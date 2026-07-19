@@ -1,0 +1,39 @@
+{
+  "name": "nightjar",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "description": "A private, invite-only, end-to-end encrypted messenger for friends and family.",
+  "license": "UNLICENSED",
+  "scripts": {
+    "dev": "vite",
+    "dev:worker": "wrangler dev",
+    "build": "tsc -b && vite build",
+    "preview": "vite preview",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:worker": "vitest run --config vitest.workers.config.ts",
+    "typecheck": "tsc -b --noEmit"
+  },
+  "dependencies": {
+    "@noble/ciphers": "^1.2.1",
+    "@noble/curves": "^1.8.1",
+    "@noble/hashes": "^1.7.1",
+    "@scure/base": "^1.2.4",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  },
+  "devDependencies": {
+    "@cloudflare/vitest-pool-workers": "^0.8.71",
+    "@cloudflare/workers-types": "^4.20260702.1",
+    "@types/node": "^22.20.1",
+    "@types/react": "^18.3.12",
+    "@types/react-dom": "^18.3.1",
+    "@vitejs/plugin-react": "^4.3.4",
+    "fake-indexeddb": "^6.0.0",
+    "typescript": "^5.6.3",
+    "vite": "^6.0.5",
+    "vitest": "^2.1.8",
+    "wrangler": "^4.35.0"
+  }
+}

@@ -1,0 +1,44 @@
+# Reproducible build container (DESIGN.md 10.1).
+#
+# The whole host-integrity story rests on anyone being able to rebuild a release
+# from public source and confirm the bytes match the hash recorded in a public
+# append-only log. That requires the build to be deterministic. Determinism here
+# comes from pinning the real inputs: the toolchain (this base image digest), the
+# dependency tree (the committed package-lock.json, installed with `npm ci`), and
+# no build-time dynamic values (vite.config.ts injects no clock or git state).
+# SOURCE_DATE_EPOCH is set below only as a documented no-op (this toolchain does
+# not consume it; the release manifest hashes file content only, not mtimes).
+#
+# Usage:
+#   docker build -f Dockerfile.build --build-arg NIGHTJAR_VERSION=vX.Y.Z -t nightjar-build .
+#   docker run --rm -v "$PWD/out:/out" nightjar-build
+# Then diff two independent runs to byte-identity, and compare against the
+# release hash in the transparency log.
+#
+# Pinned to a digest, not just a tag, so the toolchain itself is reproducible
+# (node:22.16.0-bookworm-slim matches .nvmrc; the digest is the multi-arch OCI
+# index resolved 2026-07). To re-pin after a base-image update, resolve the new
+# digest and update both the tag and the @sha256 below.
+FROM node:22.16.0-bookworm-slim@sha256:048ed02c5fd52e86fda6fbd2f6a76cf0d4492fd6c6fee9e2c463ed5108da0e34
+
+# SOURCE_DATE_EPOCH is exported for parity with archive-based toolchains but is
+# INERT here (DESIGN 10): vite/rollup/esbuild do not consume it and the
+# release manifest hashes file CONTENT only. Determinism comes from the pinned
+# toolchain (this digest + the committed lockfile via `npm ci`) and no build-time
+# dynamic values (NIGHTJAR_VERSION is injected, never a clock).
+ENV SOURCE_DATE_EPOCH=1577836800
+# CI passes the release tag: docker build --build-arg NIGHTJAR_VERSION=v0.7.0 ...
+ARG NIGHTJAR_VERSION=repro
+ENV NIGHTJAR_VERSION=$NIGHTJAR_VERSION
+
+WORKDIR /app
+COPY package.json package-lock.json ./
+RUN npm ci
+COPY . .
+RUN npm run build
+
+# Emit the canonical release hash (DESIGN 10) so a container build prints the
+# same number CI signs into Rekor and the canary attests.
+RUN node scripts/release-hash.mjs dist || true
+
+CMD ["sh", "-c", "cp -r dist/* /out/ 2>/dev/null || echo 'mount a volume at /out to extract the build'"]

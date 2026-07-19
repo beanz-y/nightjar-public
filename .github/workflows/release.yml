@@ -1,0 +1,100 @@
+# Nightjar release + transparency pipeline (P7, DESIGN 10.1/10.3; DESIGN 10).
+#
+# Model A (the load-bearing choice, DESIGN 10): the artifact this workflow
+# hashes, logs to Rekor, and DEPLOYS is one and the same, so "served bytes ==
+# logged hash" holds by construction. Cloudflare's own git-integration auto-build
+# MUST be turned OFF (this workflow is the only deploy path), otherwise Cloudflare
+# would rebuild from source in its own unpinned builder and the served bytes could
+# drift from the logged hash.
+#
+# Trigger: pushing an SSH-signed tag `vX.Y.Z` (the operator cuts + signs the tag,
+# which also gives the "signed tag" half of DESIGN 10.1).
+#
+# One-time setup by the operator (all dashboard/web actions, no local CLI):
+#   - Make the repo PUBLIC (scrubbed, DESIGN 10) so public-good Rekor + the
+#     rebuild-from-source story work.
+#   - Turn OFF Cloudflare Pages/Workers git-integration auto-deploy.
+#   - Add repo secrets: CLOUDFLARE_API_TOKEN (a scoped Workers-deploy token created
+#     in the CF dashboard) and CLOUDFLARE_ACCOUNT_ID.
+#   - Actions permissions already allow id-token: write below (Sigstore keyless).
+#
+# SECURITY NOTE (supply chain, DESIGN 10): the `uses:` refs below are pinned to
+# release TAGS for readability. Before this is load-bearing, repin each to a full
+# commit SHA (resolve with e.g. `gh api repos/actions/checkout/git/refs/tags/v4`)
+# so the pipeline itself is reproducible/auditable.
+
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write # create the GitHub Release
+  id-token: write # Sigstore keyless OIDC -> Rekor
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout the tag (LF via .gitattributes)
+        uses: actions/checkout@v4
+
+      - name: Build once inside the digest-pinned container (the canonical artifact)
+        run: |
+          docker build -f Dockerfile.build \
+            --build-arg NIGHTJAR_VERSION="${GITHUB_REF_NAME}" \
+            -t nightjar-build .
+          # Extract the exact built tree into ./dist (what gets hashed AND deployed).
+          rm -rf dist && mkdir dist
+          cid=$(docker create nightjar-build)
+          docker cp "$cid:/app/dist/." dist/
+          docker rm "$cid"
+
+      - name: Compute the canonical release hash (DESIGN 10)
+        id: hash
+        run: |
+          NIGHTJAR_VERSION="${GITHUB_REF_NAME}" node scripts/release-hash.mjs dist
+          echo "release_hash=$(sha256sum manifest.txt | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Sign the manifest into public-good Rekor (keyless)
+        run: |
+          # Keyless: the signer identity is THIS repo's workflow OIDC token,
+          # recorded in the append-only Rekor log. The bundle self-verifies offline.
+          cosign sign-blob --yes manifest.txt --bundle manifest.cosign.bundle
+
+      - name: Deploy the exact hashed artifact (Model A)
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          # No build here: wrangler deploy uploads the already-built ./dist assets
+          # + the Worker. keep_vars:true (wrangler.jsonc) preserves dashboard
+          # secrets/vars (ADMIN_TOKEN, VAPID_JWK, CANARY_JSON).
+          command: deploy
+
+      - name: Publish the GitHub Release (Rekor is the trust anchor, not this)
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            manifest.txt
+            release.json
+            manifest.cosign.bundle
+          body: |
+            Nightjar ${{ github.ref_name }}
+
+            Release hash (sha256 of manifest.txt): `${{ steps.hash.outputs.release_hash }}`
+
+            Verify (DESIGN 10, docs/RUNBOOK-verifiability.md):
+            1. Rebuild this tag in Dockerfile.build and run `node scripts/release-hash.mjs dist`.
+            2. Confirm the release hash matches the value above and the served build.
+            3. Find the Rekor entry independently by artifact digest + this repo's
+               workflow identity (do NOT rely on this note as the anchor); the
+               attached cosign bundle self-verifies offline.
+
+            This proves the build matches public source; it does not prove the
+            source is honest, nor that bytes served to one targeted user match.

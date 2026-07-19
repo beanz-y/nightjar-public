@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+    <meta name="color-scheme" content="dark light" />
+    <meta name="theme-color" content="#0b0e14" />
+    <title>Nightjar</title>
+    <!-- PWA install + iOS Home Screen (required for iOS Web Push, DESIGN 7.4).
+         All same-origin static files, so the strict CSP is unaffected. -->
+    <link rel="manifest" href="/manifest.webmanifest" />
+    <link rel="icon" href="/icon-192.png" />
+    <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <meta name="apple-mobile-web-app-title" content="Nightjar" />
+    <!--
+      The production Content-Security-Policy is served as a real HTTP header
+      (public/_headers for Pages, and the P4 Worker later), NOT as a meta tag,
+      because a meta CSP would also apply to the Vite dev server and break HMR.
+      The build is kept free of inline scripts (see vite.config.ts) so the
+      strict production `script-src 'self'` holds. See DESIGN.md 10.2.
+    -->
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

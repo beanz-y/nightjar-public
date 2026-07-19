@@ -1,0 +1,18 @@
+# Cloudflare Pages / Workers static-asset headers.
+# The strict Content-Security-Policy is the P0 half of the host-integrity
+# hardening in DESIGN.md section 10.2: no inline script, no eval, no third-party
+# origins, so any backdoor must live in the one first-party bundle the
+# reproducible build and release-hash log (10.1) can watch. connect-src widens
+# to the real relay and push origins when they exist (P4/P6).
+#
+# NOTE: the "/*" line below is a Cloudflare _headers URL PATH GLOB (it matches
+# every route), NOT a C-style /* */ comment. Comments in this file are
+# '#'-prefixed; the indented lines under "/*" are the headers applied to all
+# responses. See developers.cloudflare.com/pages/configuration/headers.
+/*
+  Content-Security-Policy: default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; font-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'; manifest-src 'self'
+  X-Content-Type-Options: nosniff
+  Referrer-Policy: no-referrer
+  Cross-Origin-Opener-Policy: same-origin
+  Cross-Origin-Resource-Policy: same-origin
+  Permissions-Policy: geolocation=(), camera=(), microphone=(), payment=()

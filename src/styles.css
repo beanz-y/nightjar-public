@@ -1,0 +1,456 @@
+:root {
+  color-scheme: dark light;
+  --bg: #0b0e14;
+  --panel: #11151f;
+  --border: #1b2230;
+  --fg: #e6e9ef;
+  --muted: #8a93a6;
+  --accent: #7aa2f7;
+  --ok: #9ece6a;
+  --error: #f7768e;
+  --warn: #e0af68;
+  font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--fg);
+  min-height: 100vh;
+}
+
+/* --- utilities ---------------------------------------------------------- */
+.mono {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+.break {
+  word-break: break-all;
+}
+.muted {
+  color: var(--muted);
+}
+.small {
+  font-size: 0.85rem;
+}
+.tiny {
+  font-size: 0.75rem;
+}
+.accent {
+  color: var(--accent);
+}
+.error {
+  color: var(--error);
+}
+.center {
+  text-align: center;
+  padding: 2rem 1rem;
+}
+.field-label {
+  display: block;
+  margin: 0.75rem 0 0.25rem;
+}
+
+/* --- buttons + inputs --------------------------------------------------- */
+button {
+  font: inherit;
+  cursor: pointer;
+  border-radius: 0.4rem;
+  border: 1px solid transparent;
+}
+button:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+.primary {
+  background: var(--accent);
+  color: #0b0e14;
+  border: 0;
+  font-weight: 600;
+  padding: 0.5rem 0.9rem;
+}
+.ghost {
+  background: transparent;
+  color: var(--fg);
+  border: 1px solid var(--border);
+  padding: 0.45rem 0.8rem;
+}
+.danger {
+  background: var(--warn);
+  color: #0b0e14;
+  border: 0;
+  font-weight: 600;
+  padding: 0.5rem 0.9rem;
+}
+.link {
+  background: none;
+  border: 0;
+  color: var(--accent);
+  padding: 0;
+  text-decoration: underline;
+}
+.block {
+  display: block;
+  width: 100%;
+}
+
+input {
+  padding: 0.5rem 0.65rem;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 0.4rem;
+  color: var(--fg);
+  min-width: 0;
+}
+
+.row {
+  display: flex;
+  gap: 0.5rem;
+  margin: 0.5rem 0;
+  flex-wrap: wrap;
+  align-items: center;
+}
+.row input {
+  flex: 1 1 12rem;
+}
+
+/* --- shell -------------------------------------------------------------- */
+.root {
+  max-width: 62rem;
+  margin: 0 auto;
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+  padding: 0 1rem;
+}
+.topbar {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  padding: 1rem 0.25rem 0.75rem;
+  border-bottom: 1px solid var(--border);
+}
+.wordmark {
+  font-size: 1.4rem;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+}
+.dot {
+  width: 0.6rem;
+  height: 0.6rem;
+  border-radius: 50%;
+}
+.dot-on {
+  background: var(--ok);
+}
+.dot-off {
+  background: var(--muted);
+}
+.banner {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 1rem;
+  background: #1a1420;
+  border: 1px solid #3a2740;
+  color: var(--warn);
+  border-radius: 0.4rem;
+  padding: 0.5rem 0.75rem;
+  margin: 0.6rem 0;
+}
+.content {
+  flex: 1;
+  padding: 1rem 0.25rem;
+}
+.foot {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  border-top: 1px solid var(--border);
+  padding: 0.9rem 0.25rem;
+  margin-top: 1rem;
+}
+
+/* --- onboarding --------------------------------------------------------- */
+.onboard {
+  max-width: 34rem;
+}
+.yourid {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 0.4rem;
+  padding: 0.5rem 0.65rem;
+}
+
+/* --- main app layout ---------------------------------------------------- */
+.app {
+  display: grid;
+  grid-template-columns: 18rem 1fr;
+  gap: 1rem;
+  min-height: 30rem;
+}
+@media (max-width: 40rem) {
+  .app {
+    grid-template-columns: 1fr;
+  }
+}
+.sidebar {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+  border-right: 1px solid var(--border);
+  padding-right: 1rem;
+}
+@media (max-width: 40rem) {
+  .sidebar {
+    border-right: 0;
+    border-bottom: 1px solid var(--border);
+    padding-right: 0;
+    padding-bottom: 0.75rem;
+  }
+}
+.me {
+  padding-bottom: 0.5rem;
+  border-bottom: 1px solid var(--border);
+}
+
+/* --- notifications control --------------------------------------------- */
+.notify {
+  margin-top: auto;
+  padding-top: 0.75rem;
+  border-top: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+}
+.notify .block {
+  margin: 0.15rem 0;
+}
+.small.block {
+  padding: 0.4rem 0.7rem;
+}
+.threads {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+  overflow-y: auto;
+}
+.thread {
+  text-align: left;
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--fg);
+  padding: 0.5rem 0.6rem;
+  display: grid;
+  gap: 0.3rem;
+}
+.thread-active {
+  border-color: var(--accent);
+  background: var(--panel);
+}
+.thread-meta {
+  display: flex;
+  gap: 0.4rem;
+  align-items: center;
+  flex-wrap: wrap;
+}
+.preview {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* --- badges ------------------------------------------------------------- */
+.badge {
+  display: inline-block;
+  font-size: 0.7rem;
+  font-weight: 600;
+  padding: 0.1rem 0.4rem;
+  border-radius: 0.3rem;
+  border: 1px solid var(--border);
+}
+.badge-unverified,
+.badge-unknown {
+  color: var(--muted);
+}
+.badge-invite {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+.badge-verified {
+  color: var(--ok);
+  border-color: var(--ok);
+}
+
+/* --- pane / conversation ------------------------------------------------ */
+.pane {
+  min-width: 0;
+}
+.empty {
+  padding: 3rem 1rem;
+  text-align: center;
+}
+.convo {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 26rem;
+}
+.convo-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 1rem;
+  padding-bottom: 0.6rem;
+  border-bottom: 1px solid var(--border);
+}
+.msgs {
+  flex: 1;
+  overflow-y: auto;
+  padding: 0.75rem 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+}
+.msg {
+  display: flex;
+}
+.msg-out {
+  justify-content: flex-end;
+}
+.bubble {
+  max-width: 80%;
+  padding: 0.45rem 0.7rem;
+  border-radius: 0.7rem;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.msg-out .bubble {
+  background: #1a2740;
+  border-color: #24406b;
+}
+.compose {
+  display: flex;
+  gap: 0.5rem;
+  padding-top: 0.6rem;
+  border-top: 1px solid var(--border);
+}
+.compose input {
+  flex: 1;
+}
+
+/* --- verify (safety number) -------------------------------------------- */
+.verify {
+  max-width: 30rem;
+}
+.safety-grid {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 0.4rem 0.8rem;
+  margin: 1rem 0;
+  padding: 0.9rem;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 0.5rem;
+}
+.safety-group {
+  font-size: 1.15rem;
+  letter-spacing: 0.06em;
+  text-align: center;
+}
+.qr-wrap {
+  display: flex;
+  justify-content: center;
+  margin: 1rem 0;
+}
+.qr-wrap svg {
+  border-radius: 0.4rem;
+}
+.verified-note {
+  color: var(--ok);
+  font-weight: 600;
+}
+
+/* --- about + warrant canary (P7) --------------------------------------- */
+.about {
+  max-width: 34rem;
+}
+.about h2 {
+  margin: 0.5rem 0 0.75rem;
+  font-size: 1.15rem;
+}
+.canary {
+  border: 1px solid var(--border);
+  border-left-width: 3px;
+  border-radius: 0.4rem;
+  padding: 0.5rem 0.75rem;
+  background: var(--panel);
+}
+.canary p {
+  margin: 0.25rem 0 0;
+}
+.canary-label {
+  font-weight: 600;
+}
+/* Deliberately NOT the green "verified" check: a fresh canary is a freshness fact,
+   not a build-integrity verdict (MF4). Neutral for note, amber for warn. */
+.canary-note {
+  border-left-color: var(--accent);
+}
+.canary-note .canary-label {
+  color: var(--accent);
+}
+.canary-warn {
+  border-left-color: var(--warn);
+}
+.canary-warn .canary-label {
+  color: var(--warn);
+}
+.canary-quiet {
+  border-left-color: var(--muted);
+}
+.canary-quiet .canary-label {
+  color: var(--muted);
+}
+.verify-steps {
+  margin: 0.35rem 0;
+  padding-left: 1.2rem;
+  display: grid;
+  gap: 0.3rem;
+}
+.disclosure p {
+  margin: 0.5rem 0;
+  line-height: 1.45;
+}
+.about-link {
+  margin-top: 0.75rem;
+}
+
+/* --- invite panel + diagnostics ---------------------------------------- */
+.panel,
+.diag {
+  max-width: 32rem;
+  border: 1px solid var(--border);
+  border-radius: 0.5rem;
+  padding: 1rem;
+  background: var(--panel);
+}
+.panel-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+.diag {
+  margin: 1rem 0.25rem;
+}
+.log {
+  margin: 0.5rem 0 0;
+  padding-left: 1.25rem;
+  display: grid;
+  gap: 0.15rem;
+}

@@ -1,0 +1,88 @@
+import { describe, expect, it } from 'vitest'
+import { generateIdentity } from '../crypto/identity'
+import { MemoryKeyStore } from '../storage/keystore'
+import { InMemoryLock } from '../storage/lock'
+import { ContactStore, KeyConflictError } from './contactStore'
+
+const NOW = 1_700_000_000_000
+
+function fresh() {
+  return new ContactStore(new MemoryKeyStore(), new InMemoryLock())
+}
+
+describe('ContactStore.assess', () => {
+  it('reports first-contact, match, and a (collision-only) conflict', async () => {
+    const store = fresh()
+    const a = generateIdentity()
+    const b = generateIdentity()
+    expect((await store.assess(a.userId, a.ikSig.publicKey)).outcome).toBe('first-contact')
+    await store.recordFirstContact(a.userId, a.ikSig.publicKey, NOW)
+    expect((await store.assess(a.userId, a.ikSig.publicKey)).outcome).toBe('match')
+    // A different key presented for the SAME userId (only possible via a hash
+    // collision or corruption) fails closed.
+    expect((await store.assess(a.userId, b.ikSig.publicKey)).outcome).toBe('conflict')
+  })
+})
+
+describe('ContactStore.recordFirstContact', () => {
+  it('records a new contact at unverified (TOFU) and is idempotent for the same key', async () => {
+    const store = fresh()
+    const a = generateIdentity()
+    await store.recordFirstContact(a.userId, a.ikSig.publicKey, NOW)
+    await store.recordFirstContact(a.userId, a.ikSig.publicKey, NOW + 1)
+    const c = await store.get(a.userId)
+    expect(c?.trust).toBe('unverified')
+    expect(c?.firstSeen).toBe(NOW)
+    expect(await store.list()).toHaveLength(1)
+  })
+
+  it('records an invite-sourced contact at invite trust and upgrades TOFU->invite', async () => {
+    const store = fresh()
+    const a = generateIdentity()
+    await store.recordFirstContact(a.userId, a.ikSig.publicKey, NOW) // TOFU
+    expect(await store.trustLevel(a.userId)).toBe('unverified')
+    await store.recordFirstContact(a.userId, a.ikSig.publicKey, NOW, 'invite')
+    expect(await store.trustLevel(a.userId)).toBe('invite')
+  })
+
+  it('rejects a key that does not hash to the peer id (substituted key)', async () => {
+    const store = fresh()
+    const a = generateIdentity()
+    const b = generateIdentity()
+    await expect(store.recordFirstContact(a.userId, b.ikSig.publicKey, NOW)).rejects.toThrow(/does not match/)
+  })
+
+  it('does not downgrade a verified contact on a later TOFU record', async () => {
+    const store = fresh()
+    const a = generateIdentity()
+    await store.recordFirstContact(a.userId, a.ikSig.publicKey, NOW)
+    await store.markVerified(a.userId, NOW)
+    await store.recordFirstContact(a.userId, a.ikSig.publicKey, NOW + 1)
+    expect(await store.trustLevel(a.userId)).toBe('verified')
+  })
+})
+
+describe('ContactStore.markVerified', () => {
+  it('promotes a contact to verified with a timestamp', async () => {
+    const store = fresh()
+    const a = generateIdentity()
+    await store.recordFirstContact(a.userId, a.ikSig.publicKey, NOW)
+    await store.markVerified(a.userId, NOW + 5)
+    const c = await store.get(a.userId)
+    expect(c?.trust).toBe('verified')
+    expect(c?.verifiedAt).toBe(NOW + 5)
+  })
+
+  it('throws when verifying an unknown peer', async () => {
+    const store = fresh()
+    await expect(store.markVerified(generateIdentity().userId, NOW)).rejects.toThrow(/unknown peer/)
+  })
+})
+
+describe('KeyConflictError', () => {
+  it('carries the peer id', () => {
+    const e = new KeyConflictError('peer-x')
+    expect(e).toBeInstanceOf(Error)
+    expect(e.peerId).toBe('peer-x')
+  })
+})

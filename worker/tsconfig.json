@@ -1,0 +1,26 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "lib": ["ES2022"],
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "types": ["@cloudflare/workers-types"],
+    "skipLibCheck": true,
+
+    "isolatedModules": true,
+    "moduleDetection": "force",
+    "noEmit": true,
+
+    "strict": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "noFallthroughCasesInSwitch": true,
+    "exactOptionalPropertyTypes": true,
+    "noImplicitOverride": true
+  },
+  // Only the worker roots (paths are relative to this file's dir); tsc pulls in
+  // the shared src/ modules they import. Test files are excluded (they run under
+  // the node/vitest configs, not Workers).
+  "include": ["**/*.ts"],
+  "exclude": ["**/*.test.ts"]
+}

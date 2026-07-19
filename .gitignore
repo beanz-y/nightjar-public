@@ -1,0 +1,17 @@
+node_modules
+dist
+dist-ssr
+coverage
+# Generated release artifacts (scripts/release-hash.mjs; produced in CI per build)
+manifest.txt
+release.json
+# TypeScript incremental build caches (regenerate per machine; keep out of the
+# public squashed commit so a friend's rebuild has no spurious working-tree diff)
+*.tsbuildinfo
+*.local
+.DS_Store
+.env
+.env.*
+!.env.example
+.dev.vars
+.wrangler

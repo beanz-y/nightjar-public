@@ -1,0 +1,34 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "nightjar",
+  "main": "worker/index.ts",
+  "compatibility_date": "2025-09-06",
+
+  // The built PWA (DESIGN 10.2). The Worker runs first for every request (it owns
+  // /connect and /admin/*), then falls through to env.ASSETS for static files;
+  // unknown non-API routes serve index.html so client-side routing works.
+  "assets": {
+    "directory": "./dist",
+    "binding": "ASSETS",
+    "not_found_handling": "single-page-application"
+  },
+
+  // The relay is two Durable Object classes (DESIGN 7.1): one Directory (prekey
+  // bundles, OPK vending, invite-gated registration) and one Inbox per user
+  // (store-and-delete WebSocket relay).
+  "durable_objects": {
+    "bindings": [
+      { "name": "DIRECTORY", "class_name": "Directory" },
+      { "name": "INBOX", "class_name": "Inbox" }
+    ]
+  },
+  "migrations": [
+    // SQLite-backed classes work on the Workers free plan and give us real tables
+    // for the queue / invite / prekey rows.
+    { "tag": "v1", "new_sqlite_classes": ["Directory", "Inbox"] }
+  ],
+
+  "observability": { "enabled": true },
+  // Dashboard-managed secrets (ADMIN_TOKEN, later VAPID) survive git deploys.
+  "keep_vars": true
+}
