@@ -67,14 +67,25 @@ jobs:
           # recorded in the append-only Rekor log. The bundle self-verifies offline.
           cosign sign-blob --yes manifest.txt --bundle manifest.cosign.bundle
 
+      # wrangler bundles the Worker (worker/index.ts) at deploy time, which pulls in
+      # its imports (@noble, @scure via the shared src/), so the runner needs the
+      # project deps. The container build's node_modules stays in the container; the
+      # runner has none until now. (dist/ was copied out separately and is unaffected.)
+      - name: Install deps for the Worker bundle
+        run: npm ci
+
       - name: Deploy the exact hashed artifact (Model A)
         uses: cloudflare/wrangler-action@v3
         with:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          # Pin wrangler to the project's major version: wrangler-action's default
+          # (3.90.0) predates wrangler.jsonc support and fails with "Missing
+          # entry-point" because it never reads the `main` field.
+          wranglerVersion: '4.35.0'
           # No build here: wrangler deploy uploads the already-built ./dist assets
           # + the Worker. keep_vars:true (wrangler.jsonc) preserves dashboard
-          # secrets/vars (ADMIN_TOKEN, VAPID_JWK, CANARY_JSON).
+          # vars/secrets (ADMIN_TOKEN, VAPID_JWK, CANARY_JSON).
           command: deploy
 
       - name: Publish the GitHub Release (Rekor is the trust anchor, not this)
