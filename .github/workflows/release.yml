@@ -27,24 +27,31 @@ name: release
 
 on:
   push:
-    tags:
-      - 'v*'
+    branches: [main]
+  workflow_dispatch:
 
 permissions:
-  contents: write # create the GitHub Release
+  contents: read
   id-token: write # Sigstore keyless OIDC -> Rekor
 
 jobs:
   release:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout the tag (LF via .gitattributes)
+      - name: Checkout (LF via .gitattributes)
         uses: actions/checkout@v4
+
+      # Version comes from the committed VERSION file, NOT the branch/ref name, so a
+      # push to main keeps a stable release version (bump VERSION to cut a new one).
+      # A redeploy of unchanged source is then byte-identical, so the canary that
+      # attests {version, releaseHash} stays valid without a re-sign.
+      - name: Derive the release version (from VERSION)
+        run: echo "NIGHTJAR_VERSION=$(tr -d '[:space:]' < VERSION)" >> "$GITHUB_ENV"
 
       - name: Build once inside the digest-pinned container (the canonical artifact)
         run: |
           docker build -f Dockerfile.build \
-            --build-arg NIGHTJAR_VERSION="${GITHUB_REF_NAME}" \
+            --build-arg NIGHTJAR_VERSION="${NIGHTJAR_VERSION}" \
             -t nightjar-build .
           # Extract the exact built tree into ./dist (what gets hashed AND deployed).
           rm -rf dist && mkdir dist
@@ -55,7 +62,8 @@ jobs:
       - name: Compute the canonical release hash (DESIGN 10)
         id: hash
         run: |
-          NIGHTJAR_VERSION="${GITHUB_REF_NAME}" node scripts/release-hash.mjs dist
+          # NIGHTJAR_VERSION is already in the env from the derive step above.
+          node scripts/release-hash.mjs dist
           echo "release_hash=$(sha256sum manifest.txt | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
 
       - name: Install cosign
@@ -88,24 +96,15 @@ jobs:
           # vars/secrets (ADMIN_TOKEN, VAPID_JWK, CANARY_JSON).
           command: deploy
 
-      - name: Publish the GitHub Release (Rekor is the trust anchor, not this)
-        uses: softprops/action-gh-release@v2
+      # No tag on a main push, so publish the transparency artifacts to the run
+      # instead of a GitHub Release. Rekor (append-only) is the real anchor; these
+      # are conveniences an auditor can also regenerate from source. The commit is
+      # recorded on the run itself, so the exact build is identifiable.
+      - name: Publish the manifest + cosign bundle as run artifacts
+        uses: actions/upload-artifact@v4
         with:
-          files: |
+          name: nightjar-release-${{ env.NIGHTJAR_VERSION }}-${{ github.sha }}
+          path: |
             manifest.txt
             release.json
             manifest.cosign.bundle
-          body: |
-            Nightjar ${{ github.ref_name }}
-
-            Release hash (sha256 of manifest.txt): `${{ steps.hash.outputs.release_hash }}`
-
-            Verify (DESIGN 10, docs/RUNBOOK-verifiability.md):
-            1. Rebuild this tag in Dockerfile.build and run `node scripts/release-hash.mjs dist`.
-            2. Confirm the release hash matches the value above and the served build.
-            3. Find the Rekor entry independently by artifact digest + this repo's
-               workflow identity (do NOT rely on this note as the anchor); the
-               attached cosign bundle self-verifies offline.
-
-            This proves the build matches public source; it does not prove the
-            source is honest, nor that bytes served to one targeted user match.
