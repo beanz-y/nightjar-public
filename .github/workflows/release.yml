@@ -71,6 +71,16 @@ jobs:
       - name: Unit + integration tests (node)
         run: npm test
 
+      # The production build must be run here for two reasons: it validates that
+      # `npm run build` (tsc + vite + the SRI plugin) actually compiles before any
+      # deploy, and it creates ./dist, which the relay tests require because
+      # wrangler.jsonc points `assets.directory` at it (the workerd test harness
+      # aborts on a missing assets directory otherwise). This build is a check
+      # only; the deployed artifact is built independently in the pinned container
+      # by the release job below.
+      - name: Build (production build check + dist for the relay tests)
+        run: npm run build
+
       - name: Relay tests (workerd)
         run: npm run test:worker
 

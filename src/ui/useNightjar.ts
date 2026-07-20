@@ -82,6 +82,8 @@ const uid = () => (globalThis.crypto?.randomUUID?.() ?? `m-${Math.random().toStr
 const appOrigin = () => globalThis.location?.origin || getRelayOrigin()
 // Well under the relay's 64 KiB ciphertext cap; a text messenger never needs more.
 const MAX_MESSAGE_CHARS = 8000
+/** Full-width userId shape: lowercase unpadded base32 of a 32-byte hash. */
+const USER_ID_RE = /^[a-z2-7]{52}$/
 
 // Derive the notifications UI state from the platform + the relay's push key.
 // The toggle is `available` only when the browser supports push, the relay has a
@@ -369,6 +371,54 @@ export function useNightjar() {
     setConversations((prev) => (prev[peer] ? prev : { ...prev, [peer]: [] }))
   }, [])
 
+  // Open a chat from a scanned/pasted value (registered user). Accepts either a
+  // bare userId (start a trust-on-first-use chat) or an invite artifact (pin the
+  // inviter, then chat with them). Returns the peer id to select, or null.
+  const openFromCode = useCallback(async (input: string): Promise<string | null> => {
+    const live = liveRef.current
+    if (!live) return null
+    setNotice(null)
+    const raw = input.trim()
+
+    if (USER_ID_RE.test(raw.toLowerCase())) {
+      const id = raw.toLowerCase()
+      if (id === live.identity.userId) {
+        setNotice('that is your own id')
+        return null
+      }
+      setConversations((prev) => (prev[id] ? prev : { ...prev, [id]: [] }))
+      return id
+    }
+
+    let artifact: InviteArtifact
+    try {
+      artifact = decodeInviteArtifact(raw)
+    } catch (e) {
+      setNotice(`unrecognized code: ${String(e instanceof Error ? e.message : e)}`)
+      return null
+    }
+    if (!artifact.inviter) {
+      setNotice('this is a setup invite with no contact to add; ask them for their code or user id')
+      return null
+    }
+    if (artifact.inviter === live.identity.userId) {
+      setNotice('that invite is your own')
+      return null
+    }
+    const id = artifact.inviter
+    try {
+      // Pin the inviter as an invite-trusted contact (6.3), then open the chat.
+      await live.client.addInviteContact(id)
+      setContacts(await live.client.listContacts())
+      setNotice('contact added and pinned')
+    } catch (e) {
+      // The contact can still be messaged (TOFU) even if the pin fetch failed.
+      setNotice(`opened a chat, but could not pin them yet: ${String(e instanceof Error ? e.message : e)}`)
+    }
+    setConversations((prev) => (prev[id] ? prev : { ...prev, [id]: [] }))
+    return id
+  }, [])
+
   const mintInvite = useCallback(async (): Promise<MintedInvite | null> => {
     const live = liveRef.current
     if (!live) return null
@@ -509,6 +559,7 @@ export function useNightjar() {
       join,
       send,
       startChat,
+      openFromCode,
       mintInvite,
       markVerified,
       dismissNotice,

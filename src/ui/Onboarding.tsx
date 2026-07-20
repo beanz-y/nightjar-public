@@ -6,6 +6,7 @@
 // backup instead (P8), which replaces the freshly generated throwaway identity.
 
 import { useState } from 'react'
+import { QrScanner } from './QrScanner'
 import { RestoreScreen } from './RestoreScreen'
 
 interface Props {
@@ -22,6 +23,7 @@ interface Props {
 export function Onboarding({ userId, prefill, connected, restoreBusy, restoreError, onJoin, onRestore, onAbout }: Props) {
   const [input, setInput] = useState(prefill)
   const [restoring, setRestoring] = useState(false)
+  const [scanning, setScanning] = useState(false)
 
   if (restoring) {
     return (
@@ -35,11 +37,26 @@ export function Onboarding({ userId, prefill, connected, restoreBusy, restoreErr
     )
   }
 
+  if (scanning) {
+    return (
+      <section className="onboard">
+        <h2 className="small accent">scan your invite</h2>
+        <QrScanner
+          onDecode={(text) => {
+            setScanning(false)
+            onJoin(text)
+          }}
+          onCancel={() => setScanning(false)}
+        />
+      </section>
+    )
+  }
+
   return (
     <section className="onboard">
       <p className="muted">
-        You have an invite-only account. Paste the invite you were given to join. Nightjar has no phone numbers, emails,
-        or passwords: your identity is a key on this device.
+        You have an invite-only account. Scan or paste the invite you were given to join. Nightjar has no phone numbers,
+        emails, or passwords: your identity is a key on this device.
       </p>
 
       {/* Priority-1 control first (DESIGN 6/12): the safety-number pointer + a
@@ -54,10 +71,11 @@ export function Onboarding({ userId, prefill, connected, restoreBusy, restoreErr
         .
       </p>
 
-      <label className="field-label small muted">your device identity</label>
-      <p className="mono break small yourid">{userId}</p>
+      <button className="primary block" disabled={!connected} onClick={() => setScanning(true)}>
+        scan invite QR
+      </button>
 
-      <label className="field-label small muted">invite</label>
+      <label className="field-label small muted">or paste the invite</label>
       <div className="row">
         <input
           className="mono"
@@ -68,11 +86,14 @@ export function Onboarding({ userId, prefill, connected, restoreBusy, restoreErr
             if (e.key === 'Enter' && input.trim()) onJoin(input)
           }}
         />
-        <button className="primary" disabled={!connected || !input.trim()} onClick={() => onJoin(input)}>
+        <button className="ghost" disabled={!connected || !input.trim()} onClick={() => onJoin(input)}>
           join
         </button>
       </div>
       {!connected && <p className="muted small">connecting to the relay…</p>}
+
+      <label className="field-label small muted">your device identity</label>
+      <p className="mono break small yourid">{userId}</p>
 
       <p className="small">
         Already have a Nightjar identity?{' '}

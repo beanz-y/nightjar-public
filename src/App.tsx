@@ -1,13 +1,14 @@
-// Nightjar app shell. A minimal but real messenger surface over NightjarClient:
-// bootstrap identity -> connect -> onboarding (invite or restore) -> the
-// registered screen. The footer reaches the About/"verify this build" view; a
-// dismissible warrant-canary banner appears on an alarming canary state; backup
-// export lives in the sidebar and restore on the evicted/onboarding screens.
+// Nightjar app shell. Bootstrap identity -> connect -> onboarding (invite/scan or
+// restore) -> the messenger. When registered, the whole surface is the chat app
+// (Messenger owns the list, conversations, new-chat, and settings). A dismissible
+// warrant-canary banner appears on an alarming canary state; the compact footer
+// (version + verify-build + diagnostics) is only shown before the messenger takes
+// over, so it never clutters the chat surface.
 
 import { useState } from 'react'
 import { About } from './ui/About'
 import { Diagnostics } from './ui/Diagnostics'
-import { MainApp } from './ui/MainApp'
+import { Messenger } from './ui/Messenger'
 import { Onboarding } from './ui/Onboarding'
 import { RestoreScreen } from './ui/RestoreScreen'
 import { useCanary } from './ui/useCanary'
@@ -41,6 +42,7 @@ export function App() {
   // for with #diag (e.g. when verifying a production deploy on purpose).
   const diagAvailable = import.meta.env.DEV || (globalThis.location?.hash ?? '').includes('diag')
 
+  const isReady = phase === 'ready' && !!identity && registered
   const showCanaryBanner = !!canary?.alarming && !canaryDismissed && !about
 
   return (
@@ -85,7 +87,7 @@ export function App() {
         </div>
       )}
 
-      <div className="content">
+      <div className={`content ${isReady && !about ? 'content-app' : ''}`}>
         {about ? (
           <About canary={canary} onBack={() => setAbout(false)} />
         ) : (
@@ -118,13 +120,14 @@ export function App() {
               />
             )}
 
-            {phase === 'ready' && identity && registered && (
-              <MainApp
+            {isReady && identity && (
+              <Messenger
                 identity={identity}
                 contacts={contacts}
                 conversations={conversations}
                 notify={notify}
                 storagePersisted={storagePersisted}
+                canary={canary}
                 actions={actions}
               />
             )}
@@ -132,19 +135,23 @@ export function App() {
         )}
       </div>
 
-      <footer className="foot muted small">
-        <span>Nightjar {__APP_VERSION__}</span>
-        <span className="row">
-          <button className="link" onClick={() => setAbout((a) => !a)}>
-            {about ? 'close about' : 'verify build'}
-          </button>
-          {diagAvailable && (
-            <button className="link" onClick={() => setDiag((d) => !d)}>
-              {diag ? 'hide diagnostics' : 'diagnostics'}
+      {/* The chat app owns its own chrome (settings holds verify-build); the
+          footer is only for the pre-messenger phases and #diag tooling. */}
+      {(!isReady || about) && (
+        <footer className="foot muted small">
+          <span>Nightjar {__APP_VERSION__}</span>
+          <span className="row">
+            <button className="link" onClick={() => setAbout((a) => !a)}>
+              {about ? 'close about' : 'verify build'}
             </button>
-          )}
-        </span>
-      </footer>
+            {diagAvailable && (
+              <button className="link" onClick={() => setDiag((d) => !d)}>
+                {diag ? 'hide diagnostics' : 'diagnostics'}
+              </button>
+            )}
+          </span>
+        </footer>
+      )}
       {diag && diagAvailable && <Diagnostics />}
     </div>
   )

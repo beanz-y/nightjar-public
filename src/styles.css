@@ -121,7 +121,9 @@ input {
 .root {
   max-width: 62rem;
   margin: 0 auto;
-  min-height: 100vh;
+  height: 100vh;
+  height: 100dvh; /* mobile browser chrome-aware */
+  overflow: hidden; /* inner panes scroll, not the page */
   display: flex;
   flex-direction: column;
   padding: 0 1rem;
@@ -132,6 +134,11 @@ input {
   gap: 0.6rem;
   padding: 1rem 0.25rem 0.75rem;
   border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+}
+.banner,
+.foot {
+  flex-shrink: 0;
 }
 .wordmark {
   font-size: 1.4rem;
@@ -172,7 +179,15 @@ input {
 }
 .content {
   flex: 1;
+  min-height: 0;
+  overflow-y: auto;
   padding: 1rem 0.25rem;
+}
+/* When the messenger is up it owns the whole area and manages its own scroll. */
+.content-app {
+  padding: 0;
+  overflow: hidden;
+  display: flex;
 }
 .foot {
   display: flex;
@@ -194,41 +209,211 @@ input {
   padding: 0.5rem 0.65rem;
 }
 
-/* --- main app layout ---------------------------------------------------- */
-.app {
-  display: grid;
-  grid-template-columns: 18rem 1fr;
-  gap: 1rem;
-  min-height: 30rem;
+/* --- messenger (chat-first shell) -------------------------------------- */
+.msgr {
+  display: flex;
+  width: 100%;
+  flex: 1;
+  min-height: 0;
 }
-@media (max-width: 40rem) {
-  .app {
-    grid-template-columns: 1fr;
-  }
+.msgr-list {
+  width: 20rem;
+  flex-shrink: 0;
+  border-right: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
 }
-.sidebar {
+.msgr-list-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 0.6rem 0.5rem 0.7rem;
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+}
+.msgr-title {
+  font-weight: 700;
+  font-size: 1.05rem;
+}
+.msgr-main {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  padding-left: 1rem;
+  min-height: 0;
+}
+.msgr-main .convo,
+.msgr-main .verify,
+.msgr-main .empty {
+  flex: 1;
+  min-height: 0;
+}
+.threads {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 0.5rem 0.35rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+}
+.threads-empty {
+  padding: 2rem 1rem;
+  text-align: center;
   display: flex;
   flex-direction: column;
   gap: 0.75rem;
-  border-right: 1px solid var(--border);
-  padding-right: 1rem;
+  align-items: center;
 }
-@media (max-width: 40rem) {
-  .sidebar {
+.thread-top {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 0.4rem;
+}
+
+/* icon buttons (new chat / settings / back) */
+.icon-btn {
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--fg);
+  width: 2.1rem;
+  height: 2.1rem;
+  border-radius: 0.45rem;
+  font-size: 1.15rem;
+  line-height: 1;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+.icon-btn:hover {
+  border-color: var(--accent);
+}
+.primary-icon {
+  background: var(--accent);
+  color: #0b0e14;
+  border: 0;
+  font-weight: 700;
+}
+.back-btn {
+  display: none;
+}
+
+/* new-chat / settings sheets + option tiles */
+.sheet {
+  max-width: 34rem;
+  width: 100%;
+  margin: 0 auto;
+  padding: 0.75rem 0.35rem 2rem;
+  overflow-y: auto;
+  min-height: 0;
+}
+.sheet-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 0.6rem;
+}
+.tile {
+  display: flex;
+  gap: 0.8rem;
+  align-items: center;
+  width: 100%;
+  text-align: left;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  color: var(--fg);
+  border-radius: 0.5rem;
+  padding: 0.85rem;
+  margin: 0.5rem 0;
+}
+.tile:hover {
+  border-color: var(--accent);
+}
+.tile-icon {
+  font-size: 1.4rem;
+  width: 2rem;
+  text-align: center;
+  color: var(--accent);
+  flex-shrink: 0;
+}
+.tile-title {
+  display: block;
+  font-weight: 600;
+}
+.tile-sub {
+  display: block;
+  margin-top: 0.1rem;
+}
+textarea {
+  width: 100%;
+  padding: 0.5rem 0.65rem;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 0.4rem;
+  color: var(--fg);
+  resize: vertical;
+  font-family: inherit;
+}
+textarea.mono {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+
+/* camera QR scanner */
+.scanner {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0.5rem;
+}
+.scanner-frame {
+  position: relative;
+  width: 100%;
+  max-width: 22rem;
+  aspect-ratio: 1;
+  background: #000;
+  border-radius: 0.6rem;
+  overflow: hidden;
+  margin: 0.25rem 0;
+}
+.scanner-video {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+.scanner-reticle {
+  position: absolute;
+  inset: 16%;
+  border: 2px solid var(--accent);
+  border-radius: 0.5rem;
+}
+
+/* single-pane on narrow screens: list <-> conversation */
+@media (max-width: 44rem) {
+  .msgr-list {
+    width: 100%;
     border-right: 0;
-    border-bottom: 1px solid var(--border);
-    padding-right: 0;
-    padding-bottom: 0.75rem;
   }
-}
-.me {
-  padding-bottom: 0.5rem;
-  border-bottom: 1px solid var(--border);
+  .msgr-main {
+    padding-left: 0;
+  }
+  .msgr.has-selection .msgr-list {
+    display: none;
+  }
+  .msgr:not(.has-selection) .msgr-main {
+    display: none;
+  }
+  .back-btn {
+    display: inline-flex;
+  }
 }
 
 /* --- notifications control --------------------------------------------- */
 .notify {
-  margin-top: auto;
+  margin-top: 1rem;
   padding-top: 0.75rem;
   border-top: 1px solid var(--border);
   display: flex;
@@ -311,10 +496,17 @@ input {
 .convo-head {
   display: flex;
   justify-content: space-between;
-  align-items: flex-start;
+  align-items: center;
   gap: 1rem;
-  padding-bottom: 0.6rem;
+  padding: 0.6rem 0.25rem;
   border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+}
+.convo-peer {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  min-width: 0;
 }
 .msgs {
   flex: 1;

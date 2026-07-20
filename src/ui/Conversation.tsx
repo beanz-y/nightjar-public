@@ -12,9 +12,11 @@ interface Props {
   trust: TrustLevel | null
   onSend: (text: string) => void
   onVerify: () => void
+  /** Narrow-screen navigation: return to the conversation list. */
+  onBack?: () => void
 }
 
-export function Conversation({ peer, messages, trust, onSend, onVerify }: Props) {
+export function Conversation({ peer, messages, trust, onSend, onVerify, onBack }: Props) {
   const [draft, setDraft] = useState('')
   const endRef = useRef<HTMLDivElement>(null)
 
@@ -32,9 +34,16 @@ export function Conversation({ peer, messages, trust, onSend, onVerify }: Props)
   return (
     <div className="convo">
       <header className="convo-head">
-        <div>
-          <div className="mono break small">{peer}</div>
-          {trust && <TrustBadge trust={trust} />}
+        <div className="convo-peer">
+          {onBack && (
+            <button className="icon-btn back-btn" title="back" onClick={onBack}>
+              ‹
+            </button>
+          )}
+          <div>
+            <div className="mono break small">{peer}</div>
+            {trust && <TrustBadge trust={trust} />}
+          </div>
         </div>
         <button className="ghost small" onClick={onVerify}>
           {trust === 'verified' ? 'verified ✓' : 'verify'}
