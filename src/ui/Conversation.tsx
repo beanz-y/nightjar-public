@@ -1,10 +1,36 @@
 // A single conversation: the message log plus a compose box. Message bodies are
 // rendered as TEXT (React escapes by default; never innerHTML), per DESIGN 8.4.
 
-import { useEffect, useRef, useState } from 'react'
+import { Fragment, useEffect, useRef, useState } from 'react'
 import type { TrustLevel } from '../trust/contactStore'
 import { TrustBadge } from './SafetyNumber'
 import type { Message } from './useNightjar'
+
+// Date/time helpers for the message log, mirroring common messengers: a centered
+// day separator ("Today" / "Yesterday" / weekday / full date) when the day rolls
+// over, and a small localized time under each message. All display-only, using
+// the viewer's locale.
+const DAY_MS = 24 * 60 * 60 * 1000
+function startOfDay(ts: number): number {
+  const d = new Date(ts)
+  d.setHours(0, 0, 0, 0)
+  return d.getTime()
+}
+export function sameDay(a: number, b: number): boolean {
+  return startOfDay(a) === startOfDay(b)
+}
+export function formatDaySeparator(ts: number, now: number): string {
+  const days = Math.round((startOfDay(now) - startOfDay(ts)) / DAY_MS)
+  if (days <= 0) return 'Today'
+  if (days === 1) return 'Yesterday'
+  const d = new Date(ts)
+  if (days < 7) return d.toLocaleDateString(undefined, { weekday: 'long' })
+  const sameYear = new Date(now).getFullYear() === d.getFullYear()
+  return d.toLocaleDateString(undefined, { month: 'long', day: 'numeric', ...(sameYear ? {} : { year: 'numeric' }) })
+}
+function formatTime(ts: number): string {
+  return new Date(ts).toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' })
+}
 
 interface Props {
   peer: string
@@ -40,6 +66,10 @@ export function Conversation({ peer, name, messages, trust, onSend, onVerify, on
     onRename(nameDraft.trim())
     setRenaming(false)
   }
+
+  // Reference "now" for relative day labels ("Today"/"Yesterday"), recomputed each
+  // render (which happens on every new message, keeping labels fresh enough).
+  const now = Date.now()
 
   const shortId = `${peer.slice(0, 8)}…${peer.slice(-6)}`
 
@@ -98,12 +128,26 @@ export function Conversation({ peer, name, messages, trust, onSend, onVerify, on
 
       <div className="msgs">
         {messages.length === 0 && <p className="muted small">No messages yet. Say hello.</p>}
-        {messages.map((m) => (
-          <div key={m.id} className={`msg msg-${m.dir}`}>
-            <span className={`bubble${m.failed ? ' bubble-failed' : ''}`}>{m.text}</span>
-            {m.failed && <span className="error tiny">not sent</span>}
-          </div>
-        ))}
+        {messages.map((m, i) => {
+          const prev = messages[i - 1]
+          const showDay = !prev || !sameDay(prev.ts, m.ts)
+          return (
+            <Fragment key={m.id}>
+              {showDay && (
+                <div className="day-sep">
+                  <span>{formatDaySeparator(m.ts, now)}</span>
+                </div>
+              )}
+              <div className={`msg msg-${m.dir}`}>
+                <span className={`bubble${m.failed ? ' bubble-failed' : ''}`}>{m.text}</span>
+                <span className="msg-meta tiny muted" title={new Date(m.ts).toLocaleString()}>
+                  {formatTime(m.ts)}
+                  {m.failed && <span className="error"> · not sent</span>}
+                </span>
+              </div>
+            </Fragment>
+          )
+        })}
         <div ref={endRef} />
       </div>
 

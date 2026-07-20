@@ -554,9 +554,29 @@ textarea.mono {
 }
 .msg {
   display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 0.1rem;
 }
 .msg-out {
-  justify-content: flex-end;
+  align-items: flex-end;
+}
+.msg-meta {
+  padding: 0 0.35rem;
+}
+/* Centered day separator, like common messengers. */
+.day-sep {
+  display: flex;
+  justify-content: center;
+  margin: 0.7rem 0 0.35rem;
+}
+.day-sep span {
+  font-size: 0.72rem;
+  color: var(--muted);
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 1rem;
+  padding: 0.15rem 0.7rem;
 }
 .bubble {
   max-width: 80%;
