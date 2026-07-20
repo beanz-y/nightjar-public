@@ -16,7 +16,7 @@
 // message + X3DH replay guard onto the wire is P4.
 
 import { bytesToHex, hexToBytes } from '@noble/hashes/utils'
-import { INFO_DR_ROOT, INFO_MSG_KEY, MAX_SKIP, VERSION } from './constants'
+import { INFO_DR_ROOT, INFO_MSG_KEY, MAX_SKIP, SKIPPED_KEY_EXPIRY_MS, VERSION } from './constants'
 import {
   type KeyPair,
   aeadOpen,
@@ -38,6 +38,14 @@ export interface MessageHeader {
   readonly n: number // message number in the current sending chain
 }
 
+/** A stored skipped message key plus when it was stored, so it can be expired
+ *  on the DESIGN 14 time bound as well as the count bound. `ts` is stamped from
+ *  the `now` the caller passes to ratchetDecrypt (this module stays pure). */
+export interface SkippedKey {
+  mk: Uint8Array
+  ts: number
+}
+
 export interface RatchetState {
   dhs: KeyPair | null // our current ratchet keypair (sending)
   dhr: Uint8Array | null // remote ratchet public key (receiving)
@@ -47,7 +55,7 @@ export interface RatchetState {
   ns: number // sending message number
   nr: number // receiving message number
   pn: number // length of the previous sending chain
-  skipped: Map<string, Uint8Array> // key `${hex(dhr)}:${n}` -> message key
+  skipped: Map<string, SkippedKey> // key `${hex(dhr)}:${n}` -> message key + stored-at
   ad: Uint8Array // X3DH associated data, constant for the session
 }
 
@@ -130,7 +138,10 @@ export function ratchetDecrypt(
   state: RatchetState,
   header: MessageHeader,
   ciphertext: Uint8Array,
+  now = 0,
 ): { state: RatchetState; plaintext: Uint8Array } {
+  // `now` stamps any skipped keys this call stores (see SkippedKey). Production
+  // callers pass Date.now(); the default keeps deterministic tests unchanged.
   // 1. Bound the work BEFORE deriving anything: a forged header with a huge n or
   //    pn must be rejected without running the chain (compute + storage DoS).
   assertWithinSkipBound(state, header)
@@ -141,19 +152,19 @@ export function ratchetDecrypt(
   // 3. A stored skipped key handles an out-of-order arrival directly.
   const stored = s.skipped.get(skKey(header.dhPub, header.n))
   if (stored) {
-    const plaintext = openMessage(stored, header, ciphertext, s.ad)
+    const plaintext = openMessage(stored.mk, header, ciphertext, s.ad)
     s.skipped.delete(skKey(header.dhPub, header.n))
     return { state: s, plaintext }
   }
 
   // 4. A new remote ratchet key means a DH ratchet step.
   if (!s.dhr || !bytesEqual(header.dhPub, s.dhr)) {
-    skipMessageKeys(s, header.pn)
+    skipMessageKeys(s, header.pn, now)
     dhRatchet(s, header)
   }
 
   // 5. Advance the receiving chain to this message, then decrypt.
-  skipMessageKeys(s, header.n)
+  skipMessageKeys(s, header.n, now)
   if (s.ckr === null) {
     // A header naming our current dhr while no receiving chain exists yet (e.g. a
     // forged packet citing the victim's PUBLIC signed prekey before any real
@@ -186,7 +197,7 @@ function assertWithinSkipBound(state: RatchetState, header: MessageHeader): void
   }
 }
 
-function skipMessageKeys(s: RatchetState, until: number): void {
+function skipMessageKeys(s: RatchetState, until: number, now: number): void {
   if (s.ckr === null) return
   while (s.nr < until) {
     const { ck, mk } = kdfCk(s.ckr)
@@ -196,10 +207,25 @@ function skipMessageKeys(s: RatchetState, until: number): void {
       const oldest = s.skipped.keys().next().value
       if (oldest !== undefined) s.skipped.delete(oldest)
     }
-    s.skipped.set(skKey(s.dhr as Uint8Array, s.nr), mk)
+    s.skipped.set(skKey(s.dhr as Uint8Array, s.nr), { mk, ts: now })
     s.ckr = ck
     s.nr += 1
   }
+}
+
+/** Drop skipped keys older than SKIPPED_KEY_EXPIRY_MS (DESIGN 5.3, 14). Pure:
+ *  returns a new state (sharing unexpired entries) and how many were dropped.
+ *  Callers run this against `now` whenever they persist a decrypt result, so a
+ *  stored session can never accumulate weeks-old message keys. */
+export function pruneSkippedKeys(s: RatchetState, now: number): { state: RatchetState; pruned: number } {
+  let pruned = 0
+  const kept = new Map<string, SkippedKey>()
+  for (const [k, v] of s.skipped) {
+    if (now - v.ts > SKIPPED_KEY_EXPIRY_MS) pruned += 1
+    else kept.set(k, v)
+  }
+  if (pruned === 0) return { state: s, pruned }
+  return { state: { ...s, skipped: kept }, pruned }
 }
 
 function dhRatchet(s: RatchetState, header: MessageHeader): void {
@@ -226,7 +252,7 @@ function cloneState(s: RatchetState): RatchetState {
     ns: s.ns,
     nr: s.nr,
     pn: s.pn,
-    skipped: new Map(Array.from(s.skipped, ([k, v]) => [k, v.slice()])),
+    skipped: new Map(Array.from(s.skipped, ([k, v]) => [k, { mk: v.mk.slice(), ts: v.ts }])),
     ad: s.ad.slice(),
   }
 }
@@ -243,7 +269,8 @@ export interface RatchetSnapshot {
   ns: number
   nr: number
   pn: number
-  skipped: Array<{ dhr: string; n: number; mk: string }>
+  /** `ts` is when the skipped key was stored; absent in pre-P8 snapshots. */
+  skipped: Array<{ dhr: string; n: number; mk: string; ts?: number }>
   ad: string
 }
 
@@ -260,26 +287,69 @@ export function serializeRatchet(s: RatchetState): RatchetSnapshot {
     pn: s.pn,
     skipped: Array.from(s.skipped, ([k, v]) => {
       const idx = k.lastIndexOf(':')
-      return { dhr: k.slice(0, idx), n: Number(k.slice(idx + 1)), mk: bytesToHex(v) }
+      return { dhr: k.slice(0, idx), n: Number(k.slice(idx + 1)), mk: bytesToHex(v.mk), ts: v.ts }
     }),
     ad: bytesToHex(s.ad),
   }
 }
 
-export function deserializeRatchet(snap: RatchetSnapshot): RatchetState {
+/** Decode a hex field, failing closed on bad hex or an unexpected length: a
+ *  corrupted snapshot must surface as a clean error at load, never as a state
+ *  that derives garbage or (worse) a truncated key. */
+function snapHex(value: string, bytes: number, what: string): Uint8Array {
+  let out: Uint8Array
+  try {
+    out = hexToBytes(value)
+  } catch {
+    throw new Error(`ratchet snapshot: ${what} is not valid hex`)
+  }
+  if (out.length !== bytes) {
+    throw new Error(`ratchet snapshot: ${what} is ${out.length} bytes, expected ${bytes}`)
+  }
+  return out
+}
+
+function snapCount(value: number, what: string): number {
+  if (!Number.isInteger(value) || value < 0 || value > 0xffffffff) {
+    throw new Error(`ratchet snapshot: ${what} is not a valid counter`)
+  }
+  return value
+}
+
+/**
+ * `legacyTs` stamps skipped entries that predate the ts field (pre-P8
+ * snapshots): callers pass Date.now(), which starts those entries' expiry
+ * clock at first post-upgrade load rather than dropping them immediately.
+ */
+export function deserializeRatchet(snap: RatchetSnapshot, legacyTs = 0): RatchetState {
+  if ((snap.dhsPriv === null) !== (snap.dhsPub === null)) {
+    throw new Error('ratchet snapshot: dhs private/public must be present together')
+  }
+  const ad = (() => {
+    try {
+      return hexToBytes(snap.ad)
+    } catch {
+      throw new Error('ratchet snapshot: ad is not valid hex')
+    }
+  })()
   return {
     dhs:
       snap.dhsPriv && snap.dhsPub
-        ? { privateKey: hexToBytes(snap.dhsPriv), publicKey: hexToBytes(snap.dhsPub) }
+        ? { privateKey: snapHex(snap.dhsPriv, 32, 'dhs.priv'), publicKey: snapHex(snap.dhsPub, 32, 'dhs.pub') }
         : null,
-    dhr: snap.dhr ? hexToBytes(snap.dhr) : null,
-    rk: hexToBytes(snap.rk),
-    cks: snap.cks ? hexToBytes(snap.cks) : null,
-    ckr: snap.ckr ? hexToBytes(snap.ckr) : null,
-    ns: snap.ns,
-    nr: snap.nr,
-    pn: snap.pn,
-    skipped: new Map(snap.skipped.map((e) => [`${e.dhr}:${e.n}`, hexToBytes(e.mk)])),
-    ad: hexToBytes(snap.ad),
+    dhr: snap.dhr ? snapHex(snap.dhr, 32, 'dhr') : null,
+    rk: snapHex(snap.rk, 32, 'rk'),
+    cks: snap.cks ? snapHex(snap.cks, 32, 'cks') : null,
+    ckr: snap.ckr ? snapHex(snap.ckr, 32, 'ckr') : null,
+    ns: snapCount(snap.ns, 'ns'),
+    nr: snapCount(snap.nr, 'nr'),
+    pn: snapCount(snap.pn, 'pn'),
+    skipped: new Map(
+      snap.skipped.map((e) => [
+        `${e.dhr}:${snapCount(e.n, 'skipped.n')}`,
+        { mk: snapHex(e.mk, 32, 'skipped.mk'), ts: typeof e.ts === 'number' && Number.isFinite(e.ts) ? e.ts : legacyTs },
+      ]),
+    ),
+    ad,
   }
 }

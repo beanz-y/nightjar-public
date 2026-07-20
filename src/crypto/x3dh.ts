@@ -6,7 +6,7 @@
 // the responder consumes one. Moving them over the wire is P4.
 
 import { bytesToHex } from '@noble/hashes/utils'
-import { INFO_X3DH, VERSION_FLOOR } from './constants'
+import { INFO_X3DH, VERSION, VERSION_FLOOR } from './constants'
 import { type Identity, verifyIdkbind } from './identity'
 import {
   type KeyPair,
@@ -135,6 +135,11 @@ export function x3dhRespond(
   void now
   if (header.version < VERSION_FLOOR) {
     throw new Error('x3dh: initiator version below floor (possible downgrade)')
+  }
+  // Ceiling as well as floor (mirrors verifyFetchedBundle): a version this
+  // client does not speak must not be processed with v1 semantics.
+  if (header.version > VERSION) {
+    throw new Error('x3dh: initiator version newer than this client speaks')
   }
   if (knownPeerIkSig && !bytesEqual(knownPeerIkSig, header.ikSigPub)) {
     throw new Error('x3dh: peer identity key changed; verify the safety number')

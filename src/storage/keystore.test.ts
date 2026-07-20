@@ -57,7 +57,6 @@ function suite(name: string, makeStore: () => KeyStore) {
 }
 
 suite('MemoryKeyStore', () => new MemoryKeyStore())
-// Each IdbKeyStore test gets a fresh in-memory IndexedDB via unique db isolation
-// is not needed here: the identity test runs first-create semantics on the
-// 'identity.v1' key which no other test writes.
+// Cross-test isolation is not needed here: the identity test uses first-create
+// semantics on the 'identity.v1' key, which no other test writes.
 suite('IdbKeyStore', () => new IdbKeyStore())

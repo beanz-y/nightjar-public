@@ -1,4 +1,4 @@
-# Nightjar release + transparency pipeline (P7, DESIGN 10.1/10.3; DESIGN 10).
+# Nightjar release + transparency pipeline (P7/P8, DESIGN 10.1/10.3; DESIGN 10).
 #
 # Model A (the load-bearing choice, DESIGN 10): the artifact this workflow
 # hashes, logs to Rekor, and DEPLOYS is one and the same, so "served bytes ==
@@ -7,8 +7,14 @@
 # would rebuild from source in its own unpinned builder and the served bytes could
 # drift from the logged hash.
 #
-# Trigger: pushing an SSH-signed tag `vX.Y.Z` (the operator cuts + signs the tag,
-# which also gives the "signed tag" half of DESIGN 10.1).
+# Trigger: a push to main (or a manual dispatch). The version comes from the
+# committed VERSION file, not from tags: the earlier design's SSH-signed-tag
+# ceremony was dropped as operator friction (DESIGN 10.1 records this), and the
+# transparency story rests on the digest-pinned container build + the keyless
+# Rekor entry, whose OIDC identity names this repo, workflow, and commit.
+#
+# A `gate` job runs the full test suites and both typechecks first; production
+# never receives a build whose KAT-locked crypto suite did not just pass.
 #
 # One-time setup by the operator (all dashboard/web actions, no local CLI):
 #   - Make the repo PUBLIC (scrubbed, DESIGN 10) so public-good Rekor + the
@@ -18,10 +24,10 @@
 #     in the CF dashboard) and CLOUDFLARE_ACCOUNT_ID.
 #   - Actions permissions already allow id-token: write below (Sigstore keyless).
 #
-# SECURITY NOTE (supply chain, DESIGN 10): the `uses:` refs below are pinned to
-# release TAGS for readability. Before this is load-bearing, repin each to a full
-# commit SHA (resolve with e.g. `gh api repos/actions/checkout/git/refs/tags/v4`)
-# so the pipeline itself is reproducible/auditable.
+# Supply chain (DESIGN 10): every `uses:` is pinned to a full commit SHA (the
+# trailing comment is the tag it was resolved from). To bump one, resolve the
+# new tag to its commit (e.g. `git ls-remote https://github.com/actions/checkout
+# refs/tags/vX.Y.Z`) and update both the SHA and the comment.
 
 name: release
 
@@ -34,12 +40,46 @@ permissions:
   contents: read
   id-token: write # Sigstore keyless OIDC -> Rekor
 
+# Two rapid pushes must deploy IN ORDER: a stale build landing last would leave
+# production mismatching the newest Rekor entry and the canary's attested hash.
+concurrency:
+  group: nightjar-release
+  cancel-in-progress: false
+
 jobs:
-  release:
+  gate:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout (LF via .gitattributes)
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - name: Node from .nvmrc
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+
+      - name: Install deps
+        run: npm ci
+
+      - name: Typecheck (app + configs)
+        run: npm run typecheck
+
+      - name: Typecheck (worker)
+        run: npx tsc --noEmit -p worker/tsconfig.json
+
+      - name: Unit + integration tests (node)
+        run: npm test
+
+      - name: Relay tests (workerd)
+        run: npm run test:worker
+
+  release:
+    needs: gate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout (LF via .gitattributes)
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
 
       # Version comes from the committed VERSION file, NOT the branch/ref name, so a
       # push to main keeps a stable release version (bump VERSION to cut a new one).
@@ -67,7 +107,7 @@ jobs:
           echo "release_hash=$(sha256sum manifest.txt | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
 
       - name: Install cosign
-        uses: sigstore/cosign-installer@v3
+        uses: sigstore/cosign-installer@d58896d6a1865668819e1d91763c7751a165e159 # v3.9.2
 
       - name: Sign the manifest into public-good Rekor (keyless)
         run: |
@@ -77,13 +117,20 @@ jobs:
 
       # wrangler bundles the Worker (worker/index.ts) at deploy time, which pulls in
       # its imports (@noble, @scure via the shared src/), so the runner needs the
-      # project deps. The container build's node_modules stays in the container; the
-      # runner has none until now. (dist/ was copied out separately and is unaffected.)
+      # project deps at the SAME node version the project pins. The container
+      # build's node_modules stays in the container; the runner has none until now.
+      # (dist/ was copied out separately and is unaffected.)
+      - name: Node from .nvmrc
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+
       - name: Install deps for the Worker bundle
         run: npm ci
 
       - name: Deploy the exact hashed artifact (Model A)
-        uses: cloudflare/wrangler-action@v3
+        uses: cloudflare/wrangler-action@9681c2997648301493e78cacbfb790a9f19c833f # v3.9.0
         with:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
@@ -98,12 +145,13 @@ jobs:
 
       # No tag on a main push, so publish the transparency artifacts to the run
       # instead of a GitHub Release. Rekor (append-only) is the real anchor; these
-      # are conveniences an auditor can also regenerate from source. The commit is
-      # recorded on the run itself, so the exact build is identifiable.
+      # are conveniences an auditor can also regenerate from source. The commit and
+      # the release hash are both in the artifact name, so correlating a run to a
+      # Rekor entry needs no download.
       - name: Publish the manifest + cosign bundle as run artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: nightjar-release-${{ env.NIGHTJAR_VERSION }}-${{ github.sha }}
+          name: nightjar-${{ env.NIGHTJAR_VERSION }}-${{ github.sha }}-${{ steps.hash.outputs.release_hash }}
           path: |
             manifest.txt
             release.json

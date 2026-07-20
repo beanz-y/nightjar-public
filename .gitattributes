@@ -3,7 +3,7 @@
 # Windows; without this, git would check text out with CRLF locally while Linux
 # CI/Docker use LF, and a Windows friend rebuilding from a public tag would get a
 # different release hash than the LF-built one signed into Rekor. Reproduction
-# requires an LF checkout (the runbook says so).
+# requires an LF checkout (see docs/VERIFYING.md).
 * text=auto eol=lf
 
 # Binary assets: never touch their bytes.

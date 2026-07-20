@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import { generateIdentity } from '../crypto/identity'
 import { bytesEqual } from '../crypto/primitives'
-import { buildOwnBundle, generateOneTimePrekeys } from '../crypto/prekeys'
+import { buildOwnBundle, generateOneTimePrekeys, generateSignedPrekey } from '../crypto/prekeys'
 import { InMemoryLock } from './lock'
 import { MemoryKeyStore } from './keystore'
 import { PrekeyStore } from './prekeyStore'
@@ -62,5 +62,65 @@ describe('PrekeyStore', () => {
     // Re-adding known ids does not duplicate.
     await prekeys.addOpks(more)
     expect(await prekeys.availableOpkCount()).toBe(5)
+  })
+})
+
+describe('SPK rotation storage (P8)', () => {
+  const DAY = 86_400_000
+
+  async function withRotated() {
+    const { own, prekeys } = await fresh()
+    const id = generateIdentity()
+    const rotated = generateSignedPrekey(id, 2, NOW + 8 * DAY)
+    await prekeys.addSpk({
+      id: 2,
+      createdAt: rotated.spk.createdAt,
+      expiry: rotated.spk.expiry,
+      priv: rotated.priv,
+      pub: rotated.spk.pub,
+      sig: rotated.spk.sig,
+    })
+    return { own, prekeys }
+  }
+
+  it('addSpk keeps the old SPK and signedPrekeyWire returns the newest', async () => {
+    const { prekeys } = await withRotated()
+    const keys = await prekeys.responderKeys()
+    expect([...keys.spkPrivById.keys()].sort((a, b) => a - b)).toEqual([1, 2])
+    expect((await prekeys.signedPrekeyWire())?.id).toBe(2)
+    expect((await prekeys.newestSpk())?.id).toBe(2)
+    expect(await prekeys.maxSpkId()).toBe(2)
+    // Both keypairs remain resolvable for in-flight initials.
+    expect(await prekeys.spkKeyPair(1)).not.toBeNull()
+    expect(await prekeys.spkKeyPair(2)).not.toBeNull()
+  })
+
+  it('rejects a duplicate SPK id', async () => {
+    const { prekeys } = await withRotated()
+    const id = generateIdentity()
+    const dup = generateSignedPrekey(id, 2, NOW)
+    await expect(
+      prekeys.addSpk({ id: 2, createdAt: NOW, expiry: NOW + DAY, priv: dup.priv, pub: dup.spk.pub, sig: dup.spk.sig }),
+    ).rejects.toThrow(/already stored/)
+  })
+
+  it('tracks the published SPK id only when marked', async () => {
+    const { prekeys } = await withRotated()
+    expect(await prekeys.publishedSpkId()).toBeNull()
+    await prekeys.markSpkPublished(2)
+    expect(await prekeys.publishedSpkId()).toBe(2)
+  })
+
+  it('pruneRetiredSpks drops an SPK only past expiry + grace, and never the newest', async () => {
+    const { prekeys } = await withRotated()
+    // SPK 1: createdAt NOW, expiry NOW+14d. Within grace (30d after expiry): kept.
+    expect(await prekeys.pruneRetiredSpks(NOW + 20 * DAY)).toBe(0)
+    // Past expiry + grace (~44d): pruned; SPK 2 remains.
+    expect(await prekeys.pruneRetiredSpks(NOW + 60 * DAY)).toBe(1)
+    const keys = await prekeys.responderKeys()
+    expect([...keys.spkPrivById.keys()]).toEqual([2])
+    // The newest survives any horizon.
+    expect(await prekeys.pruneRetiredSpks(NOW + 500 * DAY)).toBe(0)
+    expect((await prekeys.newestSpk())?.id).toBe(2)
   })
 })

@@ -20,12 +20,15 @@ import {
   subscribePush,
   unsubscribePush,
 } from '../platform/webpush'
-import { IdbKeyStore } from '../storage/keystore'
+import { openBackup, parseBackupHeader, sealBackup } from '../crypto/backup'
+import { createBackupKdf } from '../platform/backupKdf'
+import { IdbKeyStore, type KeyStore } from '../storage/keystore'
 import { bootstrapIdentity } from '../storage/identityStore'
 import { IdbSessionStore } from '../storage/sessionStore'
-import { createLock } from '../storage/lock'
-import { createSentinel, requestPersistentStorage } from '../storage/persist'
+import { type Lock, createLock } from '../storage/lock'
+import { type Sentinel, createSentinel, requestPersistentStorage } from '../storage/persist'
 import { PrekeyStore } from '../storage/prekeyStore'
+import { clearPendingRestore, pendingRestore, stageRestore } from '../storage/restore'
 import { type Contact, ContactStore } from '../trust/contactStore'
 import {
   type InviteArtifact,
@@ -51,6 +54,9 @@ export interface Message {
   dir: 'in' | 'out'
   text: string
   ts: number
+  /** An outbound bubble whose send threw before it was queued: rendered as
+   *  failed, never as silently delivered (P8 review fix). */
+  failed?: boolean
 }
 
 export interface MintedInvite {
@@ -64,13 +70,23 @@ interface Live {
   identity: Identity
 }
 
+interface Stores {
+  keys: KeyStore
+  lock: Lock
+  sentinel: Sentinel
+  sessions: IdbSessionStore
+  contacts: ContactStore
+}
+
 const uid = () => (globalThis.crypto?.randomUUID?.() ?? `m-${Math.random().toString(36).slice(2)}`)
 const appOrigin = () => globalThis.location?.origin || getRelayOrigin()
+// Well under the relay's 64 KiB ciphertext cap; a text messenger never needs more.
+const MAX_MESSAGE_CHARS = 8000
 
 // Derive the notifications UI state from the platform + the relay's push key.
 // The toggle is `available` only when the browser supports push, the relay has a
 // VAPID key, and (on iOS) the app is installed to the Home Screen (iOS refuses
-// permission/subscribe in a plain Safari tab; red-team H5).
+// permission/subscribe in a plain Safari tab).
 function computeNotify(pushKey: string | null): NotifyState {
   const supported = pushSupported()
   const iosNotInstalled = isIos() && !isStandalone()
@@ -87,6 +103,9 @@ export function useNightjar() {
   const [phase, setPhase] = useState<Phase>('loading')
   const [error, setError] = useState<string | null>(null)
   const [notice, setNotice] = useState<string | null>(null)
+  // Security events are STICKY: each needs its own dismissal and is never
+  // overwritten by later operational notices (P8 review fix).
+  const [securityNotices, setSecurityNotices] = useState<string[]>([])
   const [identity, setIdentity] = useState<Identity | null>(null)
   const [connected, setConnected] = useState(false)
   const [registered, setRegistered] = useState(false)
@@ -94,8 +113,13 @@ export function useNightjar() {
   const [conversations, setConversations] = useState<Record<string, Message[]>>({})
   const [prefillInvite, setPrefillInvite] = useState<string>('')
   const [notify, setNotify] = useState<NotifyState>(() => computeNotify(null))
+  const [restoreBusy, setRestoreBusy] = useState(false)
+  const [restoreError, setRestoreError] = useState<string | null>(null)
+  const [storagePersisted, setStoragePersisted] = useState<boolean | null>(null)
 
   const liveRef = useRef<Live | null>(null)
+  const storesRef = useRef<Stores | null>(null)
+  const restoreFixupRef = useRef<Promise<void> | null>(null)
   const pushKeyRef = useRef<string | null>(null)
   const heartbeatRef = useRef<number | null>(null)
   const visHandlerRef = useRef<(() => void) | null>(null)
@@ -113,19 +137,53 @@ export function useNightjar() {
     setConversations((prev) => ({ ...prev, [peer]: [...(prev[peer] ?? []), m] }))
   }, [])
 
+  // Consume a pending-restore flag (P8): the forced fresh-prekey publish that
+  // completes a restore (DESIGN 8.3). Deduplicated through a ref because it is
+  // triggered from both the boot path and every onConnection(true), which can
+  // overlap on the first connect; reregister must never run twice concurrently.
+  const completeRestoreIfPending = useCallback((client: NightjarClient, keys: KeyStore): Promise<void> => {
+    if (restoreFixupRef.current) return restoreFixupRef.current
+    restoreFixupRef.current = (async () => {
+      try {
+        if (!client.isRegistered || !(await pendingRestore(keys))) return
+        await client.reregister()
+        await clearPendingRestore(keys)
+        setNotice('restore complete: fresh prekeys are published. Send each contact a message to re-establish your conversations.')
+      } catch {
+        setNotice('restore is not fully finished (fresh prekeys not yet published); it will retry automatically')
+      } finally {
+        restoreFixupRef.current = null
+      }
+    })()
+    return restoreFixupRef.current
+  }, [])
+
   useEffect(() => {
     let cancelled = false
-    // Prefill the invite box from a deep link (…/#i=CODE.inviter).
+    // Prefill the invite box from a deep link (…/#i=CODE.inviter), then strip
+    // it from the URL so the invite token does not linger in browser history.
     const hash = globalThis.location?.hash ?? ''
     const m = hash.match(/[#?&]i=([^#?&\s]+)/)
-    if (m) setPrefillInvite(decodeURIComponent(m[1]))
+    if (m) {
+      setPrefillInvite(decodeURIComponent(m[1]))
+      try {
+        history.replaceState(null, '', globalThis.location.pathname + globalThis.location.search)
+      } catch {
+        /* history API unavailable: cosmetic only */
+      }
+    }
 
     void (async () => {
       try {
-        await requestPersistentStorage()
+        const persisted = await requestPersistentStorage()
+        if (!cancelled) setStoragePersisted(persisted)
         const lock = createLock()
         const keys = new IdbKeyStore()
-        const boot = await bootstrapIdentity(keys, createSentinel(), lock)
+        const sentinel = createSentinel()
+        const sessions = new IdbSessionStore()
+        const contactStore = new ContactStore(keys, lock)
+        storesRef.current = { keys, lock, sentinel, sessions, contacts: contactStore }
+        const boot = await bootstrapIdentity(keys, sentinel, lock)
         if (cancelled) return
         if (boot.state === 'evicted-needs-restore' || !boot.identity) {
           setPhase('evicted')
@@ -133,13 +191,46 @@ export function useNightjar() {
         }
         const id = boot.identity
         const prekeys = new PrekeyStore(keys, lock)
-        const contacts = new ContactStore(keys, lock)
-        const client = new NightjarClient(id, new IdbSessionStore(), prekeys, contacts, lock, {
+        const client = new NightjarClient(id, sessions, prekeys, contactStore, lock, {
           onMessage: (from, text) => {
             appendMessage(from, { id: uid(), dir: 'in', text, ts: Date.now() })
             void client.listContacts().then(setContacts)
           },
           onError: (detail) => setNotice(detail),
+          onSecurity: (detail) => setSecurityNotices((prev) => (prev.includes(detail) ? prev : [...prev, detail])),
+          // A queued message was permanently rejected: mark that exact bubble
+          // failed (envelope id == message id) so it never reads as delivered.
+          onSendFailed: (envId, reason) => {
+            setConversations((prev) => {
+              const next: Record<string, Message[]> = {}
+              for (const [p, msgs] of Object.entries(prev)) {
+                next[p] = msgs.map((m) => (m.id === envId ? { ...m, failed: true } : m))
+              }
+              return next
+            })
+            setNotice(`a message could not be delivered (${reason})`)
+          },
+          // Fires on every drop AND every automatic reconnect: keep the UI's
+          // connected dot honest, and re-run the connect-time side band
+          // (presence, push freshness, a still-pending restore) after a heal.
+          onConnection: (up) => {
+            if (cancelled) return
+            setConnected(up)
+            if (!up) return
+            client.sendPresence(document.visibilityState === 'visible')
+            if (client.pushKey && notifyPref() && notifyPermission() === 'granted') {
+              void subscribePush(client.pushKey)
+                .then((sub) => sub && client.subscribePush(sub))
+                .catch(() => {})
+            }
+            void completeRestoreIfPending(client, keys)
+            // Recover a stale terminal 'error' phase: if the FIRST connect failed
+            // (boot catch set phase='error') but a later reconnect succeeded, the
+            // client is live and must not be stranded behind the error screen.
+            setRegistered(client.isRegistered)
+            void client.listContacts().then(setContacts).catch(() => {})
+            setPhase((prev) => (prev === 'error' ? (client.isRegistered ? 'ready' : 'onboarding') : prev))
+          },
         })
         liveRef.current = { client, identity: id }
         setIdentity(id)
@@ -148,6 +239,13 @@ export function useNightjar() {
         if (cancelled) return
         setConnected(true)
         setRegistered(authed.registered)
+
+        // Await the pending-restore fixup BEFORE 'ready' so the window where
+        // the Directory still serves dead prekeys stays as small as one
+        // round-trip. onConnection(true) already started it during connect();
+        // this joins the same deduplicated promise.
+        if (authed.registered) await completeRestoreIfPending(client, keys)
+        if (cancelled) return
         setContacts(await client.listContacts())
         setPhase(authed.registered ? 'ready' : 'onboarding')
 
@@ -171,11 +269,19 @@ export function useNightjar() {
         const onVisibility = () => {
           const visible = document.visibilityState === 'visible'
           client.sendPresence(visible)
-          if (visible) void clearNotifications()
+          if (visible) {
+            void clearNotifications()
+            client.reconnectNow() // a backgrounded tab's socket often died quietly
+          }
         }
+        const onOnline = () => client.reconnectNow()
         heartbeatRef.current = window.setInterval(beat, PRESENCE_HEARTBEAT_MS)
         document.addEventListener('visibilitychange', onVisibility)
-        visHandlerRef.current = onVisibility
+        window.addEventListener('online', onOnline)
+        visHandlerRef.current = () => {
+          document.removeEventListener('visibilitychange', onVisibility)
+          window.removeEventListener('online', onOnline)
+        }
         void clearNotifications() // the app is open now; drop any prior nudge
       } catch (e) {
         if (cancelled) return
@@ -188,7 +294,7 @@ export function useNightjar() {
       cancelled = true
       if (heartbeatRef.current !== null) window.clearInterval(heartbeatRef.current)
       heartbeatRef.current = null
-      if (visHandlerRef.current) document.removeEventListener('visibilitychange', visHandlerRef.current)
+      visHandlerRef.current?.()
       visHandlerRef.current = null
       liveRef.current?.client.close()
       liveRef.current = null
@@ -225,12 +331,35 @@ export function useNightjar() {
     async (peer: string, text: string) => {
       const live = liveRef.current
       if (!live || !text.trim()) return
-      appendMessage(peer, { id: uid(), dir: 'out', text, ts: Date.now() })
+      // Reject over-long text up front: the relay caps ciphertext at 64 KiB, and
+      // a rejection there advances the ratchet before failing. This keeps a
+      // normal user well under that with a clear message instead of a silent drop.
+      if (text.length > MAX_MESSAGE_CHARS) {
+        setNotice(`message is too long (limit ${MAX_MESSAGE_CHARS.toLocaleString()} characters)`)
+        return
+      }
+      const msgId = uid()
+      appendMessage(peer, { id: msgId, dir: 'out', text, ts: Date.now() })
       try {
-        await live.client.sendText(peer, text)
+        // Pass msgId so the envelope id equals this bubble's id; a later async
+        // permanent rejection (onSendFailed) can then mark this exact bubble.
+        await live.client.sendText(peer, text, msgId)
         setContacts(await live.client.listContacts())
       } catch (e) {
-        setNotice(`send failed: ${String(e instanceof Error ? e.message : e)}`)
+        // The optimistic bubble must never read as delivered: flag it failed.
+        setConversations((prev) => ({
+          ...prev,
+          [peer]: (prev[peer] ?? []).map((m) => (m.id === msgId ? { ...m, failed: true } : m)),
+        }))
+        const isConflict = e instanceof Error && e.name === 'KeyConflictError'
+        if (isConflict) {
+          setSecurityNotices((prev) => {
+            const d = `sending to ${peer.slice(0, 12)}… was BLOCKED: the directory presented a key that conflicts with the one stored for this contact. Verify safety numbers in person.`
+            return prev.includes(d) ? prev : [...prev, d]
+          })
+        } else {
+          setNotice(`send failed: ${String(e instanceof Error ? e.message : e)}`)
+        }
       }
     },
     [appendMessage],
@@ -256,11 +385,68 @@ export function useNightjar() {
   const markVerified = useCallback(async (peer: string) => {
     const live = liveRef.current
     if (!live) return
-    await live.client.markVerified(peer)
-    setContacts(await live.client.listContacts())
+    try {
+      await live.client.markVerified(peer)
+      setContacts(await live.client.listContacts())
+    } catch (e) {
+      // Never let a failed trust upgrade look like it silently succeeded.
+      setNotice(`could not save the verification: ${String(e instanceof Error ? e.message : e)}`)
+    }
+  }, [])
+
+  const dismissSecurityNotice = useCallback((detail: string) => {
+    setSecurityNotices((prev) => prev.filter((d) => d !== detail))
   }, [])
 
   const dismissNotice = useCallback(() => setNotice(null), [])
+
+  // Restore this device from a backup file (P8). Available from the evicted
+  // screen and from onboarding (where it replaces the freshly generated,
+  // never-registered identity). Ends in a full reload: a clean re-bootstrap is
+  // the only supported path into a restored identity.
+  const restoreFromBackup = useCallback(async (file: File, passphrase: string) => {
+    const stores = storesRef.current
+    if (!stores) return
+    setRestoreBusy(true)
+    setRestoreError(null)
+    try {
+      const blob = new Uint8Array(await file.arrayBuffer())
+      parseBackupHeader(blob) // cheap format/bounds errors surface before the slow KDF
+      const opened = await openBackup(blob, passphrase, { kdf: createBackupKdf() })
+      liveRef.current?.client.close()
+      await stageRestore(
+        { keys: stores.keys, sessions: stores.sessions, contacts: stores.contacts, sentinel: stores.sentinel, lock: stores.lock },
+        opened.payload,
+      )
+      globalThis.location.reload()
+    } catch (e) {
+      setRestoreError(e instanceof Error ? e.message : String(e))
+      setRestoreBusy(false)
+    }
+  }, [])
+
+  // Seal and download a backup of the identity + contact trust (P8). Returns
+  // true on success so the panel can show its written-down confirmation step.
+  const exportBackup = useCallback(async (passphrase: string): Promise<boolean> => {
+    const live = liveRef.current
+    if (!live) return false
+    try {
+      const contacts = await live.client.listContacts()
+      const blob = await sealBackup(live.identity, contacts, passphrase, { kdf: createBackupKdf() })
+      const stamp = new Date().toISOString().slice(0, 10).replaceAll('-', '')
+      const url = URL.createObjectURL(new Blob([blob.buffer as ArrayBuffer], { type: 'application/octet-stream' }))
+      const a = document.createElement('a')
+      a.href = url
+      a.download = `nightjar-backup-${stamp}.njbk`
+      a.rel = 'noopener'
+      a.click()
+      setTimeout(() => URL.revokeObjectURL(url), 60_000)
+      return true
+    } catch (e) {
+      setNotice(`backup failed: ${String(e instanceof Error ? e.message : e)}`)
+      return false
+    }
+  }, [])
 
   // Turn notifications ON for this device: request permission (only here, never
   // automatically), subscribe with the relay's VAPID key, and register the
@@ -308,6 +494,7 @@ export function useNightjar() {
     phase,
     error,
     notice,
+    securityNotices,
     identity,
     connected,
     registered,
@@ -315,6 +502,9 @@ export function useNightjar() {
     conversations,
     prefillInvite,
     notify,
+    restoreBusy,
+    restoreError,
+    storagePersisted,
     actions: {
       join,
       send,
@@ -322,9 +512,12 @@ export function useNightjar() {
       mintInvite,
       markVerified,
       dismissNotice,
+      dismissSecurityNotice,
       listContacts,
       enableNotifications,
       disableNotifications,
+      restoreFromBackup,
+      exportBackup,
     },
   }
 }

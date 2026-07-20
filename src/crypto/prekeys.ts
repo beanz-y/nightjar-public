@@ -64,7 +64,8 @@ export function generateSignedPrekey(
   const createdAt = now
   // The acceptance window is the 14-day max age, not the ~7-day rotation cadence,
   // so a key stays usable while the owner is briefly offline (DESIGN 4.2, 14).
-  // The owner still rotates weekly (P4), producing overlapping valid prekeys.
+  // The client rotates on connect once the current SPK passes SPK_ROTATION_MS
+  // (client.ts maybeRotateSpk), producing overlapping valid prekeys.
   const expiry = now + SPK_MAX_AGE_MS
   const sig = ed25519Sign(spkSigningInput(id, createdAt, expiry, kp.publicKey), identity.ikSig.privateKey)
   return { spk: { id, createdAt, expiry, pub: kp.publicKey, sig }, priv: kp.privateKey }
@@ -95,6 +96,11 @@ export function verifyFetchedBundle(
   if (bundle.version < VERSION_FLOOR) {
     throw new Error('x3dh: peer version below floor (possible downgrade)')
   }
+  // Ceiling as well as floor: a version we do not speak has semantics we cannot
+  // assume, so it is rejected rather than processed with v1 rules.
+  if (bundle.version > VERSION) {
+    throw new Error('x3dh: peer version newer than this client speaks')
+  }
   if (knownPeerIkSig && !bytesEqual(knownPeerIkSig, bundle.ikSigPub)) {
     throw new Error('x3dh: peer identity key changed; verify the safety number')
   }
@@ -104,6 +110,12 @@ export function verifyFetchedBundle(
     throw new Error('x3dh: IK_dh binding signature invalid')
   }
   const { spk } = bundle
+  // Fail closed on non-finite timestamps BEFORE the comparisons below: every
+  // one of them is false for NaN, so without this a NaN-stamped SPK would pass
+  // all three freshness checks.
+  if (!Number.isFinite(spk.createdAt) || !Number.isFinite(spk.expiry) || !Number.isInteger(spk.id)) {
+    throw new Error('x3dh: signed prekey has malformed id or timestamps')
+  }
   if (!ed25519Verify(spk.sig, spkSigningInput(spk.id, spk.createdAt, spk.expiry, spk.pub), bundle.ikSigPub)) {
     throw new Error('x3dh: signed-prekey signature invalid')
   }

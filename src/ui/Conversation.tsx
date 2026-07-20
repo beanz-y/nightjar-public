@@ -45,7 +45,8 @@ export function Conversation({ peer, messages, trust, onSend, onVerify }: Props)
         {messages.length === 0 && <p className="muted small">No messages yet. Say hello.</p>}
         {messages.map((m) => (
           <div key={m.id} className={`msg msg-${m.dir}`}>
-            <span className="bubble">{m.text}</span>
+            <span className={`bubble${m.failed ? ' bubble-failed' : ''}`}>{m.text}</span>
+            {m.failed && <span className="error tiny">not sent</span>}
           </div>
         ))}
         <div ref={endRef} />

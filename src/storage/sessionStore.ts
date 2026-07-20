@@ -25,6 +25,7 @@
 // is still enforced one layer up by the inbound processor / client holding the
 // per-peer lock.
 
+import { ENVELOPE_TTL_MS } from '../crypto/constants'
 import type { RatchetSnapshot } from '../crypto/ratchet'
 
 /** One ratchet session inside a peer's book. `id` is a stable local handle
@@ -55,6 +56,7 @@ export interface OutboxEntry {
   env: unknown
   createdAt: number
 }
+
 
 export interface SessionStore {
   // --- session book ------------------------------------------------------
@@ -92,6 +94,18 @@ export interface SessionStore {
   // --- outbox ------------------------------------------------------------
   removeOutbox(id: string): Promise<void>
   pendingOutbox(): Promise<OutboxEntry[]>
+
+  // --- maintenance (P8) ----------------------------------------------------
+  /** Age out dedup + failure rows past ENVELOPE_TTL_MS: the relay redelivers an
+   *  unacked envelope for up to that long, so a `seen` row must outlive the whole
+   *  redelivery window (pruning at the shorter seen-id TTL would let a late
+   *  redelivery skip dedup and burn poison-drop attempts). `failures` age out on
+   *  the same bound (the envelope they count no longer exists past it). The
+   *  REPLAY store is never pruned, by design (DESIGN 4.3). */
+  pruneExpired(now: number): Promise<{ seen: number; failures: number }>
+  /** Erase every store (restore, DESIGN 8.3): a restored identity starts with
+   *  no sessions, dedup state, failure counters, or queued outbox. */
+  wipeAll(): Promise<void>
 }
 
 // --- helpers shared by both implementations --------------------------------
@@ -117,9 +131,9 @@ const clone = <T>(v: T): T => structuredClone(v) as T
 
 export class MemorySessionStore implements SessionStore {
   private readonly books = new Map<string, SessionBook>()
-  private readonly seen = new Set<string>()
+  private readonly seen = new Map<string, number>() // msgId -> seen-at ms
   private readonly replay = new Set<string>()
-  private readonly failures = new Map<string, number>()
+  private readonly failures = new Map<string, { count: number; ts: number }>()
   private readonly outbox = new Map<string, OutboxEntry>()
 
   async loadBook(peerId: string): Promise<SessionBook | null> {
@@ -133,12 +147,12 @@ export class MemorySessionStore implements SessionStore {
 
   async saveBookWithSeen(peerId: string, book: SessionBook, msgId: string): Promise<void> {
     this.books.set(peerId, clone(book))
-    this.seen.add(msgId)
+    this.seen.set(msgId, Date.now())
   }
 
   async saveBookWithSeenReplay(peerId: string, book: SessionBook, msgId: string, initId: string): Promise<void> {
     this.books.set(peerId, clone(book))
-    this.seen.add(msgId)
+    this.seen.set(msgId, Date.now())
     this.replay.add(initId)
   }
 
@@ -179,7 +193,7 @@ export class MemorySessionStore implements SessionStore {
   }
 
   async markSeen(msgId: string): Promise<void> {
-    this.seen.add(msgId)
+    this.seen.set(msgId, Date.now())
   }
 
   async hasReplayedInitial(initId: string): Promise<boolean> {
@@ -187,9 +201,10 @@ export class MemorySessionStore implements SessionStore {
   }
 
   async bumpFailure(msgId: string): Promise<number> {
-    const n = (this.failures.get(msgId) ?? 0) + 1
-    this.failures.set(msgId, n)
-    return n
+    const prev = this.failures.get(msgId)
+    const next = { count: (prev?.count ?? 0) + 1, ts: prev?.ts ?? Date.now() }
+    this.failures.set(msgId, next)
+    return next.count
   }
 
   async clearFailure(msgId: string): Promise<void> {
@@ -203,6 +218,32 @@ export class MemorySessionStore implements SessionStore {
   async pendingOutbox(): Promise<OutboxEntry[]> {
     return [...this.outbox.values()].map(clone)
   }
+
+  async pruneExpired(now: number): Promise<{ seen: number; failures: number }> {
+    let seen = 0
+    for (const [id, ts] of this.seen) {
+      if (now - ts > ENVELOPE_TTL_MS) {
+        this.seen.delete(id)
+        seen += 1
+      }
+    }
+    let failures = 0
+    for (const [id, f] of this.failures) {
+      if (now - f.ts > ENVELOPE_TTL_MS) {
+        this.failures.delete(id)
+        failures += 1
+      }
+    }
+    return { seen, failures }
+  }
+
+  async wipeAll(): Promise<void> {
+    this.books.clear()
+    this.seen.clear()
+    this.replay.clear()
+    this.failures.clear()
+    this.outbox.clear()
+  }
 }
 
 // --- IndexedDB implementation ---------------------------------------------
@@ -213,7 +254,7 @@ const SEEN = 'seen'
 const REPLAY = 'replay'
 const FAILURES = 'failures'
 const OUTBOX = 'outbox'
-const DB_VERSION = 3
+const DB_VERSION = 4
 
 export class IdbSessionStore implements SessionStore {
   private dbPromise: Promise<IDBDatabase> | null = null
@@ -234,13 +275,19 @@ export class IdbSessionStore implements SessionStore {
           // none yet: the only durable sessions before P5 were isolated dev
           // self-tests using the in-memory store.)
           const from = (ev as IDBVersionChangeEvent).oldVersion
-          if (from >= 1 && from < 3) {
-            const tx = req.transaction
-            if (tx) migrateSessionsToBooks(tx.objectStore(SESSIONS))
-          }
+          const tx = req.transaction
+          if (from >= 1 && from < 3 && tx) migrateSessionsToBooks(tx.objectStore(SESSIONS))
+          // v3 -> v4: `seen` values become the seen-at timestamp and `failures`
+          // values become {count, ts}, so both can be TTL-pruned. Existing rows
+          // are stamped at migration time (their clocks start now; pruning a
+          // dedup row EARLY is the only unsafe direction, so never stamp 0).
+          if (from >= 1 && from < 4 && tx) migrateRetentionStamps(tx.objectStore(SEEN), tx.objectStore(FAILURES))
         }
         req.onsuccess = () => resolve(req.result)
-        req.onerror = () => reject(req.error)
+        req.onerror = () => {
+          this.dbPromise = null // a failed open must not wedge every later call
+          reject(req.error)
+        }
       })
     }
     return this.dbPromise
@@ -283,7 +330,7 @@ export class IdbSessionStore implements SessionStore {
   async saveBookWithSeen(peerId: string, book: SessionBook, msgId: string): Promise<void> {
     await this.tx([SESSIONS, SEEN], 'readwrite', (t) => {
       t.objectStore(SESSIONS).put(book, peerId)
-      t.objectStore(SEEN).put(1, msgId)
+      t.objectStore(SEEN).put(Date.now(), msgId)
       return null
     })
   }
@@ -291,7 +338,7 @@ export class IdbSessionStore implements SessionStore {
   async saveBookWithSeenReplay(peerId: string, book: SessionBook, msgId: string, initId: string): Promise<void> {
     await this.tx([SESSIONS, SEEN, REPLAY], 'readwrite', (t) => {
       t.objectStore(SESSIONS).put(book, peerId)
-      t.objectStore(SEEN).put(1, msgId)
+      t.objectStore(SEEN).put(Date.now(), msgId)
       t.objectStore(REPLAY).put(1, initId)
       return null
     })
@@ -340,7 +387,7 @@ export class IdbSessionStore implements SessionStore {
   }
 
   async markSeen(msgId: string): Promise<void> {
-    await this.tx(SEEN, 'readwrite', (t) => t.objectStore(SEEN).put(1, msgId))
+    await this.tx(SEEN, 'readwrite', (t) => t.objectStore(SEEN).put(Date.now(), msgId))
   }
 
   async hasReplayedInitial(initId: string): Promise<boolean> {
@@ -356,8 +403,11 @@ export class IdbSessionStore implements SessionStore {
       const get = store.get(msgId)
       let next = 1
       get.onsuccess = () => {
-        next = ((get.result as number | undefined) ?? 0) + 1
-        store.put(next, msgId)
+        const prev = get.result as number | { count: number; ts: number } | undefined
+        const count = typeof prev === 'number' ? prev : (prev?.count ?? 0)
+        const ts = typeof prev === 'object' && prev ? prev.ts : Date.now()
+        next = count + 1
+        store.put({ count: next, ts }, msgId)
       }
       get.onerror = () => reject(get.error)
       t.oncomplete = () => resolve(next)
@@ -378,6 +428,58 @@ export class IdbSessionStore implements SessionStore {
     const entries = await this.tx<OutboxEntry[]>(OUTBOX, 'readonly', (t) => t.objectStore(OUTBOX).getAll())
     return entries ?? []
   }
+
+  async pruneExpired(now: number): Promise<{ seen: number; failures: number }> {
+    const db = await this.open()
+    return new Promise((resolve, reject) => {
+      const t = db.transaction([SEEN, FAILURES], 'readwrite')
+      let seen = 0
+      let failures = 0
+      const sweep = (store: IDBObjectStore, expired: (v: unknown) => boolean, bump: () => void) => {
+        const cur = store.openCursor()
+        cur.onsuccess = () => {
+          const c = cur.result
+          if (!c) return
+          if (expired(c.value)) {
+            c.delete()
+            bump()
+          }
+          c.continue()
+        }
+      }
+      sweep(
+        t.objectStore(SEEN),
+        (v) => typeof v === 'number' && now - v > ENVELOPE_TTL_MS,
+        () => (seen += 1),
+      )
+      sweep(
+        t.objectStore(FAILURES),
+        (v) => typeof v === 'object' && v !== null && now - (v as { ts: number }).ts > ENVELOPE_TTL_MS,
+        () => (failures += 1),
+      )
+      t.oncomplete = () => resolve({ seen, failures })
+      t.onabort = () => reject(t.error)
+      t.onerror = () => reject(t.error)
+    })
+  }
+
+  async wipeAll(): Promise<void> {
+    await this.tx([SESSIONS, SEEN, REPLAY, FAILURES, OUTBOX], 'readwrite', (t) => {
+      t.objectStore(SESSIONS).clear()
+      t.objectStore(SEEN).clear()
+      t.objectStore(REPLAY).clear()
+      t.objectStore(FAILURES).clear()
+      t.objectStore(OUTBOX).clear()
+      return null
+    })
+  }
+
+  /** Close the cached connection (restore: lets a wipe/reload proceed without a
+   *  blocked-version dance). Subsequent calls reopen on demand. */
+  close(): void {
+    void this.dbPromise?.then((db) => db.close()).catch(() => {})
+    this.dbPromise = null
+  }
 }
 
 /** v2 -> v3 migration: rewrite each bare-snapshot session value as a one-session
@@ -393,5 +495,26 @@ function migrateSessionsToBooks(store: IDBObjectStore): void {
       cursor.update(singleSessionBook(value as RatchetSnapshot))
     }
     cursor.continue()
+  }
+}
+
+/** v3 -> v4 migration: stamp legacy `seen` (value 1) and `failures` (bare count)
+ *  rows with the migration-time clock so TTL pruning can never drop a dedup row
+ *  early. Runs inside the versionchange transaction via cursors. */
+function migrateRetentionStamps(seen: IDBObjectStore, failures: IDBObjectStore): void {
+  const now = Date.now()
+  const seenCur = seen.openCursor()
+  seenCur.onsuccess = () => {
+    const c = seenCur.result
+    if (!c) return
+    if (typeof c.value !== 'number' || c.value < 1_000_000_000_000) c.update(now)
+    c.continue()
+  }
+  const failCur = failures.openCursor()
+  failCur.onsuccess = () => {
+    const c = failCur.result
+    if (!c) return
+    if (typeof c.value === 'number') c.update({ count: c.value, ts: now })
+    c.continue()
   }
 }

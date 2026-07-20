@@ -5,7 +5,7 @@
 // in-app verifier (src/verify/canary.ts), which a round-trip test locks.
 //
 //   CANARY_PRIVATE_KEY=<base64url-32B> node tools/canary-sign.mjs \
-//       --version v0.7.0 --hash <64-hex releaseHash> [--statement "..."]
+//       --version v1.0.0 --hash <64-hex releaseHash> [--statement "..."]
 //
 // MF3 (do not weaken): signedAt defaults to NOW and the tool REFUSES a date more
 // than a few minutes in the future. The whole warrant-canary guarantee is that the

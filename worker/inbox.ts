@@ -297,25 +297,29 @@ export class Inbox {
   }
 
   private async doSend(ws: WebSocket, userId: string, msg: SendMsg): Promise<void> {
+    // Send errors carry `ref` = the envelope id (when parseable) so the sender
+    // can stop retrying a PERMANENTLY undeliverable outbox entry instead of
+    // silently re-firing it on every reconnect (P8 review fix).
+    const refPart = typeof msg.env?.id === 'string' ? { ref: msg.env.id } : {}
     // Gate the relay surface on the sender being registered (invite-gated), so an
     // unregistered key-holder cannot flood a victim's inbox (P4 review).
     const att = ws.deserializeAttachment() as Attachment | null
     if (!att?.registered) {
-      this.sendTo(ws, { t: 'error', code: 'not_registered', msg: 'register before sending' })
+      this.sendTo(ws, { t: 'error', code: 'not_registered', msg: 'register before sending', ...refPart })
       return
     }
     if (!USER_ID_RE.test(msg.to)) {
-      this.sendTo(ws, { t: 'error', code: 'bad_to', msg: 'bad recipient user id' })
+      this.sendTo(ws, { t: 'error', code: 'bad_to', msg: 'bad recipient user id', ...refPart })
       return
     }
     try {
       const env = decodeEnvelope(msg.env) // structural validation
       if (env.ciphertext.length > MAX_CIPHERTEXT_BYTES) {
-        this.sendTo(ws, { t: 'error', code: 'too_large', msg: 'ciphertext too large' })
+        this.sendTo(ws, { t: 'error', code: 'too_large', msg: 'ciphertext too large', ...refPart })
         return
       }
     } catch {
-      this.sendTo(ws, { t: 'error', code: 'bad_envelope', msg: 'malformed envelope' })
+      this.sendTo(ws, { t: 'error', code: 'bad_envelope', msg: 'malformed envelope', ...refPart })
       return
     }
     try {
@@ -328,7 +332,7 @@ export class Inbox {
       // had them). The sender's outbox can now stop retrying this id.
       this.sendTo(ws, { t: 'sent', id: msg.env.id })
     } catch (e) {
-      this.replyError(ws, e)
+      this.replyError(ws, e, undefined, 'ref' in refPart ? refPart.ref : undefined)
     }
   }
 
@@ -545,9 +549,9 @@ export class Inbox {
     }
   }
 
-  private replyError(ws: WebSocket, e: unknown, reqId?: string): void {
+  private replyError(ws: WebSocket, e: unknown, reqId?: string, ref?: string): void {
     const code = e instanceof DirectoryError ? e.code : 'internal'
     const msg = e instanceof Error ? e.message : String(e)
-    this.sendTo(ws, reqId ? { t: 'error', code, msg, reqId } : { t: 'error', code, msg })
+    this.sendTo(ws, { t: 'error', code, msg, ...(reqId ? { reqId } : {}), ...(ref ? { ref } : {}) })
   }
 }

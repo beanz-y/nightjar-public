@@ -4,9 +4,12 @@
   "main": "worker/index.ts",
   "compatibility_date": "2025-09-06",
 
-  // The built PWA (DESIGN 10.2). The Worker runs first for every request (it owns
-  // /connect and /admin/*), then falls through to env.ASSETS for static files;
-  // unknown non-API routes serve index.html so client-side routing works.
+  // The built PWA (DESIGN 10.2). Without run_worker_first, Workers static-asset
+  // routing serves a matching asset DIRECTLY (the Worker is not invoked for it),
+  // and only non-asset routes (/connect, /admin/*, /canary.json, /health) reach
+  // the Worker. That is deliberate and good for the transparency story: the
+  // Worker cannot conditionally rewrite the hashed static bundle per request.
+  // Unknown non-API routes serve index.html so client-side routing works.
   "assets": {
     "directory": "./dist",
     "binding": "ASSETS",

@@ -161,6 +161,15 @@ input {
   padding: 0.5rem 0.75rem;
   margin: 0.6rem 0;
 }
+.banner-alert {
+  background: #201014;
+  border-color: #57202c;
+  color: var(--danger, #e0656f);
+}
+.bubble-failed {
+  opacity: 0.55;
+  border: 1px dashed var(--danger, #e0656f);
+}
 .content {
   flex: 1;
   padding: 1rem 0.25rem;

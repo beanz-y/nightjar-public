@@ -20,6 +20,7 @@ import {
   type MessageHeader,
   type RatchetState,
   deserializeRatchet,
+  pruneSkippedKeys,
   ratchetDecrypt,
   ratchetEncrypt,
   serializeRatchet,
@@ -69,10 +70,12 @@ export class RatchetSession {
   async decrypt(header: MessageHeader, ciphertext: Uint8Array): Promise<Uint8Array> {
     return this.lock.withLock(this.lockName(), async () => {
       const state = await this.loadState()
+      const now = Date.now()
       // Throws on a forged/replayed/oversized message -> we never save -> the
       // persisted state is left untouched.
-      const { state: next, plaintext } = ratchetDecrypt(state, header, ciphertext)
-      await this.store.save(this.peerId, serializeRatchet(next)) // commit BEFORE returning plaintext
+      const { state: next, plaintext } = ratchetDecrypt(state, header, ciphertext, now)
+      const { state: pruned } = pruneSkippedKeys(next, now)
+      await this.store.save(this.peerId, serializeRatchet(pruned)) // commit BEFORE returning plaintext
       return plaintext
     })
   }
@@ -84,6 +87,7 @@ export class RatchetSession {
   private async loadState(): Promise<RatchetState> {
     const snap = await this.store.load(this.peerId)
     if (!snap) throw new Error(`no ratchet session for peer ${this.peerId}`)
-    return deserializeRatchet(snap)
+    // Date.now() stamps pre-P8 skipped entries at first load (see deserializeRatchet).
+    return deserializeRatchet(snap, Date.now())
   }
 }

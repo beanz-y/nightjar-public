@@ -16,8 +16,8 @@
 import { type Identity, deriveUserId } from '../crypto/identity'
 import type { PushSubscriptionInfo } from '../platform'
 import { utf8 } from '../crypto/primitives'
-import { OPK_BATCH, OPK_REPLENISH_THRESHOLD, OUTBOX_RETRY_HORIZON_MS } from '../crypto/constants'
-import { OWN_BUNDLE_VERSION, buildOwnBundle, generateOneTimePrekeys } from '../crypto/prekeys'
+import { OPK_BATCH, OPK_REPLENISH_THRESHOLD, OUTBOX_RETRY_HORIZON_MS, SPK_ROTATION_MS } from '../crypto/constants'
+import { OWN_BUNDLE_VERSION, buildOwnBundle, generateOneTimePrekeys, generateSignedPrekey } from '../crypto/prekeys'
 import { deserializeRatchet, initRatchetInitiator, ratchetEncrypt, serializeRatchet } from '../crypto/ratchet'
 import { x3dhInitiate } from '../crypto/x3dh'
 import { type Contact, type ContactStore, type TrustLevel, KeyConflictError } from '../trust/contactStore'
@@ -29,6 +29,7 @@ import type { OutboxEntry, SessionStore } from '../storage/sessionStore'
 import {
   type Envelope,
   type WireEnvelope,
+  b64decode,
   b64encode,
   decodeEnvelope,
   encodeInitialHeader,
@@ -44,18 +45,38 @@ const decode = (b: Uint8Array) => new TextDecoder().decode(b)
 const sessionLock = (peerId: string) => `nightjar-session:${peerId}`
 const REPLENISH_LOCK = 'nightjar-opk-replenish'
 
+// Reconnect backoff (P8): exponential with jitter, capped. A dropped socket
+// self-heals; the UI additionally kicks reconnectNow() on visibility/online.
+const RECONNECT_MIN_MS = 1000
+const RECONNECT_MAX_MS = 60 * 1000
+
 export interface ClientCallbacks {
   /** A decrypted message arrived from `from`. */
   onMessage: (from: string, text: string) => void
-  /** Optional: an inbound envelope failed to process, was dropped, or a security
-   *  check failed (forged/replayed/unknown, a substituted directory key). */
+  /** Optional: an inbound envelope failed to process or was dropped (transient
+   *  operational noise; the UI may show it as an overwritable notice). */
   onError?: (detail: string) => void
+  /** Optional: a SECURITY event (a key conflict for a known userId, i.e. a
+   *  would-be substitution or local corruption). The UI must show these
+   *  stickily, never silently overwrite them. */
+  onSecurity?: (detail: string) => void
+  /** Optional: a queued message (by envelope id) was PERMANENTLY rejected by the
+   *  relay and dropped from the outbox. The UI marks that exact message failed so
+   *  it never reads as delivered (the envelope id equals the UI message id). */
+  onSendFailed?: (envId: string, reason: string) => void
+  /** Optional: the authenticated connection came up (true) or dropped (false).
+   *  Fires on every transition, including automatic reconnects. */
+  onConnection?: (connected: boolean) => void
 }
 
 export class NightjarClient {
   readonly transport: Transport
   readonly directory: DirectoryClient
   private authed: AuthedInfo | null = null
+  private closed = false
+  private connecting = false
+  private reconnectAttempt = 0
+  private reconnectTimer: ReturnType<typeof setTimeout> | null = null
 
   constructor(
     private readonly identity: Identity,
@@ -118,23 +139,140 @@ export class NightjarClient {
 
   async connect(): Promise<AuthedInfo> {
     this.transport.onDeliver((from, envJson) => void this.handleDeliver(from, envJson))
+    this.transport.onSendError((ref, code, msg) => this.handleSendError(ref, code, msg))
+    this.transport.onClose(() => {
+      this.cb.onConnection?.(false)
+      this.scheduleReconnect()
+    })
     this.authed = await this.transport.connect()
-    await this.flushOutbox()
-    // If we came back with a low server-side OPK stock (a run of inbound sessions
-    // depleted it while we were away), top it back up.
-    if (this.authed.registered && this.authed.opkCount < OPK_REPLENISH_THRESHOLD) {
-      void this.maybeReplenishOpks().catch(() => {})
-    }
+    await this.afterConnect()
     return this.authed
   }
 
+  /** Post-auth housekeeping, shared by first connect and every reconnect. */
+  private async afterConnect(): Promise<void> {
+    this.reconnectAttempt = 0
+    this.cb.onConnection?.(true)
+    await this.flushOutbox()
+    // If we came back with a low server-side OPK stock (a run of inbound sessions
+    // depleted it while we were away), top it back up.
+    if (this.authed?.registered && this.authed.opkCount < OPK_REPLENISH_THRESHOLD) {
+      void this.maybeReplenishOpks().catch(() => {})
+    }
+    // Rotate the signed prekey on cadence (P8): without this, the registration
+    // SPK ages past SPK_MAX_AGE_MS and every NEW inbound session fails at the
+    // initiator's bundle check. Best-effort; retried on every connect.
+    if (this.authed?.registered) {
+      void this.maybeRotateSpk().catch(() => {})
+    }
+    // Age out client-side dedup/failure rows (P8). Best-effort maintenance;
+    // the replay guard is intentionally never pruned (DESIGN 4.3).
+    void this.store.pruneExpired(Date.now()).catch(() => {})
+    // Retry trust work that failed transiently on an earlier connect (P8).
+    void this.flushPendingTrust().catch(() => {})
+  }
+
+  /** Land pending trust work: the inviter pin (DESIGN 6.3) and inbound
+   *  first-contact records whose original writes failed after their sessions
+   *  had already committed. Each item is removed only once it lands (or is
+   *  proven conflicting, which is surfaced as a security event). */
+  private async flushPendingTrust(): Promise<void> {
+    const pending = await this.contacts.getPendingTrust()
+    for (const r of pending.records) {
+      try {
+        await this.contacts.recordFirstContact(r.peerId, b64decode(r.ikSig, 32), Date.now())
+        await this.contacts.mutatePendingTrust((p) => {
+          p.records = p.records.filter((x) => x.peerId !== r.peerId)
+        })
+      } catch (e) {
+        if (e instanceof KeyConflictError) {
+          this.cb.onSecurity?.(`stored key for ${r.peerId.slice(0, 12)}… conflicts with the one presented earlier; verify safety numbers`)
+          await this.contacts.mutatePendingTrust((p) => {
+            p.records = p.records.filter((x) => x.peerId !== r.peerId)
+          })
+        }
+        // Other failures: keep the record; retried next connect.
+      }
+    }
+    if (pending.inviterPin) {
+      try {
+        await this.addInviteContact(pending.inviterPin)
+        await this.contacts.mutatePendingTrust((p) => {
+          delete p.inviterPin
+        })
+      } catch {
+        // Keep it; retried next connect.
+      }
+    }
+  }
+
+  private scheduleReconnect(): void {
+    if (this.closed || this.reconnectTimer) return
+    const backoff = Math.min(RECONNECT_MAX_MS, RECONNECT_MIN_MS * 2 ** this.reconnectAttempt)
+    const delay = backoff * (0.5 + Math.random() * 0.5) // jitter: [0.5x, 1x]
+    this.reconnectAttempt += 1
+    this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = null
+      void this.tryReconnect()
+    }, delay)
+  }
+
+  private async tryReconnect(): Promise<void> {
+    if (this.closed || this.transport.isOpen || this.connecting) return
+    this.connecting = true
+    try {
+      this.authed = await this.transport.connect()
+      await this.afterConnect()
+    } catch {
+      this.scheduleReconnect()
+    } finally {
+      this.connecting = false
+    }
+  }
+
+  /** Kick an immediate reconnect attempt (page became visible, network came
+   *  back). No-op while closed or already connected. */
+  reconnectNow(): void {
+    if (this.closed || this.transport.isOpen) return
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer)
+      this.reconnectTimer = null
+    }
+    this.reconnectAttempt = 0
+    void this.tryReconnect()
+  }
+
   close(): void {
+    this.closed = true
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer)
+      this.reconnectTimer = null
+    }
     this.transport.close()
   }
 
+  // A send error naming a specific envelope (ref). Permanent rejections drop
+  // the outbox entry (it would fail identically on every future flush) and are
+  // surfaced; transient ones (queue_full, a not-registered race) stay queued.
+  private handleSendError(ref: string, code: string, msg: string): void {
+    const permanent = code === 'bad_to' || code === 'bad_envelope' || code === 'too_large'
+    if (!permanent) return
+    void this.store.removeOutbox(ref).catch(() => {})
+    // Mark the exact message failed (envelope id == UI message id) so it never
+    // reads as delivered; onError is only a fallback if the UI does not correlate.
+    this.cb.onSendFailed?.(ref, `${code}: ${msg}`)
+    this.cb.onError?.(`a message could not be delivered (${code}): ${msg}`)
+  }
+
   /** Register this identity behind a single-use invite, publishing a fresh
-   *  prekey bundle and persisting the private prekeys for later responding. */
+   *  prekey bundle and persisting the private prekeys for later responding.
+   *  Serialized on the replenish lock so a registration can never interleave
+   *  its prekey writes/publish with rotation or OPK replenishment. */
   async register(inviteCode: string): Promise<number> {
+    return this.lock.withLock(REPLENISH_LOCK, () => this.registerUnderLock(inviteCode))
+  }
+
+  private async registerUnderLock(inviteCode: string): Promise<number> {
     const now = Date.now()
     const own = buildOwnBundle(this.identity, now, { spkId: 1, opkStartId: 1, opkCount: OPK_BATCH })
     await this.prekeys.setFromRegistration({
@@ -152,16 +290,37 @@ export class NightjarClient {
       opks: own.opks,
     })
     const opkCount = await this.directory.register(inviteCode, bundle)
+    // Only after the Directory acknowledged: the full set is now served, so the
+    // registration is confirmed (and this SPK id marked published).
+    await this.prekeys.confirmRegistration(own.spk.id).catch(() => {})
     if (this.authed) this.authed = { ...this.authed, registered: true, opkCount }
     return opkCount
   }
 
+  /** Re-publish everything from scratch for an ALREADY-REGISTERED identity (a
+   *  restore, or a self-heal when local prekeys are missing): a fresh SPK + OPK
+   *  batch, with the Directory's re-registration branch hard-invalidating every
+   *  previously published prekey and outstanding vend (DESIGN 8.3). Consumes no
+   *  invite: the server ignores the code for a known identity. */
+  async reregister(): Promise<number> {
+    return this.register('')
+  }
+
   /** Onboarding (DESIGN 6.3): register behind the invite code, then pin the
-   *  inviter from the shared artifact (if it carried one). */
+   *  inviter from the shared artifact (if it carried one). Registration
+   *  consumed the single-use invite, so a transient pin failure must not lose
+   *  the inviter identity: it is persisted and retried on every connect. */
   async joinWithInvite(artifact: InviteArtifact): Promise<void> {
     await this.register(artifact.code)
     if (artifact.inviter && artifact.inviter !== this.userId) {
-      await this.addInviteContact(artifact.inviter)
+      try {
+        await this.addInviteContact(artifact.inviter)
+      } catch {
+        const inviter = artifact.inviter
+        await this.contacts.mutatePendingTrust((p) => {
+          p.inviterPin = inviter
+        }).catch(() => {})
+      }
     }
   }
 
@@ -195,17 +354,22 @@ export class NightjarClient {
   }
 
   /** Send text to a peer. Uses the current session, or opens a new one (X3DH) if
-   *  none exists. Runs under the per-peer lock. */
-  async sendText(to: string, text: string): Promise<void> {
+   *  none exists. Runs under the per-peer lock. Returns the envelope id, which
+   *  the caller uses as its UI message id so a later async send-failure (carrying
+   *  the same id as `ref`) can be attributed to the exact message. `msgId`, if
+   *  given, becomes the envelope id (so the optimistic bubble already matches). */
+  async sendText(to: string, text: string, msgId?: string): Promise<string> {
     const entry = await this.lock.withLock(sessionLock(to), async () => {
       const now = Date.now()
-      const id = crypto.randomUUID()
+      const id = msgId ?? crypto.randomUUID()
       const book = await this.store.loadBook(to)
       const current = currentSession(book)
 
       if (current) {
-        // Established (or pending) session: a normal ratchet message.
-        const { state, header, ciphertext } = ratchetEncrypt(deserializeRatchet(current.snapshot), utf8(text))
+        // Established (or pending) session: a normal ratchet message. `now` as
+        // legacyTs stamps any pre-P8 skipped entries so the re-serialized
+        // snapshot below cannot mark them instantly expired.
+        const { state, header, ciphertext } = ratchetEncrypt(deserializeRatchet(current.snapshot, now), utf8(text))
         const env: WireEnvelope = {
           id,
           kind: 'normal',
@@ -263,6 +427,7 @@ export class NightjarClient {
       return e
     })
     this.fire(entry)
+    return entry.id
   }
 
   // Fire a queued envelope at the socket and arrange for its outbox entry to be
@@ -308,7 +473,13 @@ export class NightjarClient {
       })
     } catch (e) {
       // Transient (retry on redelivery) or a surfaced security event: do NOT ack.
-      this.cb.onError?.(String(e instanceof Error ? e.message : e))
+      if (e instanceof KeyConflictError) {
+        this.cb.onSecurity?.(
+          `an incoming message presented a key that conflicts with the one stored for ${from.slice(0, 12)}…; the message was refused. Verify safety numbers with this contact.`,
+        )
+      } else {
+        this.cb.onError?.(String(e instanceof Error ? e.message : e))
+      }
       return
     }
     // processInbound persisted before returning, so a delivered plaintext is
@@ -356,7 +527,59 @@ export class NightjarClient {
         spk,
         pairs.map((p) => encodeOneTimePrekey(p.opk)),
       )
+      await this.prekeys.markSpkPublished(spk.id).catch(() => {})
       if (this.authed) this.authed = { ...this.authed, opkCount }
+    })
+  }
+
+  /**
+   * Rotate the signed prekey on the SPK_ROTATION_MS cadence (P8, DESIGN 4.1).
+   * Runs on every authenticated connect, under the same lock as OPK
+   * replenishment so the two can never interleave publishes. Three cases:
+   *   - no local SPK at all: a restored identity whose forced re-registration
+   *     was interrupted -> redo the full re-registration (fresh SPK + OPKs,
+   *     server hard-invalidates the old bundle it may still be serving);
+   *   - newest SPK unpublished (a rotation crashed between local commit and the
+   *     Directory ack) -> retry the publish;
+   *   - newest SPK older than the cadence -> generate + publish the successor.
+   * Old SPK private halves are kept for late in-flight initials and pruned on
+   * the SPK_RETIRE_GRACE_MS horizon. Discipline: the new private half is
+   * durable locally BEFORE its public half is offered to the Directory.
+   */
+  async maybeRotateSpk(now = Date.now()): Promise<void> {
+    if (!this.isRegistered) return
+    await this.lock.withLock(REPLENISH_LOCK, async () => {
+      const newest = await this.prekeys.newestSpk()
+      // No local SPK at all, OR a full registration that never got the Directory
+      // ack: recover with a purging full re-register, NEVER a plain publishBundle.
+      // publishBundle only rotates the SPK row and appends OPKs; it would leave
+      // the Directory serving the prior batch of OPKs whose private halves this
+      // device no longer holds, silently breaking every new inbound session that
+      // fetches one (P9 stale-OPK finding). The full register path runs the
+      // Directory's existing-user branch, which DELETEs the stale opks + vends.
+      if (!newest || (await this.prekeys.isRegistrationUnconfirmed())) {
+        // Already inside the replenish lock: use the under-lock body directly.
+        await this.registerUnderLock('')
+        return
+      }
+      const published = await this.prekeys.publishedSpkId()
+      const needsRotate = now - newest.createdAt >= SPK_ROTATION_MS
+      const needsPublish = published !== newest.id
+      if (!needsRotate && !needsPublish) {
+        await this.prekeys.pruneRetiredSpks(now)
+        return
+      }
+      if (needsRotate) {
+        const id = (await this.prekeys.maxSpkId()) + 1
+        const { spk, priv } = generateSignedPrekey(this.identity, id, now)
+        await this.prekeys.addSpk({ id, createdAt: spk.createdAt, expiry: spk.expiry, priv, pub: spk.pub, sig: spk.sig })
+      }
+      const wire = await this.prekeys.signedPrekeyWire()
+      if (!wire) return // pre-P5 stored SPK without a persisted signature
+      const opkCount = await this.directory.publishBundle(wire, [])
+      await this.prekeys.markSpkPublished(wire.id)
+      if (this.authed) this.authed = { ...this.authed, opkCount }
+      await this.prekeys.pruneRetiredSpks(now)
     })
   }
 }

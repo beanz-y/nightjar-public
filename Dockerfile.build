@@ -27,7 +27,7 @@ FROM node:22.16.0-bookworm-slim@sha256:048ed02c5fd52e86fda6fbd2f6a76cf0d4492fd6c
 # toolchain (this digest + the committed lockfile via `npm ci`) and no build-time
 # dynamic values (NIGHTJAR_VERSION is injected, never a clock).
 ENV SOURCE_DATE_EPOCH=1577836800
-# CI passes the release tag: docker build --build-arg NIGHTJAR_VERSION=v0.7.0 ...
+# CI passes the VERSION-file value: docker build --build-arg NIGHTJAR_VERSION=v1.0.0 ...
 ARG NIGHTJAR_VERSION=repro
 ENV NIGHTJAR_VERSION=$NIGHTJAR_VERSION
 
@@ -39,6 +39,8 @@ RUN npm run build
 
 # Emit the canonical release hash (DESIGN 10) so a container build prints the
 # same number CI signs into Rekor and the canary attests.
-RUN node scripts/release-hash.mjs dist || true
+# The in-container hash must FAIL LOUDLY for a local rebuilder: a swallowed
+# error here would read as "no hash" instead of "broken build".
+RUN node scripts/release-hash.mjs dist
 
 CMD ["sh", "-c", "cp -r dist/* /out/ 2>/dev/null || echo 'mount a volume at /out to extract the build'"]

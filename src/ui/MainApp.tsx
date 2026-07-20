@@ -5,6 +5,7 @@
 import { useMemo, useState } from 'react'
 import type { Identity } from '../crypto/identity'
 import type { Contact } from '../trust/contactStore'
+import { BackupPanel } from './BackupPanel'
 import { Conversation } from './Conversation'
 import { InvitePanel } from './InvitePanel'
 import { NotifySettings } from './NotifySettings'
@@ -18,6 +19,7 @@ interface Props {
   contacts: Contact[]
   conversations: Record<string, Message[]>
   notify: NotifyState
+  storagePersisted: boolean | null
   actions: {
     send: (peer: string, text: string) => void
     startChat: (peer: string) => void
@@ -25,13 +27,15 @@ interface Props {
     markVerified: (peer: string) => void
     enableNotifications: () => void
     disableNotifications: () => void
+    exportBackup: (passphrase: string) => Promise<boolean>
   }
 }
 
-export function MainApp({ identity, contacts, conversations, notify, actions }: Props) {
+export function MainApp({ identity, contacts, conversations, notify, storagePersisted, actions }: Props) {
   const [selected, setSelected] = useState<string | null>(null)
   const [view, setView] = useState<'chat' | 'verify'>('chat')
   const [inviteOpen, setInviteOpen] = useState(false)
+  const [backupOpen, setBackupOpen] = useState(false)
   const [minted, setMinted] = useState<MintedInvite | null>(null)
   const [newPeer, setNewPeer] = useState('')
 
@@ -122,10 +126,25 @@ export function MainApp({ identity, contacts, conversations, notify, actions }: 
         </div>
 
         <NotifySettings notify={notify} onEnable={actions.enableNotifications} onDisable={actions.disableNotifications} />
+
+        <button
+          className="ghost block"
+          onClick={() => {
+            setBackupOpen(true)
+            setInviteOpen(false)
+          }}
+        >
+          back up identity
+        </button>
+        {storagePersisted === false && !backupOpen && (
+          <p className="muted tiny">storage is not persistent in this browser; keep a backup</p>
+        )}
       </aside>
 
       <main className="pane">
-        {inviteOpen ? (
+        {backupOpen ? (
+          <BackupPanel onExport={actions.exportBackup} storagePersisted={storagePersisted} onClose={() => setBackupOpen(false)} />
+        ) : inviteOpen ? (
           <InvitePanel minted={minted} onMint={() => void mint()} onClose={() => setInviteOpen(false)} />
         ) : !selected ? (
           <div className="empty muted">

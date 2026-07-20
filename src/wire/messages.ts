@@ -27,7 +27,7 @@ export interface AuthMsg {
   ikSigPub: string
   sig: string
   /** Initial foreground state, so the server sets `watching` atomically as the
-   *  socket becomes authed (no undefined-default window; P6, red-team H7). */
+   *  socket becomes authed (no undefined-default window; P6). */
   watching?: boolean
 }
 
@@ -74,7 +74,7 @@ export interface DrainMsg {
 // --- Web Push (P6, DESIGN 7.4) -------------------------------------------
 // All three ride the AUTHENTICATED socket and are handled ONLY post-auth, so the
 // server always uses the challenge-verified userId, never a client claim
-// (red-team H1). The subscription fields are the browser's PushSubscription,
+// The subscription fields are the browser's PushSubscription,
 // base64url. `presence` re-affirms foreground state to gate content-free pushes.
 
 export interface PushSubscribeMsg {
@@ -167,6 +167,9 @@ export interface ErrorMsg {
   code: string
   msg: string
   reqId?: string
+  /** For send failures: the envelope id the error refers to, so the sender can
+   *  drop a permanently undeliverable outbox entry (P8). */
+  ref?: string
 }
 
 export type ServerMessage =

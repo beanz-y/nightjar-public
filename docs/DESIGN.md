@@ -4,11 +4,20 @@ A private, invite-only, end-to-end encrypted messenger for friends and family.
 Self-sovereign keypair identity, no phone numbers, no third-party sign-in.
 Delivered as a universal Progressive Web App, honestly and openly hardened.
 
-Status: **built and live** through P7 (design at **v0.4**). The protocol,
+Status: **built and live** through P8 (design at **v0.5**). The protocol,
 architecture, and hardening here were reviewed and attacked before any
 cryptographic code was written; the roadmap in section 12 tracks what has shipped.
 
 **Changelog.**
+- **v0.5** is the pre-release pass alongside P8. It adds passphrase-wrapped
+  identity **backup and restore** (8.3, download-only in v1, Argon2id parameters
+  pinned in 14); documents the automatic **signed-prekey rotation** the client
+  now performs on connect (4.1), and the **skipped-key time expiry** (5.3, 14)
+  that completes the retry invariant chain; describes the multi-session
+  **session book** in the body (6.4) that section 14 already referenced; corrects
+  the deploy model to **push-to-main + digest-pinned container + Rekor**, with no
+  SSH-signed tag (10.1/10.3); and records the client-side retention bounds (14).
+  A full adversarial review of the *implementation* (P9) accompanies it.
 - **v0.2** folded in a four-lens adversarial review of the protocol (signing
   oracle, send-path key reuse, mutate-before-verify DoS, OPK replay/depletion,
   half-earned "verified" badge, the web-client host-trust gap). All critical and
@@ -244,8 +253,14 @@ from the first message.
 - `SPK_pub` (X25519 signed prekey) `+ Sig(IK_sig, "Nightjar-spk-v1" || spk_id ||
   createdAt || expiry || SPK_pub)`, with `spk_id`, `createdAt`, and `expiry`
   inside the signed blob (createdAt is signed so the max-age check cannot be
-  bypassed). Rotated ~weekly; the acceptance window is the 14-day max age
-  (section 14), so a briefly-offline owner does not break inbound sessions.
+  bypassed). The client rotates it automatically once the current SPK passes
+  `SPK_ROTATION_MS` (~7 days), checked on every authenticated connect: it
+  generates a fresh SPK at the next id, publishes it, and keeps the retired
+  private half until initials that cite it can no longer arrive
+  (`SPK_RETIRE_GRACE_MS`). The acceptance window is the 14-day max age (section
+  14), so a briefly-offline owner does not break inbound sessions, and a
+  longer-offline one heals on its next connect rather than becoming permanently
+  unreachable for new contacts.
 - `OPK_pub[]` : one-time prekeys, each with an id, **unsigned** (matching Signal;
   substitution degrades only to a session-setup DoS, and the responder fails
   closed and surfaces it).
@@ -342,10 +357,13 @@ Header encryption is deferred to v2.
    desync the ratchet.
 
 **Skipped keys.** At most `MAX_SKIP` per session, evicted oldest-first (marking
-those message ids "unrecoverable" in the UI, not a false corruption error),
-expired on a time bound generous relative to the outbox retry horizon (7.2).
-Consumed keys are deleted and their number refused (replay rejection). Junk never
-reaches commit (rule 3), so only real skips consume budget.
+those message ids "unrecoverable" in the UI, not a false corruption error). Each
+is stamped with the receive-time clock and pruned once older than
+`SKIPPED_KEY_EXPIRY_MS` (14 days, section 14), which exceeds the outbox retry
+horizon (7 days, 7.2), so a sender's late retry always lands on either a live
+skipped key or the receiver's dedup set, never a silently-aged-out key. Consumed
+keys are deleted and their number refused (replay rejection). Junk never reaches
+commit (rule 3), so only real skips consume budget.
 
 **Send: commit before you release.** Order is **advance sending chain -> derive
 MK and expand -> encrypt -> commit advanced state + outbox entry (with `n` and a
@@ -450,6 +468,28 @@ displays it (section 6.1).
 - **A restored identity keeps the same `IK_sig`** (8.3), so restore does not
   trigger false warnings. An empty store with a prior-use signal (8.2) routes to
   restore, never to silent new-identity generation.
+
+### 6.5 The session book (glare and re-establishment)
+
+A peer slot is not one ratchet session but a **session book**: a `currentId`
+plus a bounded set (`MAX_SESSIONS_PER_PEER`, section 14) of sessions. This solves
+two problems with one structure, without any userId tie-break:
+
+- **Glare.** If two contacts each send a first-contact initial before either has
+  received the other's, a single-slot design would have each side's inbound
+  responder session overwrite its own just-made initiator session, diverging the
+  two ratchets so every later normal message fails forever. With a book, an
+  accepted initial is *promoted* to current and the prior current is *archived*,
+  never clobbered.
+- **Re-establishment.** After a restore (8.3) the peer legitimately starts a new
+  session; it is promoted the same way.
+
+Sends use the current session. Inbound decrypt tries the sessions in order and
+keeps whichever authenticates (a wrong session throws and leaves its state
+untouched, by the 5.3 discipline). The book is bounded, LRU-evicting the
+least-recently-used non-current session, so a peer cannot grow it without limit.
+A never-decryptable envelope is retried, then acked-and-dropped after
+`POISON_MAX_ATTEMPTS` so the relay stops redelivering it forever (5.3).
 
 ---
 
@@ -562,18 +602,35 @@ and warns explicitly; it never silently generates a new identity.
 
 ### 8.3 Backup and recovery
 
-- **Identity backup:** the two identity private keys wrapped under an Argon2id
-  key from a user passphrase (params in 14), per-blob random salt, AEAD, and a
-  version/params header. Downloadable and/or opt-in server storage. The server
-  never sees the passphrase or plaintext. A restored identity keeps the same
-  `IK_sig`, so id, contacts, and verification status survive.
-- **Server-stored backups are honestly caveated:** an offline-attackable secret;
-  seizure reduces to passphrase strength. Opt-in, with an enforced
-  passphrase-strength floor; download-only avoids the risk (see 1.3).
-- **Restore forces fresh prekeys:** atomically generate a fresh SPK + OPK batch,
-  publish a new signed bundle, and have the server hard-invalidate the previous
-  bundle and outstanding OPKs. In-flight initial messages sent in the seconds
-  before invalidation are unrecoverable, and we say so.
+Implemented in P8, **download-only** in v1.
+
+- **Identity backup:** the two identity private keys **and the contact-trust map**
+  (peer id, bound `IK_sig`, trust level, verification timestamps) wrapped under an
+  Argon2id key from a user passphrase (params in 14), per-blob random salt,
+  XChaCha20-Poly1305 AEAD, and a version/params header that is itself the AAD (so
+  no header field, including the KDF cost parameters, can be altered without
+  failing the tag). The key and nonce both derive from the passphrase via HKDF, so
+  the nonce is unique by construction. The server never sees the passphrase, the
+  blob, or the plaintext. A restored identity keeps the same `IK_sig`, so id,
+  contacts, and verification status survive; each imported contact row is
+  re-checked against the `userId == H(IK_sig)` binding and dropped if it fails.
+- **The passphrase is the backup's whole security.** The UI offers a generated
+  ~100-bit passphrase and holds typed ones to a minimum length (section 14); the
+  honest framing is that whoever holds the file and the passphrase holds the
+  identity, and losing either along with the device means no recovery.
+- **Server-stored backups are deferred.** They would be an offline-attackable
+  secret whose seizure reduces to passphrase strength (1.3), so v1 ships
+  download-only, which avoids that risk. If added later they require an enforced
+  passphrase-strength floor.
+- **Restore forces fresh prekeys.** Staging wipes the device's session-layer
+  state, then a durable one-shot flag drives a re-registration on the next
+  authenticated connect: a fresh SPK + OPK batch is published and the server's
+  re-registration path hard-invalidates the previously published bundle and
+  outstanding OPKs. The flag is set *before* the restored identity is loadable and
+  cleared *only* on a successful publish, so a crash or offline restore retries
+  rather than silently leaving the Directory serving dead prekeys. In-flight
+  initial messages sent in the seconds before invalidation are unrecoverable, and
+  we say so.
 - **History does not come back.** Per-device only; syncing ratchet sessions would
   break forward secrecy. Encrypted history export/import is a v2 candidate.
 
@@ -650,8 +707,12 @@ determinism comes from a **digest-pinned build container** (Node + OS + arch) an
 `SOURCE_DATE_EPOCH` / `strip-nondeterminism` are kept as documented no-ops: this
 toolchain does not consume them and the manifest hashes file content only.) Then
 diff two builds to byte-identity. Sign each release manifest into a public
-**append-only** log (Sigstore/Rekor) plus an SSH-signed git tag. The load-bearing
-property is **append-only**: a prior honest entry cannot be deleted or backdated.
+**append-only** log (Sigstore/Rekor). (An earlier design also cut an SSH-signed
+git tag; that ceremony was dropped as operator friction, and the transparency
+story does not rest on it: the deploy trigger is a push to `main`, and the
+release is identified by the CI run's recorded commit plus the Rekor entry's
+workflow identity.) The load-bearing property is **append-only**: a prior honest
+entry cannot be deleted or backdated.
 It is *not* independence from the operator, because the keyless OIDC signer is our
 own repo CI, which a compelled operator controls; a Rekor entry therefore attests
 only "this repo's CI logged hash H at time T", never that the build is honest.
@@ -677,13 +738,14 @@ fail-closed verification tool that exists.
 
 ### 10.3 Immutable atomic deploys + build hash in the UI + a canary
 
-**B: moderate against a lazy operator and third parties. T: zero.** Cloudflare
-Pages gives atomic, permanently-addressed deployments, so a released artifact
-cannot be silently rewritten in place; a non-selective swap must produce a new,
-differently-addressed, archivable deploy. Honest limit: this constrains a lazy
-operator and outside tamperers, but buys ~nothing against a compelled operator who
-fronts the deploy with a response-mutating Worker or repoints the alias, since it
-controls the edge. Show the release **version tag** and the operator's
+**B: moderate against a lazy operator and third parties. T: zero.** The deploy is
+Model A: CI builds the artifact in the digest-pinned container, logs its hash to
+Rekor, and `wrangler deploy`s *that same* artifact, so the audited, logged, and
+served bytes are one by construction, and each deploy is a distinct, CI-recorded
+event rather than an in-place edit. Honest limit: this constrains a lazy operator
+and outside tamperers, but buys ~nothing against a compelled operator, who owns
+the same Worker + edge that serves the assets and can mutate responses or deploy
+off-pipeline, since it controls the edge. Show the release **version tag** and the operator's
 **attested release hash** in an About screen, labeled as *a claim you confirm by
 rebuilding* (the app cannot hash its own served bytes, 1.3, so this is never a
 self-integrity verdict), so a family member can read it to the technical friend.
@@ -832,17 +894,28 @@ before touching a network):
   reproducible build; CI (`.github/workflows/release.yml`) builds the artifact in
   the digest-pinned container, cosign-keyless-signs its hash into **append-only
   Rekor**, and `wrangler deploy`s that exact artifact (Model A: served == logged ==
-  audited; Cloudflare git-build off), plus an SSH-signed tag. An **in-app warrant
-  canary** (signed `/canary.json`, source-pinned key, off-until-configured) whose
-  staleness/absence is the signal, with a benign-outcome taxonomy so offline never
-  alarms and no build-verification "check"; an About/"verify this build" view
-  (version + attested hash as a claim-you-rebuild + the plain-language disclosure,
-  runtime-gated on live canary state); onboarding leads with the safety-number
-  pointer. Design red-teamed on paper (6 lenses, 5 must-fixes folded before code);
-  implementation adversarially reviewed; browser-verified. Going public (scrubbed,
-  single source of truth) + the operator runbook accompany it.
-- **P8. Backup.** Argon2id passphrase-wrapped identity export/restore with forced
-  fresh-prekey publish and passphrase-strength floor.
+  audited; Cloudflare git-build off). A gate job runs the full test suites and
+  both typechecks before any deploy. An **in-app warrant canary** (signed
+  `/canary.json`, source-pinned key, off-until-configured) whose staleness/absence
+  is the signal, with a benign-outcome taxonomy so a plain offline/unreachable
+  fetch stays quiet (the one exception, added in P8: a RETURNING device whose
+  freshest locally-verified signature is already older than the stale horizon
+  escalates a persistent unreachable to a stale-style warning, so a canary that
+  is selectively 404'd cannot stay quiet forever on a device that once saw it);
+  an About/"verify this build" view (version +
+  attested hash as a claim-you-rebuild + the plain-language disclosure,
+  runtime-gated on live canary state, pointing at `docs/VERIFYING.md`); onboarding
+  leads with the safety-number pointer. Design red-teamed on paper (6 lenses, 5
+  must-fixes folded before code); implementation adversarially reviewed;
+  browser-verified. Going public (scrubbed, single source of truth) accompanies it.
+- **P8. Backup + release hardening. DONE.** Argon2id passphrase-wrapped identity
+  + contact-trust export/restore (download-only in v1), with restore forcing a
+  fresh-prekey publish via a durable one-shot flag and the server hard-invalidating
+  the old bundle (8.3). Ships alongside the carried-over robustness work:
+  automatic **SPK rotation** on connect (4.1), **skipped-key time expiry** (5.3),
+  client-side dedup/failure **TTL pruning**, WebSocket **auto-reconnect** with
+  connect/request timeouts and permanent-send-error surfacing, sticky security
+  notices, and the CI test gate + SHA-pinned actions.
 - **P9. Hardening + beta.** Full adversarial review of the *implementation*, then
   a closed beta with a couple of family members. Consider WEBCAT enrollment for
   the technical friend.
@@ -920,20 +993,22 @@ Native (Tauri) is **not** on the critical path; it is a demand-gated v2 (10.5).
 | `MAX_SKIP` (compute + storage) | 1000 per session, checked before derivation | 5.3 |
 | `MAX_SESSIONS_PER_PEER` (session book) | 5 (1 current + <=4 archived); LRU-evict the non-current on overflow | 6.4, 8.3 |
 | `POISON_MAX_ATTEMPTS` (receive) | 10 failed decrypts before an undecryptable envelope is acked-and-dropped | 5.3 |
-| Skipped-key expiry | 14 days *(provisional; pin before P2/P3, must exceed outbox retry horizon)* | 5.3, 7.2 |
-| Outbox retry horizon | 7 days *(provisional; pin before P2/P3, must be < skip expiry)* | 7.2 |
+| Skipped-key expiry | 14 days (`SKIPPED_KEY_EXPIRY_MS`); each skipped key is timestamped on receipt and pruned past this. Chain: outbox retry (7d) < seen-id TTL (8d) < skip expiry (14d) | 5.3, 7.2 |
+| Outbox retry horizon | 7 days (`OUTBOX_RETRY_HORIZON_MS`); < skip expiry | 7.2 |
 | Undelivered envelope TTL | 30 days | 7.1 |
-| Inbox seen-id TTL | >= outbox retry horizon | 7.1 |
-| SPK rotation / max age | ~7 days / reject if signed age > 14 days | 4.1, 4.2 |
+| Inbox seen-id TTL | 8 days (>= outbox retry horizon) | 7.1 |
+| SPK rotation / max age / retired-key grace | rotate at ~7 days (client, on connect) / reject if signed age > 14 days / keep a retired SPK private half until expiry + 30 days (envelope TTL) for late in-flight initials | 4.1, 4.2 |
+| Client dedup/failure retention | `seen` pruned past 8 days (seen-id TTL), `failures` past 30 days (envelope TTL), on connect; the replay-guard store is never pruned (4.3) | 5.3, 8.1 |
 | OPK batch / policy | 100 per batch; <= 1 outstanding per (fetcher,target); replenish under 20 | 4.1, 4.3 |
 | User id | `base32(SHA-256(IK_sig_pub))`, full 256-bit, untruncated | 3 |
 | Invite-embedded fingerprint | inviter `IK_sig` at full 256-bit width; joiner does a full-width equality check vs the directory-returned key | 6.3 |
 | Safety number | iterated SHA-512, `N_iter` = 5200, displayed width >= 120 bits, tag `"Nightjar-SN-v1"` | 6.2 |
-| Argon2id (backup) | m = 256 MiB, t = 3, p = 1 *(provisional; measure on iOS Safari + low-end Android in a Web Worker, pin before P8)*; 16-B salt; AEAD-wrapped with params header | 8.3 |
-| Passphrase floor | server-stored backup requires an estimated-strength minimum *(provisional; define before P8)* | 8.3 |
+| Argon2id (backup) | m = 64 MiB, t = 3, p = 1 (measured ~2.3 s desktop via `@noble/hashes`; 256 MiB was ~9 s and risks OOM in an iOS Safari worker; RFC 9106 constrained-env recommendation); 16-B salt; XChaCha20-Poly1305 body with the header as AAD; key+nonce via HKDF-SHA256 info `"Nightjar_Backup_v1"`; restore bounds m to [8 MiB, 256 MiB], t <= 6, p == 1 before running the KDF | 8.3 |
+| Passphrase floor | typed passphrases >= 12 chars (after NFC-trim); the offered generated passphrase is 20 base32 chars (~100 bits) | 8.3 |
+| Backup blob format | magic `"NJBK"`, format version `0x01`, then m/t/p/salt header, then AEAD body; download-only in v1 | 8.3 |
 | Version octet | starts at `0x01` (classical X25519) | 4.4 |
 | Reproducible build inputs | digest-pinned container (Node + OS + arch), committed lockfile (`npm ci`), no build-time dynamic values (`__APP_VERSION__` injected, never a clock). *`SOURCE_DATE_EPOCH`/`strip-nondeterminism` are inert here (vite emits no timestamps; the manifest hashes content only) and kept only as documented no-ops* | 10.1, P7 |
 | Release hash | `sha256(manifest.txt)`; `manifest.txt` = each `dist/` file as `<sha256-hex>  <relpath>\n`, byte-sorted, LF (one recipe: `scripts/release-hash.mjs` == the pure-shell pipeline). Hashes the **build output**, so the honest claim is "rebuild and diff", not "diff the served bytes" | 10.1, P7 |
-| Release transparency | keyless cosign of `manifest.txt` into public-good **Rekor** (append-only: a prior entry cannot be deleted or backdated; NOT independent of the operator, whose CI is the OIDC signer) + an SSH-signed release tag. The audited artifact is the deployed one (CI builds in the pinned container and `wrangler deploy`s it; Cloudflare git-build is off) | 10.1, P7 |
-| Warrant canary | Ed25519-signed `{version, releaseHash, statement, signedAt}` at `/canary.json` (public var, off-until-set), verified vs a source-pinned pubkey; re-signed ~30 d, warn at 45 d; tag `"Nightjar-canary-v1"`; future-dated => invalid; offline/unreachable never alarms | 10.3, P7 |
+| Release transparency | keyless cosign of `manifest.txt` into public-good **Rekor** (append-only: a prior entry cannot be deleted or backdated; NOT independent of the operator, whose CI is the OIDC signer). Deploy trigger is a push to `main` (no SSH-signed tag). The audited artifact is the deployed one (CI builds in the pinned container and `wrangler deploy`s it; Cloudflare git-build is off), gated on the test + typecheck job; `uses:` actions are pinned to full commit SHAs | 10.1, P7 |
+| Warrant canary | Ed25519-signed `{version, releaseHash, statement, signedAt}` at `/canary.json` (public var, off-until-set), verified vs a source-pinned pubkey; re-signed ~30 d, warn at 45 d; tag `"Nightjar-canary-v1"`; future-dated => invalid; a plain offline/unreachable fetch stays quiet, EXCEPT a returning device whose freshest locally-verified signature is older than the 45 d stale horizon escalates a persistent unreachable to a stale-style warning (so a selectively-404'd canary cannot stay quiet forever on a device that once verified it) | 10.3, P7, P8 |
 | CSP | `default-src 'self'`, no `unsafe-inline`/`unsafe-eval`, `connect-src` = relay + push only, SRI on all subresources, `Integrity-Policy` on scripts | 10.2 |

@@ -33,8 +33,9 @@ and an in-app canary) are implemented. See the roadmap in the design doc.
 > me could serve bad code to just you. The strongest thing you can do is verify
 > your contacts' safety numbers in person, though note even that check runs on code
 > I serve. Also know: your messages' contents are private, but I can see *who* you
-> talk to and *when* (not what you say). And keep a backup of your identity key,
-> because if you lose your device without one, your account and history are gone.
+> talk to and *when* (not what you say). And keep a backup of your identity,
+> because if you lose your device without one your account is gone (message
+> history stays only on each device and is never in a backup).
 > If your threat model includes being targeted by me, by anyone who can compel me,
 > or by a state, use Signal.
 

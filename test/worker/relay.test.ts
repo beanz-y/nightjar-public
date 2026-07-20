@@ -3,7 +3,7 @@ import { describe, expect, it, vi } from 'vitest'
 import { MAX_PUSH_SUBS } from '../../src/crypto/constants'
 import { type Identity, generateIdentity } from '../../src/crypto/identity'
 import { utf8 } from '../../src/crypto/primitives'
-import { OWN_BUNDLE_VERSION, buildOwnBundle } from '../../src/crypto/prekeys'
+import { OWN_BUNDLE_VERSION, buildOwnBundle, generateSignedPrekey, verifyFetchedBundle } from '../../src/crypto/prekeys'
 import { initRatchetInitiator, initRatchetResponder, ratchetDecrypt, ratchetEncrypt } from '../../src/crypto/ratchet'
 import { x3dhInitiate, x3dhRespond } from '../../src/crypto/x3dh'
 import { verifyAndSignChallenge } from '../../src/wire/auth'
@@ -556,5 +556,63 @@ describe('push subscriptions (P6)', () => {
     }
     await vi.waitFor(async () => expect(await subCount(id.userId)).toBe(MAX_PUSH_SUBS))
     conn.close()
+  })
+})
+
+describe('SPK rotation through the directory (P8)', () => {
+  const DAY = 86_400_000
+
+  it('publishBundle with a rotated SPK replaces the served one, and the new SPK verifies where the old would fail max-age', async () => {
+    const bob = generateIdentity()
+    // Register with an 8-day-old bundle (accepted: under the 14-day max age).
+    // This simulates a user whose registration SPK has aged past the rotation
+    // cadence, the exact state maybeRotateSpk fires on.
+    const own = buildOwnBundle(bob, Date.now() - 8 * DAY, { spkId: 1, opkStartId: 1, opkCount: 2 })
+    const conn = await connectAndAuth(bob)
+    const reg = await register(conn, own, await adminInvite())
+    expect(reg.t).toBe('registered')
+
+    // Rotate: publish a FRESH SPK (id 2) with no new OPKs, as the client does.
+    const rotated = generateSignedPrekey(bob, 2, Date.now())
+    const reqId = nextReq()
+    conn.send({
+      t: 'publishBundle',
+      reqId,
+      spk: {
+        id: rotated.spk.id,
+        createdAt: rotated.spk.createdAt,
+        expiry: rotated.spk.expiry,
+        pub: b64encode(rotated.spk.pub),
+        sig: b64encode(rotated.spk.sig),
+      },
+      opks: [],
+    })
+    const pub = await conn.waitPred((m) => (m.t === 'published' || m.t === 'error') && (m as { reqId?: string }).reqId === reqId)
+    expect(pub.t).toBe('published')
+
+    // A fetcher now receives the rotated SPK, and it verifies at a `now` one
+    // week ahead, where the registration-time SPK would already be 15 days old
+    // and fail the initiator's max-age check.
+    const alice = generateIdentity()
+    const aliceConn = await connectAndAuth(alice)
+    const aliceOwn = ownBundleFor(alice)
+    const regA = await register(aliceConn, aliceOwn, await adminInvite())
+    expect(regA.t).toBe('registered')
+
+    const fetchReq = nextReq()
+    aliceConn.send({ t: 'fetchBundle', reqId: fetchReq, target: bob.userId })
+    const bm = (await aliceConn.waitFor('bundle')) as Extract<ServerMessage, { t: 'bundle' }>
+    expect(bm.bundle).not.toBeNull()
+    const fetched = decodeFetchedBundle(bm.bundle!)
+    expect(fetched.spk.id).toBe(2)
+
+    const later = Date.now() + 7 * DAY
+    expect(() => verifyFetchedBundle(fetched, later)).not.toThrow()
+    // The pre-rotation SPK really would have been rejected at that time.
+    const stale = { ...fetched, spk: own.spk }
+    expect(() => verifyFetchedBundle(stale, later)).toThrow(/expired|too old/)
+
+    conn.close()
+    aliceConn.close()
   })
 })

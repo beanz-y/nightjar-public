@@ -78,8 +78,8 @@ export function About({ canary, onBack }: Props) {
 
       <div className="field-label small muted">how to verify this build</div>
       <ol className="verify-steps small muted">
-        <li>Get the public source at the signed release tag {live && canary?.attestsVersion ? canary.attestsVersion : __APP_VERSION__}.</li>
-        <li>Rebuild it in the pinned container and compute the release hash with the documented recipe (see the runbook).</li>
+        <li>Get the public source at the deployed commit for {live && canary?.attestsVersion ? canary.attestsVersion : __APP_VERSION__}.</li>
+        <li>Rebuild it in the pinned container and compute the release hash (the steps are in docs/VERIFYING.md).</li>
         <li>
           Compare that hash to the one in the public transparency log (Rekor){canary?.attestsHash ? ` and to the hash this build's canary vouches for (${canary.attestsHash.slice(0, 16)}…)` : ''}.
         </li>

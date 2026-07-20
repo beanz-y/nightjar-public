@@ -2,20 +2,38 @@
 // (generated on first launch); to actually message, it must register behind a
 // single-use invite. A normal invite carries the inviter's fingerprint, which the
 // client pins on join; the very first user registers with a bootstrap (admin)
-// code that carries no inviter.
+// code that carries no inviter. Users with an existing identity restore a
+// backup instead (P8), which replaces the freshly generated throwaway identity.
 
 import { useState } from 'react'
+import { RestoreScreen } from './RestoreScreen'
 
 interface Props {
   userId: string
   prefill: string
   connected: boolean
+  restoreBusy: boolean
+  restoreError: string | null
   onJoin: (input: string) => void
+  onRestore: (file: File, passphrase: string) => void
   onAbout: () => void
 }
 
-export function Onboarding({ userId, prefill, connected, onJoin, onAbout }: Props) {
+export function Onboarding({ userId, prefill, connected, restoreBusy, restoreError, onJoin, onRestore, onAbout }: Props) {
   const [input, setInput] = useState(prefill)
+  const [restoring, setRestoring] = useState(false)
+
+  if (restoring) {
+    return (
+      <RestoreScreen
+        mode="onboarding"
+        busy={restoreBusy}
+        error={restoreError}
+        onRestore={onRestore}
+        onBack={() => setRestoring(false)}
+      />
+    )
+  }
 
   return (
     <section className="onboard">
@@ -55,6 +73,13 @@ export function Onboarding({ userId, prefill, connected, onJoin, onAbout }: Prop
         </button>
       </div>
       {!connected && <p className="muted small">connecting to the relay…</p>}
+
+      <p className="small">
+        Already have a Nightjar identity?{' '}
+        <button className="link" onClick={() => setRestoring(true)}>
+          restore from a backup file
+        </button>
+      </p>
     </section>
   )
 }

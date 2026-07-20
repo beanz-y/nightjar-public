@@ -24,7 +24,7 @@
 // to come); this module is the durable trust STATE and the binding checks.
 
 import { deriveUserId } from '../crypto/identity'
-import { b64encode } from '../wire/codec'
+import { b64decode, b64encode } from '../wire/codec'
 import type { KeyStore } from '../storage/keystore'
 import type { Lock } from '../storage/lock'
 
@@ -56,8 +56,19 @@ export class KeyConflictError extends Error {
 
 const CONTACTS_KEY = 'contacts.v1'
 const CONTACTS_LOCK = 'nightjar-contacts'
+const PENDING_KEY = 'contacts.pending.v1'
+const MAX_PENDING_RECORDS = 100
 const encoder = new TextEncoder()
 const decoder = new TextDecoder()
+
+/** Trust work that failed transiently and must not be lost (P8): an inviter pin
+ *  whose bundle fetch failed after registration consumed the invite, and inbound
+ *  first-contact records whose write failed after the session committed. Both
+ *  are retried on every connect until they land. */
+export interface PendingTrust {
+  inviterPin?: string
+  records: Array<{ peerId: string; ikSig: string }>
+}
 
 export class ContactStore {
   constructor(
@@ -123,6 +134,53 @@ export class ContactStore {
         return
       }
       map[peerId] = { peerId, ikSig: encoded, trust, firstSeen: now, verifiedAt: null }
+    })
+  }
+
+  // --- pending trust work (P8 durability) ---------------------------------
+
+  async getPendingTrust(): Promise<PendingTrust> {
+    const bytes = await this.store.get(PENDING_KEY)
+    if (!bytes) return { records: [] }
+    try {
+      const p = JSON.parse(decoder.decode(bytes)) as PendingTrust
+      return {
+        ...(typeof p.inviterPin === 'string' ? { inviterPin: p.inviterPin } : {}),
+        records: Array.isArray(p.records) ? p.records : [],
+      }
+    } catch {
+      return { records: [] }
+    }
+  }
+
+  async mutatePendingTrust(fn: (p: PendingTrust) => void): Promise<void> {
+    await this.lock.withLock(CONTACTS_LOCK, async () => {
+      const p = await this.getPendingTrust()
+      fn(p)
+      p.records = p.records.slice(-MAX_PENDING_RECORDS)
+      if (!p.inviterPin && p.records.length === 0) {
+        await this.store.delete(PENDING_KEY)
+      } else {
+        await this.store.put(PENDING_KEY, encoder.encode(JSON.stringify(p)))
+      }
+    })
+  }
+
+  /** Replace the whole contact map from a restored backup (P8, DESIGN 8.3).
+   *  Restore-only: it runs against a freshly wiped device, so replacing (not
+   *  merging) is the correct semantics. Every row is re-checked against the
+   *  key<->userId binding here as well, independent of the backup decoder. */
+  async replaceAllFromBackup(contacts: Contact[]): Promise<void> {
+    const map: Record<string, Contact> = {}
+    for (const c of contacts) {
+      if (deriveUserId(b64decode(c.ikSig, 32)) !== c.peerId) continue
+      map[c.peerId] = { ...c }
+    }
+    await this.lock.withLock(CONTACTS_LOCK, async () => {
+      await this.write(map)
+      // Clear any pending-trust work parked by the PRIOR identity on this device
+      // so a restored identity starts from a clean ledger (fresh-device premise).
+      await this.store.delete(PENDING_KEY)
     })
   }
 

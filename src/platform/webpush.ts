@@ -27,7 +27,7 @@ export function pushSupported(): boolean {
 
 /** True when running as an installed (Home Screen / standalone) app. iOS only
  *  permits Notification permission + push subscription inside the installed
- *  instance, so the UI gates the toggle on this for iOS (red-team H5). */
+ *  instance, so the UI gates the toggle on this for iOS. */
 export function isStandalone(): boolean {
   if (typeof window === 'undefined') return false
   const displayMode = window.matchMedia?.('(display-mode: standalone)').matches ?? false
@@ -172,7 +172,7 @@ export async function unsubscribePush(): Promise<string | null> {
 
 /** Clear any outstanding content-free nudges. Called when the app becomes
  *  visible: the message is now on screen or draining, so the nudge is moot, and
- *  clearing only on visibility avoids racing an in-flight push (red-team M3). */
+ *  clearing only on visibility avoids racing an in-flight push. */
 export async function clearNotifications(): Promise<void> {
   if (typeof navigator === 'undefined' || !('serviceWorker' in navigator)) return
   try {

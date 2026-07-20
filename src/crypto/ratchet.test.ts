@@ -14,6 +14,7 @@ import {
   initRatchetResponder,
   kdfCk,
   kdfRk,
+  pruneSkippedKeys,
   ratchetDecrypt,
   ratchetEncrypt,
   serializeRatchet,
@@ -351,5 +352,79 @@ describe('ratchet serialization', () => {
     const d1 = ratchetDecrypt(bob, e1.header, e1.ciphertext) // recover via the persisted skipped key
     bob = d1.state
     expect(S(d1.plaintext)).toBe('s1')
+  })
+})
+
+describe('skipped-key time expiry (DESIGN 5.3, 14)', () => {
+  const DAY = 24 * 60 * 60 * 1000
+
+  /** Alice sends two messages; Bob decrypts only the second, storing the first
+   *  message's key as skipped, stamped at `at`. Returns Bob plus the held-back
+   *  envelope. */
+  function withSkipped(at: number) {
+    let { alice, bob } = establish()
+    const e1 = ratchetEncrypt(alice, B('held back'))
+    alice = e1.state
+    const e2 = ratchetEncrypt(alice, B('arrives first'))
+    const d2 = ratchetDecrypt(bob, e2.header, e2.ciphertext, at)
+    return { bob: d2.state, held: e1 }
+  }
+
+  it('stamps skipped keys with the decrypt-time now and prunes past the bound', () => {
+    const { bob, held } = withSkipped(NOW)
+    expect(bob.skipped.size).toBe(1)
+
+    // Fresh: pruning within the window keeps the key, and the late message lands.
+    const fresh = pruneSkippedKeys(bob, NOW + 13 * DAY)
+    expect(fresh.pruned).toBe(0)
+    const d = ratchetDecrypt(fresh.state, held.header, held.ciphertext)
+    expect(S(d.plaintext)).toBe('held back')
+
+    // Aged out: pruning past the bound drops it, and the late message no longer
+    // decrypts (its key is gone; poison-drop handles the envelope upstream).
+    const aged = pruneSkippedKeys(bob, NOW + 15 * DAY)
+    expect(aged.pruned).toBe(1)
+    expect(aged.state.skipped.size).toBe(0)
+    expect(() => ratchetDecrypt(aged.state, held.header, held.ciphertext)).toThrow()
+  })
+
+  it('pruning returns the same state object when nothing expires', () => {
+    const { bob } = withSkipped(NOW)
+    const { state, pruned } = pruneSkippedKeys(bob, NOW + 1000)
+    expect(pruned).toBe(0)
+    expect(state).toBe(bob)
+  })
+
+  it('ts survives serialization, and legacy snapshots without ts are stamped at load', () => {
+    const { bob } = withSkipped(NOW)
+    const snap = serializeRatchet(bob)
+    expect(snap.skipped[0]?.ts).toBe(NOW)
+    const restored = deserializeRatchet(snap)
+    expect(Array.from(restored.skipped.values())[0]?.ts).toBe(NOW)
+
+    // A pre-P8 snapshot (no ts): the legacyTs param starts its clock at load,
+    // so an upgrade never mass-drops in-flight skipped keys.
+    const legacy = { ...snap, skipped: snap.skipped.map(({ dhr, n, mk }) => ({ dhr, n, mk })) }
+    const stamped = deserializeRatchet(legacy, NOW + 5 * DAY)
+    expect(Array.from(stamped.skipped.values())[0]?.ts).toBe(NOW + 5 * DAY)
+  })
+})
+
+describe('snapshot shape validation (fail closed on corruption)', () => {
+  function goodSnap() {
+    const { bob } = establish()
+    return serializeRatchet(bob)
+  }
+
+  it('rejects truncated or non-hex key material and bad counters', () => {
+    const snap = goodSnap()
+    expect(() => deserializeRatchet({ ...snap, rk: snap.rk.slice(0, 62) })).toThrow(/rk/)
+    expect(() => deserializeRatchet({ ...snap, rk: 'zz'.repeat(32) })).toThrow(/hex/)
+    expect(() => deserializeRatchet({ ...snap, ns: -1 })).toThrow(/counter/)
+    expect(() => deserializeRatchet({ ...snap, nr: 1.5 })).toThrow(/counter/)
+    expect(() => deserializeRatchet({ ...snap, dhsPriv: null })).toThrow(/together/)
+    expect(() =>
+      deserializeRatchet({ ...snap, skipped: [{ dhr: 'aa'.repeat(32), n: 0, mk: 'ff'.repeat(31) }] }),
+    ).toThrow(/skipped.mk/)
   })
 })

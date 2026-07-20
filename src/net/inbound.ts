@@ -25,14 +25,14 @@
 import { bytesToHex } from '@noble/hashes/utils'
 import { POISON_MAX_ATTEMPTS } from '../crypto/constants'
 import { type Identity, deriveUserId } from '../crypto/identity'
-import { deserializeRatchet, initRatchetResponder, ratchetDecrypt, serializeRatchet } from '../crypto/ratchet'
+import { deserializeRatchet, initRatchetResponder, pruneSkippedKeys, ratchetDecrypt, serializeRatchet } from '../crypto/ratchet'
 import { initialMessageId, x3dhRespond } from '../crypto/x3dh'
 import { type ContactStore, KeyConflictError } from '../trust/contactStore'
 import { decryptOrder, promoteSession, updateSession } from '../session/sessionBook'
 import type { PrekeyStore } from '../storage/prekeyStore'
 import type { Lock } from '../storage/lock'
 import type { SessionStore } from '../storage/sessionStore'
-import type { Envelope } from '../wire/codec'
+import { type Envelope, b64encode } from '../wire/codec'
 
 export type InboundResult =
   | { kind: 'delivered'; peerId: string; plaintext: Uint8Array; consumedOpk: boolean }
@@ -138,7 +138,7 @@ async function handleInitial(env: Envelope, from: string, deps: InboundDeps): Pr
 
   const state0 = initRatchetResponder(resp.sk, resp.ad, { privateKey: spkPriv, publicKey: spkPub })
   // Throws on AEAD failure -> no persist below, the book is left untouched.
-  const { state, plaintext } = ratchetDecrypt(state0, env.header, env.ciphertext)
+  const { state, plaintext } = ratchetDecrypt(state0, env.header, env.ciphertext, now)
 
   // Promote the new responder session to current, archiving the prior current
   // (glare/re-establishment safety), then commit book + seen + replay atomically.
@@ -158,11 +158,19 @@ async function handleInitial(env: Envelope, from: string, deps: InboundDeps): Pr
     }
   }
   // Trust-on-first-use: record the peer's key now that a session is durable.
+  // A failed write must not poison the already-committed message, but it must
+  // not be LOST either (the peer would be unverifiable forever): park it in the
+  // pending-trust ledger, flushed on every connect (P8).
   if (firstContact && deps.contacts) {
     try {
       await deps.contacts.recordFirstContact(from, ih.ikSigPub, now)
     } catch {
-      /* best-effort */
+      const ikSigB64 = b64encode(ih.ikSigPub)
+      await deps.contacts
+        .mutatePendingTrust((p) => {
+          if (!p.records.some((r) => r.peerId === from)) p.records.push({ peerId: from, ikSig: ikSigB64 })
+        })
+        .catch(() => {})
     }
   }
   return { kind: 'delivered', peerId: from, plaintext, consumedOpk }
@@ -182,8 +190,12 @@ async function handleNormal(env: Envelope, from: string, deps: InboundDeps): Pro
   let lastErr: unknown = new Error('inbound: message did not match any session')
   for (const s of decryptOrder(book)) {
     try {
-      const { state, plaintext } = ratchetDecrypt(deserializeRatchet(s.snapshot), env.header, env.ciphertext)
-      const advanced = updateSession(book, s.id, serializeRatchet(state), now)
+      const { state, plaintext } = ratchetDecrypt(deserializeRatchet(s.snapshot, now), env.header, env.ciphertext, now)
+      // Expire aged skipped keys on the state we are about to persist (DESIGN
+      // 5.3/14: the count cap lives in the ratchet; the time bound is enforced
+      // here, where a real clock exists).
+      const { state: pruned } = pruneSkippedKeys(state, now)
+      const advanced = updateSession(book, s.id, serializeRatchet(pruned), now)
       await store.saveBookWithSeen(from, advanced, env.id)
       return { kind: 'delivered', peerId: from, plaintext, consumedOpk: false }
     } catch (e) {

@@ -126,3 +126,23 @@ describe('bundle verification (fails closed)', () => {
     expect(() => verifyFetchedBundle({ ...b, spk }, NOW)).toThrow(/too old/)
   })
 })
+
+describe('version ceiling and timestamp sanity (P8 hardening)', () => {
+  it('rejects a bundle advertising a version newer than this client speaks', () => {
+    const b = { ...bundleFor(generateIdentity(), NOW), version: 2 }
+    expect(() => verifyFetchedBundle(b, NOW)).toThrow(/newer/)
+  })
+
+  it('rejects an SPK whose timestamps are non-finite (NaN passes every comparison)', () => {
+    const bob = generateIdentity()
+    const b = bundleFor(bob, NOW)
+    // Re-sign so only the freshness guards are in play, not the signature check.
+    const spkNaN = {
+      ...b.spk,
+      createdAt: Number.NaN,
+      expiry: Number.NaN,
+      sig: signSpk(bob, b.spk.id, Number.NaN, Number.NaN, b.spk.pub),
+    }
+    expect(() => verifyFetchedBundle({ ...b, spk: spkNaN }, NOW)).toThrow(/malformed/)
+  })
+})

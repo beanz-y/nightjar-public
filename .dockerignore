@@ -1,0 +1,19 @@
+# The reproducible-build container must see ONLY the committed sources: with no
+# .dockerignore, `COPY . .` (which runs AFTER the container's own `npm ci`)
+# would overlay a local rebuilder's host node_modules (wrong-platform binaries),
+# stale dist/, and .git over the clean install, breaking the "anyone can rebuild
+# and confirm byte-identity" claim exactly for the people trying to verify it.
+node_modules
+dist
+dist-ssr
+coverage
+.git
+.github
+.wrangler
+manifest.txt
+release.json
+*.tsbuildinfo
+.env
+.env.*
+.dev.vars
+.DS_Store

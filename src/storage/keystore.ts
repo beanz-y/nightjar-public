@@ -50,7 +50,10 @@ export class IdbKeyStore implements KeyStore {
           req.result.createObjectStore(STORE_NAME)
         }
         req.onsuccess = () => resolve(req.result)
-        req.onerror = () => reject(req.error)
+        req.onerror = () => {
+          this.dbPromise = null // a failed open must not wedge every later call
+          reject(req.error)
+        }
       })
     }
     return this.dbPromise

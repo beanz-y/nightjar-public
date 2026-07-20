@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // The ONE canonical release-hash recipe (DESIGN 10, MF5). Referenced by the
-// CI release workflow, build-reproducible.sh, the runbook, and the warrant canary,
+// CI release workflow, build-reproducible.sh, docs/VERIFYING.md, and the warrant canary,
 // so an auditor rebuilding from public source computes the SAME number that is
 // signed into Rekor and attested by the canary. Node built-ins only, run under the
 // pinned Node (.nvmrc) with `node scripts/release-hash.mjs [distDir]`.

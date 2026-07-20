@@ -29,6 +29,12 @@ export const SN_DIGITS_PER_GROUP = 5
 // it is a compute bound as well as a storage bound. (Consumed at P2.)
 export const MAX_SKIP = 1000
 
+/** Skipped message keys older than this are pruned (DESIGN 5.3, 14). Completes
+ *  the retry invariant chain: outbox retry horizon (7d) < seen-id TTL (8d) <
+ *  skipped-key expiry (14d), so a sender's late retry always lands on either a
+ *  live skipped key or the receiver's dedup, never a silently-aged-out key. */
+export const SKIPPED_KEY_EXPIRY_MS = 14 * 24 * 60 * 60 * 1000
+
 // Session management (DESIGN 6.4, 8.3; the P5 glare fix). A peer slot holds a
 // small SET of ratchet sessions (a "session book"), not one: simultaneous
 // first-contact ("glare") leaves each side with two live sessions, and a
@@ -58,12 +64,18 @@ export const AUTH_NONCE_BYTES = 16
 // X3DH / prekeys (DESIGN 4, 14).
 /** Reject a peer advertising a version below this (downgrade protection, 4.4). */
 export const VERSION_FLOOR = 0x01
-/** Owner rotates the signed prekey about weekly; expiry = createdAt + this. */
+/** The client rotates its signed prekey once the current one is older than this
+ *  (checked on every authenticated connect; P8). */
 export const SPK_ROTATION_MS = 7 * 24 * 60 * 60 * 1000
 /** Initiator rejects a signed prekey older than this (2x rotation). */
 export const SPK_MAX_AGE_MS = 14 * 24 * 60 * 60 * 1000
 /** Tolerance for clock skew when validating signed-prekey timestamps. */
 export const CLOCK_SKEW_MS = 5 * 60 * 1000
+/** How long a RETIRED signed prekey's private half is kept after its expiry: an
+ *  initial message may be built any time the sender's fetched bundle still
+ *  verifies (up to expiry + skew) and then sit queued for the full envelope TTL,
+ *  so the responder must be able to open it that long (P8 rotation). */
+export const SPK_RETIRE_GRACE_MS = 30 * 24 * 60 * 60 * 1000 + 5 * 60 * 1000
 /** One-time prekey batch size, and the low-water mark to replenish at (P4). */
 export const OPK_BATCH = 100
 export const OPK_REPLENISH_THRESHOLD = 20
@@ -83,7 +95,7 @@ export const SEEN_ID_TTL_MS = 8 * 24 * 60 * 60 * 1000
  *  the SAME one-time prekey instead of depleting another (DESIGN 4.3). */
 export const OPK_VEND_TTL_MS = 7 * 24 * 60 * 60 * 1000
 
-// Server-side abuse ceilings (P4 review). The Directory and Inbox are shared,
+// Server-side abuse ceilings. The Directory and Inbox are shared,
 // single-instance-ish Durable Objects, so an unbounded write from one registered
 // account is a shared-fate DoS. These bound each write path.
 /** Max one-time prekeys accepted in a single register/publish call. */
@@ -115,7 +127,7 @@ export const PUSH_TTL_SEC = 24 * 60 * 60
  *  few hundred bytes; this bounds storage + outbound fetch size). */
 export const MAX_PUSH_ENDPOINT_LEN = 2048
 
-// Presence (P6, red-team H4/H7). A push is sent for a new envelope only when the
+// Presence (P6). A push is sent for a new envelope only when the
 // user has no socket that is "fresh-watching" (foreground). The client re-affirms
 // watching while its page is visible; a slept/backgrounded/zombie socket stops
 // affirming and goes stale within the freshness window, so its stale watching bit
@@ -126,3 +138,33 @@ export const PRESENCE_HEARTBEAT_MS = 45 * 1000
  *  new envelope is pushed. Must exceed the heartbeat by >1 interval so a single
  *  dropped heartbeat does not spuriously push to an active foreground app. */
 export const PRESENCE_FRESH_MS = 110 * 1000
+
+// Identity backup (P8, DESIGN 8.3, 14). The blob is a fixed header (magic,
+// format version, Argon2id parameters, salt) followed by an XChaCha20-Poly1305
+// body whose key and nonce both derive from the passphrase; the header is the
+// AAD, so no field of it can be altered without failing the tag.
+export const BACKUP_MAGIC = 'NJBK'
+export const BACKUP_FORMAT_VERSION = 0x01
+/** Argon2id parameters pinned for exports: 64 MiB, 3 passes, 1 lane. Measured
+ *  (@noble/hashes, desktop): ~2.3 s; the earlier provisional 256 MiB measured
+ *  9.1 s and risks OOM in an iOS Safari worker. 64 MiB / t=3 is RFC 9106's
+ *  constrained-environment recommendation; p=1 because a browser runs one lane
+ *  and extra lanes in one thread only slow the defender. */
+export const BACKUP_ARGON2_M_KIB = 65536
+export const BACKUP_ARGON2_T = 3
+export const BACKUP_ARGON2_P = 1
+/** Restore-side bounds, enforced BEFORE the KDF runs so a hostile blob cannot
+ *  make the client allocate gigabytes or spin for minutes. */
+export const BACKUP_MIN_M_KIB = 8192
+export const BACKUP_MAX_M_KIB = 262144
+export const BACKUP_MAX_T = 6
+export const BACKUP_SALT_BYTES = 16
+/** KDF expansion info for the backup key+nonce (one derivation, versioned). */
+export const INFO_BACKUP = 'Nightjar_Backup_v1'
+/** Decrypted payload cap, enforced before JSON.parse (identity is 192 bytes and
+ *  contacts are small; anything near this is not one of our blobs). */
+export const BACKUP_MAX_PAYLOAD_BYTES = 256 * 1024
+export const BACKUP_MAX_CONTACTS = 1000
+/** Minimum typed-passphrase length (after trim + NFC). The offered generated
+ *  passphrase is 20 base32 characters (~100 bits) and always passes. */
+export const PASSPHRASE_MIN_LENGTH = 12
