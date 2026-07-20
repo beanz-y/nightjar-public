@@ -96,7 +96,19 @@ jobs:
       # A redeploy of unchanged source is then byte-identical, so the canary that
       # attests {version, releaseHash} stays valid without a re-sign.
       - name: Derive the release version (from VERSION)
-        run: echo "NIGHTJAR_VERSION=$(tr -d '[:space:]' < VERSION)" >> "$GITHUB_ENV"
+        # Strip a leading UTF-8 BOM (\357\273\277 = EF BB BF) AND all whitespace:
+        # an editor that saves VERSION as "UTF-8 with BOM" (e.g. Windows
+        # PowerShell 5.1 `Set-Content -Encoding utf8`) would otherwise bake an
+        # invisible U+FEFF into __APP_VERSION__, so the running build would not
+        # equal the clean version the canary signs. Then fail loudly if what is
+        # left is not a sane version, rather than shipping a malformed one.
+        run: |
+          NIGHTJAR_VERSION=$(tr -d '\357\273\277[:space:]' < VERSION)
+          if ! printf '%s' "$NIGHTJAR_VERSION" | grep -qE '^v?[0-9]+\.[0-9]+\.[0-9]+([.+-][0-9A-Za-z.-]+)?$'; then
+            echo "::error::VERSION is not a valid version after normalization: [$NIGHTJAR_VERSION]"
+            exit 1
+          fi
+          echo "NIGHTJAR_VERSION=$NIGHTJAR_VERSION" >> "$GITHUB_ENV"
 
       - name: Build once inside the digest-pinned container (the canonical artifact)
         run: |
