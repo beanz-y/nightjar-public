@@ -8,16 +8,21 @@ import type { Message } from './useNightjar'
 
 interface Props {
   peer: string
+  /** Local nickname for this chat, or '' if none. */
+  name: string
   messages: Message[]
   trust: TrustLevel | null
   onSend: (text: string) => void
   onVerify: () => void
+  onRename: (name: string) => void
   /** Narrow-screen navigation: return to the conversation list. */
   onBack?: () => void
 }
 
-export function Conversation({ peer, messages, trust, onSend, onVerify, onBack }: Props) {
+export function Conversation({ peer, name, messages, trust, onSend, onVerify, onRename, onBack }: Props) {
   const [draft, setDraft] = useState('')
+  const [renaming, setRenaming] = useState(false)
+  const [nameDraft, setNameDraft] = useState(name)
   const endRef = useRef<HTMLDivElement>(null)
 
   useEffect(() => {
@@ -31,6 +36,13 @@ export function Conversation({ peer, messages, trust, onSend, onVerify, onBack }
     setDraft('')
   }
 
+  function saveName() {
+    onRename(nameDraft.trim())
+    setRenaming(false)
+  }
+
+  const shortId = `${peer.slice(0, 8)}…${peer.slice(-6)}`
+
   return (
     <div className="convo">
       <header className="convo-head">
@@ -40,8 +52,42 @@ export function Conversation({ peer, messages, trust, onSend, onVerify, onBack }
               ‹
             </button>
           )}
-          <div>
-            <div className="mono break small">{peer}</div>
+          <div className="convo-idblock">
+            {renaming ? (
+              <div className="row">
+                <input
+                  autoFocus
+                  value={nameDraft}
+                  placeholder="name this chat"
+                  maxLength={60}
+                  onChange={(e) => setNameDraft(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter') saveName()
+                    if (e.key === 'Escape') setRenaming(false)
+                  }}
+                />
+                <button className="ghost small" onClick={saveName}>
+                  save
+                </button>
+              </div>
+            ) : (
+              <div className="convo-title">
+                <span className="convo-name">{name || shortId}</span>
+                <button
+                  className="icon-btn rename-btn"
+                  title={name ? 'rename this chat' : 'name this chat'}
+                  onClick={() => {
+                    setNameDraft(name)
+                    setRenaming(true)
+                  }}
+                >
+                  ✎
+                </button>
+              </div>
+            )}
+            {/* The real device id stays visible so verification is always by
+                identity, never by the (cosmetic, self-set) name. */}
+            <div className="mono break tiny muted">{peer}</div>
             {trust && <TrustBadge trust={trust} />}
           </div>
         </div>

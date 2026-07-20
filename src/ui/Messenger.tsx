@@ -21,6 +21,7 @@ type Overlay = 'none' | 'newchat' | 'settings'
 interface Props {
   identity: Identity
   contacts: Contact[]
+  aliases: Record<string, string>
   conversations: Record<string, Message[]>
   notify: NotifyState
   storagePersisted: boolean | null
@@ -29,6 +30,7 @@ interface Props {
     send: (peer: string, text: string) => void
     startChat: (peer: string) => void
     openFromCode: (input: string) => Promise<string | null>
+    renameChat: (peer: string, name: string) => void
     mintInvite: () => Promise<MintedInvite | null>
     markVerified: (peer: string) => void
     enableNotifications: () => void
@@ -41,7 +43,8 @@ function shortId(id: string): string {
   return `${id.slice(0, 6)}…${id.slice(-4)}`
 }
 
-export function Messenger({ identity, contacts, conversations, notify, storagePersisted, canary, actions }: Props) {
+export function Messenger({ identity, contacts, aliases, conversations, notify, storagePersisted, canary, actions }: Props) {
+  const displayName = (peer: string): string => aliases[peer]?.trim() || shortId(peer)
   const [selected, setSelected] = useState<string | null>(null)
   const [chatView, setChatView] = useState<'chat' | 'verify'>('chat')
   const [overlay, setOverlay] = useState<Overlay>('none')
@@ -49,15 +52,21 @@ export function Messenger({ identity, contacts, conversations, notify, storagePe
 
   const contactById = useMemo(() => new Map(contacts.map((c) => [c.peerId, c])), [contacts])
 
-  // Threads = everyone we have a contact for OR a conversation with, newest first.
+  // Threads = everyone we have a contact for, a conversation with, OR a name for
+  // (a named chat persists in the list even before a message or contact record),
+  // newest-conversation first.
   const threads = useMemo(() => {
-    const ids = new Set<string>([...contacts.map((c) => c.peerId), ...Object.keys(conversations)])
+    const ids = new Set<string>([
+      ...contacts.map((c) => c.peerId),
+      ...Object.keys(conversations),
+      ...Object.keys(aliases),
+    ])
     return [...ids].sort((a, b) => {
       const la = conversations[a]?.at(-1)?.ts ?? 0
       const lb = conversations[b]?.at(-1)?.ts ?? 0
       return lb - la
     })
-  }, [contacts, conversations])
+  }, [contacts, conversations, aliases])
 
   function openChat(peer: string) {
     setSelected(peer)
@@ -134,9 +143,10 @@ export function Messenger({ identity, contacts, conversations, notify, storagePe
                 onClick={() => openChat(peer)}
               >
                 <div className="thread-top">
-                  <span className="mono tiny">{shortId(peer)}</span>
+                  <span className="thread-name">{displayName(peer)}</span>
                   {c ? <TrustBadge trust={c.trust} /> : <span className="badge badge-unknown">new</span>}
                 </div>
+                {aliases[peer]?.trim() && <span className="mono tiny muted">{shortId(peer)}</span>}
                 {last && (
                   <span className="muted tiny preview">
                     {last.dir === 'out' ? 'you: ' : ''}
@@ -165,10 +175,12 @@ export function Messenger({ identity, contacts, conversations, notify, storagePe
         ) : (
           <Conversation
             peer={selected}
+            name={aliases[selected]?.trim() || ''}
             messages={conversations[selected] ?? []}
             trust={selectedContact?.trust ?? null}
             onSend={(t) => actions.send(selected, t)}
             onVerify={() => selectedContact && setChatView('verify')}
+            onRename={(n) => actions.renameChat(selected, n)}
             onBack={() => setSelected(null)}
           />
         )}

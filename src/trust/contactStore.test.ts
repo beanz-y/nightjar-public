@@ -86,3 +86,30 @@ describe('KeyConflictError', () => {
     expect(e.peerId).toBe('peer-x')
   })
 })
+
+describe('chat aliases (P8+, local nicknames)', () => {
+  it('sets, reads, updates, and clears a peer alias without touching contacts', async () => {
+    const store = new ContactStore(new MemoryKeyStore(), new InMemoryLock())
+    const peer = generateIdentity().userId
+    expect(await store.getAliases()).toEqual({})
+
+    await store.setAlias(peer, '  Alice  ') // trimmed
+    expect((await store.getAliases())[peer]).toBe('Alice')
+
+    await store.setAlias(peer, 'Alice at work')
+    expect((await store.getAliases())[peer]).toBe('Alice at work')
+
+    // Aliases are independent of the contact map (a chat can be named pre-contact).
+    expect(await store.list()).toEqual([])
+
+    await store.setAlias(peer, '') // clear
+    expect(await store.getAliases()).toEqual({})
+  })
+
+  it('caps alias length', async () => {
+    const store = new ContactStore(new MemoryKeyStore(), new InMemoryLock())
+    const peer = generateIdentity().userId
+    await store.setAlias(peer, 'x'.repeat(200))
+    expect((await store.getAliases())[peer]?.length).toBe(60)
+  })
+})

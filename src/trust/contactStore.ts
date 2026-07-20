@@ -57,7 +57,9 @@ export class KeyConflictError extends Error {
 const CONTACTS_KEY = 'contacts.v1'
 const CONTACTS_LOCK = 'nightjar-contacts'
 const PENDING_KEY = 'contacts.pending.v1'
+const ALIASES_KEY = 'aliases.v1'
 const MAX_PENDING_RECORDS = 100
+const MAX_ALIAS_LENGTH = 60
 const encoder = new TextEncoder()
 const decoder = new TextDecoder()
 
@@ -134,6 +136,37 @@ export class ContactStore {
         return
       }
       map[peerId] = { peerId, ikSig: encoded, trust, firstSeen: now, verifiedAt: null }
+    })
+  }
+
+  // --- chat aliases (local, cosmetic) -------------------------------------
+  //
+  // A per-device nickname for a peer, so a chat is identifiable by name instead
+  // of a 52-char device id. Aliases are LOCAL and cosmetic only: they never touch
+  // the wire, the crypto, or the trust level, and the real userId + trust badge
+  // stay visible so verification is always by identity, not by a label anyone
+  // could set. Keyed by peerId so a chat can be named before it is a full contact.
+
+  async getAliases(): Promise<Record<string, string>> {
+    const bytes = await this.store.get(ALIASES_KEY)
+    if (!bytes) return {}
+    try {
+      const m = JSON.parse(decoder.decode(bytes)) as Record<string, string>
+      return m && typeof m === 'object' ? m : {}
+    } catch {
+      return {}
+    }
+  }
+
+  /** Set (or clear, with an empty name) a peer's local nickname. */
+  async setAlias(peerId: string, name: string): Promise<void> {
+    const trimmed = name.trim().slice(0, MAX_ALIAS_LENGTH)
+    await this.lock.withLock(CONTACTS_LOCK, async () => {
+      const map = await this.getAliases()
+      if (trimmed) map[peerId] = trimmed
+      else delete map[peerId]
+      if (Object.keys(map).length === 0) await this.store.delete(ALIASES_KEY)
+      else await this.store.put(ALIASES_KEY, encoder.encode(JSON.stringify(map)))
     })
   }
 

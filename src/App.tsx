@@ -24,6 +24,7 @@ export function App() {
     connected,
     registered,
     contacts,
+    aliases,
     conversations,
     prefillInvite,
     notify,
@@ -124,6 +125,7 @@ export function App() {
               <Messenger
                 identity={identity}
                 contacts={contacts}
+                aliases={aliases}
                 conversations={conversations}
                 notify={notify}
                 storagePersisted={storagePersisted}

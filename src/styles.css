@@ -16,11 +16,18 @@
   box-sizing: border-box;
 }
 
+html,
 body {
+  height: 100%;
   margin: 0;
+}
+body {
   background: var(--bg);
   color: var(--fg);
-  min-height: 100vh;
+  /* The app owns the viewport; the page itself must never scroll (that is what
+     pushed the compose bar off screen). Inner panes scroll instead. */
+  overflow: hidden;
+  overscroll-behavior: none;
 }
 
 /* --- utilities ---------------------------------------------------------- */
@@ -121,8 +128,10 @@ input {
 .root {
   max-width: 62rem;
   margin: 0 auto;
-  height: 100vh;
-  height: 100dvh; /* mobile browser chrome-aware */
+  /* --app-height (main.tsx) tracks the VISIBLE viewport incl. the on-screen
+     keyboard; 100dvh is the fallback before/without JS. */
+  height: 100dvh;
+  height: var(--app-height, 100dvh);
   overflow: hidden; /* inner panes scroll, not the page */
   display: flex;
   flex-direction: column;
@@ -508,6 +517,33 @@ textarea.mono {
   gap: 0.5rem;
   min-width: 0;
 }
+.convo-idblock {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
+}
+.convo-title {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+}
+.convo-name {
+  font-weight: 600;
+  font-size: 1rem;
+}
+.rename-btn {
+  width: 1.6rem;
+  height: 1.6rem;
+  font-size: 0.85rem;
+  border-color: transparent;
+}
+.thread-name {
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 .msgs {
   flex: 1;
   overflow-y: auto;
@@ -539,7 +575,10 @@ textarea.mono {
   display: flex;
   gap: 0.5rem;
   padding-top: 0.6rem;
+  /* Clear the iPhone home indicator so the bar is never behind it. */
+  padding-bottom: env(safe-area-inset-bottom, 0);
   border-top: 1px solid var(--border);
+  flex-shrink: 0; /* the message list scrolls; the compose bar stays put */
 }
 .compose input {
   flex: 1;

@@ -348,6 +348,16 @@ export class NightjarClient {
     return this.contacts.list()
   }
 
+  /** Local per-device chat nicknames (cosmetic; see ContactStore). */
+  async listAliases(): Promise<Record<string, string>> {
+    return this.contacts.getAliases()
+  }
+
+  /** Set or clear a peer's local nickname. */
+  async setAlias(peerId: string, name: string): Promise<void> {
+    return this.contacts.setAlias(peerId, name)
+  }
+
   /** Record that the out-of-band safety-number check passed for a peer (6.2). */
   async markVerified(peerId: string): Promise<void> {
     return this.contacts.markVerified(peerId, Date.now())

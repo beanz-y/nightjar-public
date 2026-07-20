@@ -2,7 +2,11 @@
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+    <!-- interactive-widget=resizes-content: when the on-screen keyboard opens, the
+         layout viewport shrinks so a bottom-pinned compose bar stays visible above
+         it (Chromium/Android). iOS is handled via the visualViewport --app-height
+         in main.tsx. viewport-fit=cover lets safe-area insets reach the compose. -->
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover, interactive-widget=resizes-content" />
     <meta name="color-scheme" content="dark light" />
     <meta name="theme-color" content="#0b0e14" />
     <title>Nightjar</title>

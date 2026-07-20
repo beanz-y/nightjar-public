@@ -112,6 +112,7 @@ export function useNightjar() {
   const [connected, setConnected] = useState(false)
   const [registered, setRegistered] = useState(false)
   const [contacts, setContacts] = useState<Contact[]>([])
+  const [aliases, setAliases] = useState<Record<string, string>>({})
   const [conversations, setConversations] = useState<Record<string, Message[]>>({})
   const [prefillInvite, setPrefillInvite] = useState<string>('')
   const [notify, setNotify] = useState<NotifyState>(() => computeNotify(null))
@@ -249,6 +250,7 @@ export function useNightjar() {
         if (authed.registered) await completeRestoreIfPending(client, keys)
         if (cancelled) return
         setContacts(await client.listContacts())
+        setAliases(await client.listAliases())
         setPhase(authed.registered ? 'ready' : 'onboarding')
 
         // Web Push (P6). Record the relay's key for the UI, and if this device
@@ -369,6 +371,18 @@ export function useNightjar() {
 
   const startChat = useCallback((peer: string) => {
     setConversations((prev) => (prev[peer] ? prev : { ...prev, [peer]: [] }))
+  }, [])
+
+  // Set (or clear, with an empty string) a local nickname for a chat.
+  const renameChat = useCallback(async (peer: string, name: string) => {
+    const live = liveRef.current
+    if (!live) return
+    try {
+      await live.client.setAlias(peer, name)
+      setAliases(await live.client.listAliases())
+    } catch (e) {
+      setNotice(`could not rename this chat: ${String(e instanceof Error ? e.message : e)}`)
+    }
   }, [])
 
   // Open a chat from a scanned/pasted value (registered user). Accepts either a
@@ -549,6 +563,7 @@ export function useNightjar() {
     connected,
     registered,
     contacts,
+    aliases,
     conversations,
     prefillInvite,
     notify,
@@ -560,6 +575,7 @@ export function useNightjar() {
       send,
       startChat,
       openFromCode,
+      renameChat,
       mintInvite,
       markVerified,
       dismissNotice,
