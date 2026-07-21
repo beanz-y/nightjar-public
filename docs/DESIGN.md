@@ -740,6 +740,13 @@ Honest posture, stated in the UI and here:
 - The delete is **content, doubly encrypted like any message**; the relay sees only
   another opaque envelope. It does not retroactively unsend: the ciphertext the peer
   already received cannot be recalled, only asked to be discarded.
+- **A delete never notifies the recipient.** The send frame carries a `silent` flag,
+  so the relay stores and delivers the delete (in-band to a live device, drained on
+  the next connect otherwise) but skips the content-free push nudge (P6): deleting a
+  message must not buzz the other person's phone. The cost is a small metadata signal
+  the relay already could largely infer (a delete is a distinctively small envelope):
+  the operator sees which sends are marked "do not notify". `silent` only suppresses
+  the notification; it never affects storage or delivery.
 
 ### 8.7 Session-only (ephemeral) messages
 

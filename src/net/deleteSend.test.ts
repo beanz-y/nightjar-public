@@ -105,6 +105,8 @@ describe('NightjarClient.deleteForEveryone (P10d)', () => {
     expect(out[0].id).not.toBe(id)
     expect(out[0].to).toBe(peer.userId)
     expect((out[0].env as { kind: string }).kind).toBe('normal')
+    // The control is marked silent so deleting never sends the recipient a push nudge.
+    expect(out[0].silent).toBe(true)
   })
 
   it('a still-queued message: cancels the send, transmits no delete control', async () => {

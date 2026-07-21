@@ -34,6 +34,7 @@ interface Props {
     renameChat: (peer: string, name: string) => void
     mintInvite: () => Promise<MintedInvite | null>
     markVerified: (peer: string) => void
+    ensureContact: (peer: string) => Promise<boolean>
     enableNotifications: () => void
     disableNotifications: () => void
     exportBackup: (passphrase: string) => Promise<boolean>
@@ -113,6 +114,19 @@ export function Messenger({ identity, contacts, aliases, conversations, notify, 
   }
 
   const selectedContact = selected ? contactById.get(selected) ?? null : null
+
+  // Open the verify screen. If we do not hold a contact record yet (e.g. this peer
+  // was just added by their code/QR and no message has been exchanged), fetch their
+  // key + record a TOFU contact first, so the safety number can render instead of the
+  // verify button silently doing nothing.
+  async function openVerify() {
+    if (!selected) return
+    if (!selectedContact) {
+      const ok = await actions.ensureContact(selected)
+      if (!ok) return // a notice was shown
+    }
+    setChatView('verify')
+  }
 
   // Full-cover overlays sit above the whole messenger.
   if (overlay === 'newchat') {
@@ -225,7 +239,7 @@ export function Messenger({ identity, contacts, aliases, conversations, notify, 
             messages={conversations[selected] ?? []}
             trust={selectedContact?.trust ?? null}
             onSend={(t, ephemeral) => actions.send(selected, t, ephemeral)}
-            onVerify={() => selectedContact && setChatView('verify')}
+            onVerify={() => void openVerify()}
             onRename={(n) => actions.renameChat(selected, n)}
             onDelete={(id, failed) => void actions.deleteMessage(selected, id, failed)}
             onBack={() => setSelected(null)}

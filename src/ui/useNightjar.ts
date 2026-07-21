@@ -604,6 +604,15 @@ export function useNightjar() {
         return null
       }
       setConversations((prev) => (prev[id] ? prev : { ...prev, [id]: [] }))
+      // Fetch their key and record a (TOFU) contact so you can verify them right
+      // away, without having to send a message first. Best-effort: if they are not
+      // registered yet the chat still opens and the contact lands on first message.
+      try {
+        await live.client.addContact(id)
+        setContacts(await live.client.listContacts())
+      } catch {
+        /* not registered / offline; verify will re-try, or it records on first message */
+      }
       return id
     }
     let artifact: InviteArtifact
@@ -654,6 +663,28 @@ export function useNightjar() {
       setContacts(await live.client.listContacts())
     } catch (e) {
       setNotice(`could not save the verification: ${String(e instanceof Error ? e.message : e)}`)
+    }
+  }, [])
+
+  // Make sure we hold a contact (with their key) for `peer` so the verify screen can
+  // render a safety number. Fetches + records a TOFU contact if we do not have one
+  // yet (e.g. right after adding them by code/QR, before any message). Returns
+  // whether a contact is now available.
+  const ensureContact = useCallback(async (peer: string): Promise<boolean> => {
+    const live = liveRef.current
+    if (!live) return false
+    try {
+      const list = await live.client.listContacts()
+      if (list.some((c) => c.peerId === peer)) {
+        setContacts(list)
+        return true
+      }
+      await live.client.addContact(peer)
+      setContacts(await live.client.listContacts())
+      return true
+    } catch (e) {
+      setNotice(`could not load this contact's key to verify (${String(e instanceof Error ? e.message : e)}); send them a message first`)
+      return false
     }
   }, [])
 
@@ -779,6 +810,7 @@ export function useNightjar() {
       renameChat,
       mintInvite,
       markVerified,
+      ensureContact,
       dismissNotice,
       dismissSecurityNotice,
       listContacts,

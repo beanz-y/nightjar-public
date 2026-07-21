@@ -55,6 +55,9 @@ export interface OutboxEntry {
   to: string
   env: unknown
   createdAt: number
+  /** A delete-for-everyone control (P10d) is delivered WITHOUT a push nudge so it
+   *  never notifies the recipient. Persisted so retransmits stay silent too. */
+  silent?: boolean
 }
 
 /** One persisted message (P10c). The WHOLE message (id, peer, dir, ts, text) is

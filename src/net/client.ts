@@ -385,6 +385,19 @@ export class NightjarClient {
     await this.contacts.recordFirstContact(inviterUserId, bundle.ikSigPub, Date.now(), 'invite')
   }
 
+  /** Add a contact by userId (TOFU): fetch their bundle, enforce the key<->userId
+   *  binding, and record them at 'unverified' so a safety number can be shown and
+   *  verified immediately - WITHOUT having to exchange a message first (the fix for
+   *  "verify does nothing after I add someone by their code/QR"). Idempotent and
+   *  never downgrades an existing invite/verified contact (recordFirstContact only
+   *  upgrades trust). Throws if the peer is not registered. */
+  async addContact(peerId: string): Promise<void> {
+    const { bundle } = await this.directory.fetchBundle(peerId)
+    if (!bundle) throw new Error(`${peerId} is not registered`)
+    if (deriveUserId(bundle.ikSigPub) !== peerId) throw new Error(`directory served a key that does not match ${peerId}`)
+    await this.contacts.recordFirstContact(peerId, bundle.ikSigPub, Date.now())
+  }
+
   /** The trust level held for a peer (DESIGN 6), or null if unknown. */
   async trustOf(peerId: string): Promise<TrustLevel | null> {
     return this.contacts.trustLevel(peerId)
@@ -605,7 +618,9 @@ export class NightjarClient {
         ciphertext: b64encode(ciphertext),
       }
       const advanced = updateSession(book!, current.id, serializeRatchet(state), now)
-      const e: OutboxEntry = { id: transportId, to: peer, env, createdAt: now }
+      // silent: a delete control is delivered without a push nudge, so deleting a
+      // message never notifies the recipient (it still applies in-band / on drain).
+      const e: OutboxEntry = { id: transportId, to: peer, env, createdAt: now, silent: true }
       await this.store.saveBookWithOutbox(peer, advanced, e) // commit before release; no history row
       return e
     })
@@ -620,7 +635,7 @@ export class NightjarClient {
   private fire(e: OutboxEntry): void {
     void this.transport.waitSent(e.id).then(() => this.store.removeOutbox(e.id))
     try {
-      this.transport.raw({ t: 'send', to: e.to, env: e.env as WireEnvelope })
+      this.transport.raw({ t: 'send', to: e.to, env: e.env as WireEnvelope, ...(e.silent ? { silent: true } : {}) })
     } catch {
       // Not connected; the entry stays queued and flushes on reconnect.
     }

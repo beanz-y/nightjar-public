@@ -60,6 +60,11 @@ export interface SendMsg {
   t: 'send'
   to: string
   env: WireEnvelope
+  /** Suppress the recipient's content-free push nudge for this envelope (P10d): a
+   *  delete-for-everyone control should never notify. The envelope is still stored
+   *  and delivered in-band to a live device, and drained on the next connect if the
+   *  recipient is offline, so the delete still applies - just without a notification. */
+  silent?: boolean
 }
 
 export interface AckMsg {

@@ -613,7 +613,6 @@ textarea.mono {
   flex-direction: row-reverse;
 }
 .msg-actions {
-  position: relative;
   flex-shrink: 0;
 }
 .msg-actions-btn {
@@ -627,6 +626,9 @@ textarea.mono {
 .msg-actions-btn:focus-visible {
   opacity: 0.6;
 }
+/* Anchored to the RIGHT edge of the full-width message row (not the tiny ⋯ button),
+   so it opens down-and-left and stays on screen even for a full-width bubble or a
+   narrow PWA. Width is clamped to the viewport so it never runs off the edge. */
 .msg-menu {
   position: absolute;
   top: 100%;
@@ -637,7 +639,8 @@ textarea.mono {
   flex-direction: column;
   gap: 0.3rem;
   padding: 0.5rem;
-  min-width: 12rem;
+  min-width: min(12rem, calc(100vw - 2rem));
+  max-width: calc(100vw - 1.5rem);
   background: var(--panel);
   border: 1px solid var(--border);
   border-radius: 0.5rem;

@@ -58,6 +58,9 @@ interface DeliverBody {
   from: string
   env: WireEnvelope
   now: number
+  /** Suppress the content-free push nudge for this envelope (a delete-for-everyone
+   *  control, P10d): still stored + delivered/drained, just never notified. */
+  silent?: boolean
 }
 
 export class Inbox {
@@ -327,6 +330,7 @@ export class Inbox {
         from: userId,
         env: msg.env,
         now: Date.now(),
+        ...(msg.silent ? { silent: true } : {}),
       })
       // Sender-side durability ack: the recipient inbox has the bytes (or already
       // had them). The sender's outbox can now stop retrying this id.
@@ -479,9 +483,11 @@ export class Inbox {
       await this.ensureAlarm(now)
       // Nudge a CLOSED / backgrounded device: only when no socket is currently
       // foreground (a foreground app renders the in-band deliver, so a push would
-      // just double-notify). Content-free; fanned out in the background so the
-      // sender's deliver round-trip is not coupled to push-service latency (M5).
-      if (pushConfigured(this.env) && !this.hasFreshWatcher(Date.now())) {
+      // just double-notify) AND the sender did not mark the envelope silent (a
+      // delete-for-everyone control must not notify, P10d). Content-free; fanned out
+      // in the background so the sender's deliver round-trip is not coupled to
+      // push-service latency (M5).
+      if (pushConfigured(this.env) && !body.silent && !this.hasFreshWatcher(Date.now())) {
         this.ctx.waitUntil(this.pushNudge())
       }
     }
