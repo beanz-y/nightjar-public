@@ -659,6 +659,45 @@ textarea.mono {
   padding-right: 1.1rem;
 }
 
+/* Session-only (ephemeral, P10e). The armed mode uses the amber "warn" tone
+   throughout (distinct from the blue accent and the red danger) so it is
+   unmistakable at a glance: the toggle chip, the whole compose bar, the send
+   button, and every ephemeral bubble all pick it up. */
+.session-toggle {
+  flex-shrink: 0;
+  border-radius: 1.3rem;
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--muted);
+  padding: 0.4rem 0.7rem;
+  font-size: 0.8rem;
+  white-space: nowrap;
+}
+.session-toggle.on {
+  border-color: var(--warn);
+  color: var(--warn);
+  background: color-mix(in srgb, var(--warn) 14%, transparent);
+  font-weight: 600;
+}
+.compose-ephemeral {
+  background: color-mix(in srgb, var(--warn) 8%, var(--panel));
+  border-top: 2px solid var(--warn);
+}
+.compose-ephemeral input {
+  border: 1px solid var(--warn);
+}
+.compose-ephemeral .primary {
+  background: var(--warn);
+  color: #0b0e14;
+}
+.bubble-ephemeral {
+  border: 1px dashed var(--warn);
+  background: color-mix(in srgb, var(--warn) 8%, var(--panel));
+}
+.ephemeral-mark {
+  color: var(--warn);
+}
+
 /* Unread ("new message") indicator on the conversation list. */
 .thread-left {
   display: flex;

@@ -432,25 +432,29 @@ export class NightjarClient {
    * carries the SAME ts and a reload cannot reorder this message relative to an
    * interleaved inbound one (whose live and stored ts already match).
    */
-  async sendText(to: string, text: string, msgId?: string, uiTs?: number): Promise<string> {
+  async sendText(to: string, text: string, msgId?: string, uiTs?: number, ephemeral = false): Promise<string> {
     const contentIdHex = msgId ?? bytesToHex(newMsgId())
-    // The ratchet plaintext is the structured NJM1 record (not raw utf8): it
-    // carries the content id + kind + ephemeral flag both sides need. P10b always
-    // sends non-ephemeral text; the ephemeral toggle is P10e.
-    const plaintext = encodeTextMessage(hexToBytes(contentIdHex), text, false)
+    // The ratchet plaintext is the structured NJM1 record (not raw utf8): it carries
+    // the content id + kind + the ephemeral flag both sides need. A session-only
+    // (ephemeral, P10e) message is authenticated with flags bit0 set and is NEVER
+    // sealed into history on either device. It is otherwise delivered EXACTLY like a
+    // normal message (same outbox + ack + retransmit): the only difference is the
+    // skipped history seal. That is deliberate - a session-ESTABLISHING initial must
+    // be delivered reliably, or a single lost frame would orphan the session and
+    // break ALL future traffic (including non-ephemeral) to this peer.
+    const plaintext = encodeTextMessage(hexToBytes(contentIdHex), text, ephemeral)
     const entry = await this.lock.withLock(sessionLock(to), async () => {
       const now = Date.now()
       const ts = uiTs ?? now
       const book = await this.store.loadBook(to)
       const current = currentSession(book)
-      // Seal the sent message for history (skipped when history is not wired).
-      // Done inside the lock, before the commit, so a seal failure aborts the send
-      // with nothing queued; the history row rides the same tx as the ratchet
-      // advance + outbox (commit before release). Stamped with the UI ts so live
-      // and hydrated ordering agree.
-      const historyRow = this.history
-        ? this.history.seal({ id: contentIdHex, peerId: to, dir: 'out', ts, text })
-        : undefined
+      // Seal the sent message for history - UNLESS it is ephemeral (never persisted,
+      // send OR receive) or history is not wired. Done inside the lock, before the
+      // commit, so a seal failure aborts the send with nothing queued; the row rides
+      // the same tx as the ratchet advance + outbox (commit before release), stamped
+      // with the UI ts so live and hydrated ordering agree.
+      const historyRow =
+        !ephemeral && this.history ? this.history.seal({ id: contentIdHex, peerId: to, dir: 'out', ts, text }) : undefined
 
       if (current) {
         // Established (or pending) session: a normal ratchet message. `now` as
@@ -487,13 +491,13 @@ export class NightjarClient {
       if (a.outcome === 'conflict') throw new KeyConflictError(to)
 
       // Record the contact BEFORE committing the session. A later send to an
-      // established peer takes the current-session branch (below) and never
-      // touches the contact store, so if this record were only best-effort AFTER
-      // the commit, a single contacts-store hiccup would leave a durable session
-      // with no contact record: the peer would be unverifiable forever (no stored
-      // IK_sig -> no safety number, the priority-1 control). Recording first means
-      // a failure aborts this first-contact send with nothing queued to lose; the
-      // retry re-fetches, re-assesses, and re-records cleanly.
+      // established peer takes the current-session branch (above) and never touches
+      // the contact store, so if this record were only best-effort AFTER the commit,
+      // a single contacts-store hiccup would leave a durable session with no contact
+      // record: the peer would be unverifiable forever (no stored IK_sig -> no safety
+      // number, the priority-1 control). Recording first means a failure aborts this
+      // first-contact send with nothing queued to lose. (Contact/trust is not message
+      // content, so it is recorded even for an ephemeral first message.)
       if (a.outcome === 'first-contact') {
         await this.contacts.recordFirstContact(to, bundle.ikSigPub, now)
       }

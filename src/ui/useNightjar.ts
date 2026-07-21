@@ -64,6 +64,9 @@ export interface Message {
   text: string
   ts: number
   failed?: boolean
+  /** Session-only (P10e): shown live but never written to history on either
+   *  device; rendered distinctly and cleared on reload/lock. */
+  ephemeral?: boolean
 }
 
 export interface MintedInvite {
@@ -214,7 +217,7 @@ export function useNightjar() {
         stores.lock,
         {
           onMessage: (from, msg) => {
-            appendMessage(from, { id: msg.id, dir: 'in', text: msg.text, ts: msg.ts })
+            appendMessage(from, { id: msg.id, dir: 'in', text: msg.text, ts: msg.ts, ...(msg.ephemeral ? { ephemeral: true } : {}) })
             void client.listContacts().then(setContacts).catch(() => {})
           },
           onDelete: (from, id) => {
@@ -517,7 +520,7 @@ export function useNightjar() {
   }, [])
 
   const send = useCallback(
-    async (peer: string, text: string) => {
+    async (peer: string, text: string, ephemeral = false) => {
       const live = liveRef.current
       if (!live || !text.trim()) return
       if (text.length > MAX_MESSAGE_CHARS) {
@@ -526,9 +529,12 @@ export function useNightjar() {
       }
       const msgId = bytesToHex(newMsgId())
       const ts = Date.now()
-      appendMessage(peer, { id: msgId, dir: 'out', text, ts })
+      // The optimistic bubble carries the ephemeral flag so it renders with the
+      // session-only marker immediately (the backstop that makes a wrong-mode send
+      // visible), even before delivery resolves.
+      appendMessage(peer, { id: msgId, dir: 'out', text, ts, ...(ephemeral ? { ephemeral: true } : {}) })
       try {
-        await live.client.sendText(peer, text, msgId, ts)
+        await live.client.sendText(peer, text, msgId, ts, ephemeral)
         setContacts(await live.client.listContacts())
       } catch (e) {
         setConversations((prev) => ({

@@ -26,7 +26,12 @@ export interface P4SelfTestResult {
 // real KDF is exercised by the node/browser lock tests). Dev tooling only.
 const fastKdf = (secret: Uint8Array, salt: Uint8Array) => hash256(new Uint8Array([...secret, ...salt]))
 
-async function makeClient(received: string[], errors: string[], deletes: string[] = []): Promise<NightjarClient> {
+async function makeClient(
+  received: string[],
+  errors: string[],
+  deletes: string[] = [],
+  recvEphemeral: boolean[] = [],
+): Promise<NightjarClient> {
   const id = generateIdentity()
   const lock = new InMemoryLock()
   const keys = new MemoryKeyStore()
@@ -44,7 +49,10 @@ async function makeClient(received: string[], errors: string[], deletes: string[
     contacts,
     lock,
     {
-      onMessage: (_from, msg) => received.push(msg.text),
+      onMessage: (_from, msg) => {
+        received.push(msg.text)
+        recvEphemeral.push(!!msg.ephemeral)
+      },
       onError: (detail) => errors.push(detail),
       onDelete: (_from, msgId) => deletes.push(msgId),
     },
@@ -65,9 +73,10 @@ export async function runP4SelfTest(bootstrapInvite: string): Promise<P4SelfTest
   const aRecv: string[] = []
   const bRecv: string[] = []
   const bDel: string[] = []
+  const bEph: boolean[] = []
   const errors: string[] = []
   const alice = await makeClient(aRecv, errors)
-  const bob = await makeClient(bRecv, errors, bDel)
+  const bob = await makeClient(bRecv, errors, bDel, bEph)
 
   try {
     await alice.connect()
@@ -139,6 +148,20 @@ export async function runP4SelfTest(bootstrapInvite: string): Promise<P4SelfTest
       !aliceAfter.some((m) => m.text === 'delete me')
     log.push(`delete-for-everyone removed it on both sides: ${deleteOk ? 'PASS' : 'FAIL'}`)
 
+    // Session-only (P10e): Alice sends an ephemeral message. Bob receives it LIVE
+    // with the ephemeral flag, but NEITHER device persists it to history.
+    const ephText = 'off the record'
+    await alice.sendText(bob.userId, ephText, undefined, undefined, true)
+    await waitUntil(() => bRecv.includes(ephText))
+    const ephIdx = bRecv.indexOf(ephText)
+    const bobAfterEph = (await bob.loadAllHistory())[alice.userId] ?? []
+    const aliceAfterEph = (await alice.loadAllHistory())[bob.userId] ?? []
+    const ephemeralOk =
+      bEph[ephIdx] === true && // received live, flagged session-only
+      !bobAfterEph.some((m) => m.text === ephText) && // not stored on the receiver
+      !aliceAfterEph.some((m) => m.text === ephText) // not stored on the sender
+    log.push(`session-only shown live + persisted on NEITHER side: ${ephemeralOk ? 'PASS' : 'FAIL'}`)
+
     const ok =
       bRecv[0] === 'hello from alice' &&
       aRecv[0] === 'hi back from bob' &&
@@ -147,6 +170,7 @@ export async function runP4SelfTest(bootstrapInvite: string): Promise<P4SelfTest
       aliceToBob === 'unverified' &&
       historyOk &&
       deleteOk &&
+      ephemeralOk &&
       errors.length === 0
     // Surface the FULL ids (both stay registered in the Directory) so the app can
     // message one and exercise the contact + verify UI against a real peer.

@@ -741,6 +741,54 @@ Honest posture, stated in the UI and here:
   another opaque envelope. It does not retroactively unsend: the ciphertext the peer
   already received cannot be recalled, only asked to be discarded.
 
+### 8.7 Session-only (ephemeral) messages
+
+A per-message compose toggle marks a message **session-only**: it is shown live but
+**never written to persistent message history on either device**. The flag is a bit
+inside the authenticated NJM1 plaintext (8.5), so both the sender's send path and the
+receiver's persist gate skip the history seal (the gate **fails closed**: a message is
+saved only if it is explicitly non-ephemeral; a missing/garbled flag is never
+persisted). A session-only message lives only in RAM and is gone from the screen on
+reload or app-lock. The compose toggle is sticky within one open conversation, resets
+to OFF on every conversation switch, reload, and lock, and is surfaced redundantly (a
+highlighted toggle, a restyled compose bar, a changed placeholder, and a per-bubble
+"session-only" mark on both sender and receiver) so a wrong-mode send is visible.
+
+Honest posture, stated plainly:
+
+- **It is off-the-record courtesy, not a guarantee, and not "more secure".** A
+  session-only message is encrypted in transit **identically** to any other message;
+  the flag changes only at-rest persistence on an **honest** client. The recipient can
+  screenshot or copy it, or run a modified client that keeps it. We do not call it
+  "disappearing", "self-destruct", "secure", or attach any timer: it is scoped to the
+  app session, not a countdown.
+- **It is delivered exactly like any message, and leaves no EXTRA durable trace.**
+  Session-only changes only the history seal; it does **not** change delivery. A
+  session-only message rides the same durable outbox + ack + retransmit path, so a
+  session-**establishing** first message reaches the peer reliably (a naive "skip the
+  outbox" would risk orphaning the session and breaking all future traffic, so we do
+  not do it). Two honest consequences: a session-only message you send while offline
+  is still delivered when you reconnect, and because it is not in your on-screen
+  history after a reload you may not notice it went out. It does not leave a *new*
+  class of at-rest trace: like any message it updates the **unencrypted** session
+  state (8.5), which keys on the peer and stamps the send time, and a first-contact
+  message still records the contact; the transient outbox entry (forward-secret
+  ciphertext, cleared on the relay ack) carries no more than the session state
+  already does. What session-only removes is only the **persistent history row**.
+- **It removes only the saved history row; it does not hide metadata.** The relay
+  still sees the same sender to recipient edge, timing, and ciphertext size (section
+  9), and a backgrounded recipient still gets the same content-free push nudge (P6).
+  Session-only does not make a message less visible to the operator or the network.
+- **It is not forward-secret magic and does not encrypt the session state.** Like any
+  message it advances the (unencrypted-at-rest, 8.5) ratchet counters, and an
+  out-of-order session-only message's key can sit in the in-flight skipped-key map
+  until it arrives. Against a device forensic image, session-only removes the history
+  row only; it does not add confidentiality beyond the normal ratchet.
+- **It can be missed entirely.** Because nothing is persisted, a session-only message
+  is shown in the one open tab/window that receives it (a second open tab will not
+  show it and cannot recover it on reload), and if your app locks or reloads before you
+  read it, it is gone with no way to retrieve it.
+
 ---
 
 ## 9. Metadata: the complete leak list and our honest posture
@@ -1115,6 +1163,7 @@ Native (Tauri) is **not** on the critical path; it is a demand-gated v2 (10.5).
 | Message payload format | magic `"NJM1"`, format version `0x01`, kind (`0x01` text / `0x02` delete), 16-B content msgId, then (text) a flags byte (bit0 = ephemeral, other bits reserved) + utf8 body; the ratchet plaintext. A payload with no magic is legacy plain text; a magic-but-invalid/unknown-version/unknown-kind payload is clean-ignored (never thrown or rendered) | 8.5 |
 | Content vs transport id | the 16-B content msgId lives inside the ratchet plaintext (history key / delete target); the relay-visible transport envelope id is separate (dedup/ack/outbox). A first-send text may reuse its content id as the transport id (brand-new, safe); a delete gets its own fresh transport id | 8.5 |
 | Delete-for-everyone | `delete{targetContentId}` (kind `0x02`) sent on the current session with its OWN fresh transport id; receiver removes only the compound (this peer, dir=in, target id), records a **tombstone** (opaque history key, TTL = envelope TTL 30 d) so a target arriving after its delete is suppressed; removal + tombstone ride the same tx as the ratchet advance. A still-outboxed target is cancelled, not chased. Best-effort, honest-client-dependent; UI says "delete sent" | 8.6 |
+| Session-only (ephemeral) | NJM1 text with flags bit0 set; **never** sealed to history on either device (send-side seal skipped, receive-side persist gate fails closed). RAM-only, cleared on reload/lock. Delivered EXACTLY like any message (same outbox + ack + retransmit, so a session-establishing initial is reliable); it removes only the persistent history row and leaves no EXTRA at-rest trace (the unencrypted session state any message updates still keys on the peer + stamps the send time). Encrypted identically in transit; does not hide relay metadata or the push nudge; off-the-record courtesy, not a guarantee; delete-for-everyone hidden on ephemeral bubbles | 8.7 |
 | App-lock + at-rest data | random 32-B **LDK** wraps all local at-rest data; the LDK is never stored unwrapped, only wrapped per method: passphrase/PIN via `HKDF(Argon2id(secret, 64 MiB/t3/p1, 16-B salt), 16-B salt, "Nightjar_LockWrap_v1")`, biometric via `HKDF(prfSecret, 16-B salt, same info)`, each `XChaCha20-Poly1305(kek, LDK)` with the method kind bound in the AAD. Mandatory; >=1 knowledge factor; PIN min 6 digits (disclosed weak). Sub-keys `HKDF(LDK, "Nightjar_HistBody_v1" / "Nightjar_HistIndex_v1" / "Nightjar_Contacts_v1")` | 8.5 |
 | History at rest | per-message record in the sessions IndexedDB; the **whole message** (content id, peer, direction, ts, text) sealed with XChaCha20-Poly1305 under key+nonce = HKDF(history-body sub-key, **fresh 16-B per-record salt**, info `"Nightjar_History_v1"`); IndexedDB key = `hex(HMAC(history-index sub-key, peer‖dir‖id))` (opaque: the DB reveals no peer/ts/count); AAD binds that storage key + a history-format version; written in the same tx as the ratchet advance + dedup marker. Contacts/pending/aliases sealed under the contacts sub-key with a fresh 16-B salt | 8.5 |
 | Version octet | starts at `0x01` (classical X25519) | 4.4 |

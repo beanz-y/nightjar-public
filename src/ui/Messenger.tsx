@@ -27,7 +27,7 @@ interface Props {
   storagePersisted: boolean | null
   canary: CanaryResult | null
   actions: {
-    send: (peer: string, text: string) => void
+    send: (peer: string, text: string, ephemeral?: boolean) => void
     deleteMessage: (peer: string, id: string, failed?: boolean) => void
     startChat: (peer: string) => void
     openFromCode: (input: string) => Promise<string | null>
@@ -216,11 +216,15 @@ export function Messenger({ identity, contacts, aliases, conversations, notify, 
           />
         ) : (
           <Conversation
+            // Remount per peer so the compose draft AND the sticky session-only mode
+            // reset to their safe defaults on every conversation switch (a session-only
+            // toggle must never silently follow you from one chat to another).
+            key={selected}
             peer={selected}
             name={aliases[selected]?.trim() || ''}
             messages={conversations[selected] ?? []}
             trust={selectedContact?.trust ?? null}
-            onSend={(t) => actions.send(selected, t)}
+            onSend={(t, ephemeral) => actions.send(selected, t, ephemeral)}
             onVerify={() => selectedContact && setChatView('verify')}
             onRename={(n) => actions.renameChat(selected, n)}
             onDelete={(id, failed) => void actions.deleteMessage(selected, id, failed)}

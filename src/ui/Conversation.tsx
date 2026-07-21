@@ -38,7 +38,7 @@ interface Props {
   name: string
   messages: Message[]
   trust: TrustLevel | null
-  onSend: (text: string) => void
+  onSend: (text: string, ephemeral: boolean) => void
   onVerify: () => void
   onRename: (name: string) => void
   /** Delete-for-everyone a message you sent (P10d). `failed` is true for a
@@ -54,6 +54,12 @@ export function Conversation({ peer, name, messages, trust, onSend, onVerify, on
   const [nameDraft, setNameDraft] = useState(name)
   // The outbound message whose delete menu is open (P10d), or null.
   const [menuFor, setMenuFor] = useState<string | null>(null)
+  // Session-only (P10e) compose mode. STICKY within this open conversation, default
+  // OFF. It is component-local state and this component is remounted per peer
+  // (key={peer} in Messenger) AND lives only in RAM, so it resets to OFF on peer
+  // switch, reload, and lock - a forgotten armed toggle can never silently follow
+  // you to another chat or survive a restart.
+  const [sessionOnly, setSessionOnly] = useState(false)
   const endRef = useRef<HTMLDivElement>(null)
 
   useEffect(() => {
@@ -76,7 +82,7 @@ export function Conversation({ peer, name, messages, trust, onSend, onVerify, on
   function submit() {
     const t = draft.trim()
     if (!t) return
-    onSend(t)
+    onSend(t, sessionOnly)
     setDraft('')
   }
 
@@ -158,8 +164,13 @@ export function Conversation({ peer, name, messages, trust, onSend, onVerify, on
               )}
               <div className={`msg msg-${m.dir}`}>
                 <div className="msg-row">
-                  <span className={`bubble${m.failed ? ' bubble-failed' : ''}`}>{m.text}</span>
-                  {m.dir === 'out' && (
+                  <span className={`bubble${m.failed ? ' bubble-failed' : ''}${m.ephemeral ? ' bubble-ephemeral' : ''}`}>
+                    {m.text}
+                  </span>
+                  {/* Delete-for-everyone (P10d) is only meaningful for a persisted
+                      message; an ephemeral one was never saved on either device, so
+                      the affordance is hidden for it. */}
+                  {m.dir === 'out' && !m.ephemeral && (
                     <div className="msg-actions">
                       <button
                         className="icon-btn msg-actions-btn"
@@ -193,6 +204,7 @@ export function Conversation({ peer, name, messages, trust, onSend, onVerify, on
                 </div>
                 <span className="msg-meta tiny muted" title={new Date(m.ts).toLocaleString()}>
                   {formatTime(m.ts)}
+                  {m.ephemeral && <span className="ephemeral-mark"> · session-only, not saved</span>}
                   {m.failed && <span className="error"> · not sent</span>}
                 </span>
               </div>
@@ -202,17 +214,30 @@ export function Conversation({ peer, name, messages, trust, onSend, onVerify, on
         <div ref={endRef} />
       </div>
 
-      <div className="compose">
+      {/* Compose. When session-only is armed the whole bar restyles, the placeholder
+          and send label change, and every sent bubble carries a "session-only" mark -
+          four redundant signals so the armed mode is unmissable (a wrong-mode send is
+          the sharp footgun, DESIGN 8.7). */}
+      <div className={`compose${sessionOnly ? ' compose-ephemeral' : ''}`}>
+        <button
+          type="button"
+          className={`session-toggle${sessionOnly ? ' on' : ''}`}
+          aria-pressed={sessionOnly}
+          title="Session-only: shown live but not saved to history on either device, and cleared when you reload or lock. The other person can still screenshot or copy it, and a modified app could keep it. Off-the-record courtesy, not a guarantee."
+          onClick={() => setSessionOnly((v) => !v)}
+        >
+          session-only{sessionOnly ? ' ✓' : ''}
+        </button>
         <input
           value={draft}
-          placeholder="message"
+          placeholder={sessionOnly ? 'session-only message' : 'message'}
           onChange={(e) => setDraft(e.target.value)}
           onKeyDown={(e) => {
             if (e.key === 'Enter') submit()
           }}
         />
         <button className="primary" disabled={!draft.trim()} onClick={submit}>
-          send
+          {sessionOnly ? 'send once' : 'send'}
         </button>
       </div>
     </div>
