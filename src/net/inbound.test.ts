@@ -3,11 +3,14 @@ import { bytesToHex } from '@noble/hashes/utils'
 import { POISON_MAX_ATTEMPTS } from '../crypto/constants'
 import { type Identity, generateIdentity } from '../crypto/identity'
 import { encodeDeleteMessage, encodeTextMessage, newMsgId } from '../crypto/message'
-import { utf8 } from '../crypto/primitives'
+import { hash256, utf8 } from '../crypto/primitives'
 import { type FetchedBundle, OWN_BUNDLE_VERSION, buildOwnBundle } from '../crypto/prekeys'
 import { type RatchetState, initRatchetInitiator, ratchetEncrypt } from '../crypto/ratchet'
 import { x3dhInitiate } from '../crypto/x3dh'
-import { HISTORY_HMK_KEY, HistoryStore } from '../storage/historyStore'
+import { AppLockStore } from '../storage/appLockStore'
+import { HistoryStore } from '../storage/historyStore'
+
+const stubKdf = (s: Uint8Array, salt: Uint8Array) => hash256(new Uint8Array([...s, ...salt]))
 import { InMemoryLock } from '../storage/lock'
 import { MemoryKeyStore } from '../storage/keystore'
 import { PrekeyStore } from '../storage/prekeyStore'
@@ -191,27 +194,29 @@ describe('processInbound', () => {
   })
 })
 
-describe('processInbound + persistent history (P10b)', () => {
+describe('processInbound + persistent history (P10c)', () => {
   let ctx: Awaited<ReturnType<typeof setup>>
+  let appLock: AppLockStore
   let history: HistoryStore
 
   beforeEach(async () => {
     ctx = await setup()
-    history = new HistoryStore(new MemoryKeyStore(), ctx.lock)
+    appLock = new AppLockStore(new MemoryKeyStore(), ctx.lock, stubKdf)
+    await appLock.enroll([{ kind: 'pass', secret: 'x' }])
+    history = new HistoryStore(appLock)
   })
 
   const deps = () => ({ me: ctx.bob, prekeys: ctx.prekeys, store: ctx.store, lock: ctx.lock, now: NOW, history })
+  const storedMsgs = async () => (await ctx.store.historyLoadAll()).map((r) => history.open(r))
 
-  it('persists a structured text message keyed by its content id, in the same commit', async () => {
+  it('persists a structured text message (full metadata sealed), in the same commit', async () => {
     const cid = newMsgId()
     const m = aliceInitialBytes(ctx.alice, ctx.bundle, 'env-1', encodeTextMessage(cid, 'persist me', false))
     const res = await processInbound(m.env, ctx.alice.userId, deps())
     expect(res.kind).toBe('delivered')
-    const rows = await ctx.store.historyLoad(ctx.alice.userId)
-    expect(rows.map((r) => r.id)).toEqual([bytesToHex(cid)])
-    expect(rows[0].dir).toBe('in')
-    expect((await history.open(rows[0])).text).toBe('persist me')
-    // The row and the dedup marker landed together (delivered -> caller acks env-1).
+    const msgs = await storedMsgs()
+    expect(msgs).toEqual([{ id: bytesToHex(cid), peerId: ctx.alice.userId, dir: 'in', ts: NOW, text: 'persist me' }])
+    // The record and the dedup marker landed together (delivered -> caller acks).
     expect(await ctx.store.hasSeen('env-1')).toBe(true)
   })
 
@@ -219,22 +224,20 @@ describe('processInbound + persistent history (P10b)', () => {
     const m = aliceInitialBytes(ctx.alice, ctx.bundle, 'env-2', encodeTextMessage(newMsgId(), 'poof', true))
     const res = await processInbound(m.env, ctx.alice.userId, deps())
     expect(res.kind).toBe('delivered') // still delivered live; simply not stored
-    expect(await ctx.store.historyLoad(ctx.alice.userId)).toEqual([])
+    expect(await ctx.store.historyLoadAll()).toEqual([])
   })
 
   it('persists a legacy (pre-P10) plain-text message keyed by the envelope id', async () => {
     const m = aliceInitialBytes(ctx.alice, ctx.bundle, 'env-3', utf8('old style'))
     await processInbound(m.env, ctx.alice.userId, deps())
-    const rows = await ctx.store.historyLoad(ctx.alice.userId)
-    expect(rows.map((r) => r.id)).toEqual(['env-3'])
-    expect((await history.open(rows[0])).text).toBe('old style')
+    expect(await storedMsgs()).toEqual([{ id: 'env-3', peerId: ctx.alice.userId, dir: 'in', ts: NOW, text: 'old style' }])
   })
 
   it('does NOT persist a delete control message', async () => {
     const m = aliceInitialBytes(ctx.alice, ctx.bundle, 'env-4', encodeDeleteMessage(newMsgId()))
     const res = await processInbound(m.env, ctx.alice.userId, deps())
     expect(res.kind).toBe('delivered')
-    expect(await ctx.store.historyLoad(ctx.alice.userId)).toEqual([])
+    expect(await ctx.store.historyLoadAll()).toEqual([])
   })
 
   it('persists a normal established-session message and a redelivery does not double-store', async () => {
@@ -243,34 +246,28 @@ describe('processInbound + persistent history (P10b)', () => {
     const cid = newMsgId()
     const second = aliceNormalBytes(first.state, 'env-6', encodeTextMessage(cid, 'second', false))
     await processInbound(second.env, ctx.alice.userId, deps())
-    // Redeliver the second: caught by hasSeen, no extra row.
     const again = await processInbound(second.env, ctx.alice.userId, deps())
     expect(again.kind).toBe('duplicate')
-    const rows = await ctx.store.historyLoad(ctx.alice.userId)
-    expect(rows.length).toBe(2)
-    expect(rows.map((r) => r.id)).toContain(bytesToHex(cid))
+    const msgs = await storedMsgs()
+    expect(msgs.length).toBe(2)
+    expect(msgs.map((m) => m.id)).toContain(bytesToHex(cid))
   })
 
   it('a decryptable message whose history seal fails is retried, NEVER poison-dropped', async () => {
-    // The review finding: a seal failure on a decryptable message must not be
-    // conflated with a decrypt miss and acked-and-dropped. Force seal failure with
-    // a WRAPPED HMK record (a P10c app-lock a P10b build cannot open -> fail closed).
-    const keys = new MemoryKeyStore()
-    await keys.put(HISTORY_HMK_KEY, Uint8Array.from([0x02, ...new Uint8Array(48)]))
-    const brokenHistory = new HistoryStore(keys, ctx.lock)
+    // A seal failure on a decryptable message must not be conflated with a decrypt
+    // miss and acked-and-dropped. Force it with a LOCKED app-lock (fail closed).
+    const lockedAppLock = new AppLockStore(new MemoryKeyStore(), ctx.lock, stubKdf) // never unlocked
+    const brokenHistory = new HistoryStore(lockedAppLock)
     const brokenDeps = () => ({ me: ctx.bob, prekeys: ctx.prekeys, store: ctx.store, lock: ctx.lock, now: NOW, history: brokenHistory })
     const m = aliceInitialBytes(ctx.alice, ctx.bundle, 'env-x', encodeTextMessage(newMsgId(), 'important', false))
-    // Every attempt THROWS (not 'dropped'), far past the poison bound, and the
-    // message is never marked seen, so it stays queued for redelivery (no loss).
     for (let i = 0; i < POISON_MAX_ATTEMPTS + 3; i++) {
       await expect(processInbound(m.env, ctx.alice.userId, brokenDeps())).rejects.toThrow()
     }
     expect(await ctx.store.hasSeen('env-x')).toBe(false)
-    // And nothing was persisted (the commit never ran).
-    expect(await ctx.store.historyLoad(ctx.alice.userId)).toEqual([])
-    // Once the history store is healthy, the same message delivers + persists.
+    expect(await ctx.store.historyLoadAll()).toEqual([])
+    // Once history is available, the same message delivers + persists.
     const res = await processInbound(m.env, ctx.alice.userId, deps())
     expect(res.kind).toBe('delivered')
-    expect((await ctx.store.historyLoad(ctx.alice.userId)).length).toBe(1)
+    expect((await ctx.store.historyLoadAll()).length).toBe(1)
   })
 })

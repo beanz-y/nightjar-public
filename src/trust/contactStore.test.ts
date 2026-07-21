@@ -113,3 +113,34 @@ describe('chat aliases (P8+, local nicknames)', () => {
     expect((await store.getAliases())[peer]?.length).toBe(60)
   })
 })
+
+describe('ContactStore at-rest encryption (P10c)', () => {
+  it('seals the contact blob under the app-lock; a fresh store re-reads it; no plaintext at rest', async () => {
+    const { AppLockStore } = await import('../storage/appLockStore')
+    const { hash256 } = await import('../crypto/primitives')
+    const stubKdf = (s: Uint8Array, salt: Uint8Array) => hash256(new Uint8Array([...s, ...salt]))
+    const keys = new MemoryKeyStore()
+    const lock = new InMemoryLock()
+    const appLock = new AppLockStore(keys, lock, stubKdf)
+    await appLock.enroll([{ kind: 'pass', secret: 'contacts-secret' }])
+
+    const a = generateIdentity()
+    const store = new ContactStore(keys, lock, appLock)
+    await store.recordFirstContact(a.userId, a.ikSig.publicKey, NOW)
+
+    // The raw keystore blob must NOT be readable plaintext JSON.
+    const raw = await keys.get('contacts.v1')
+    expect(raw).not.toBeNull()
+    const asText = new TextDecoder().decode(raw!)
+    expect(asText).not.toContain(a.userId)
+    expect(asText).not.toContain('unverified')
+
+    // A fresh store over the same keys + (unlocked) app-lock reads it back.
+    const store2 = new ContactStore(keys, lock, appLock)
+    expect((await store2.get(a.userId))?.peerId).toBe(a.userId)
+
+    // Locked -> the contacts sub-key is unavailable -> reads fail closed.
+    appLock.lockNow()
+    await expect(new ContactStore(keys, lock, appLock).list()).rejects.toThrow()
+  })
+})

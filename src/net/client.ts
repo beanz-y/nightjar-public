@@ -294,7 +294,7 @@ export class NightjarClient {
       try {
         if (this.history) {
           const entry = (await this.store.pendingOutbox()).find((e) => e.id === ref)
-          if (entry) await this.store.historyMarkFailed(entry.to, 'out', ref)
+          if (entry) await this.store.historyMarkFailed(this.history.storageKey(entry.to, 'out', ref))
         }
       } catch {
         /* best-effort */
@@ -444,7 +444,9 @@ export class NightjarClient {
       // with nothing queued; the history row rides the same tx as the ratchet
       // advance + outbox (commit before release). Stamped with the UI ts so live
       // and hydrated ordering agree.
-      const historyRow = this.history ? await this.history.seal(contentIdHex, to, 'out', ts, text) : undefined
+      const historyRow = this.history
+        ? this.history.seal({ id: contentIdHex, peerId: to, dir: 'out', ts, text })
+        : undefined
 
       if (current) {
         // Established (or pending) session: a normal ratchet message. `now` as
@@ -521,12 +523,12 @@ export class NightjarClient {
     const out: Record<string, StoredMessage[]> = {}
     for (const row of rows) {
       try {
-        const m = await this.history.open(row)
+        const m = this.history.open(row)
         const msg: StoredMessage = { id: m.id, dir: m.dir, text: m.text, ts: m.ts }
         if (row.failed) msg.failed = true
-        ;(out[row.peerId] ??= []).push(msg)
+        ;(out[m.peerId] ??= []).push(msg)
       } catch {
-        /* unreadable row (corruption / wrong key): skip it */
+        /* unreadable record (corruption / wrong key): skip it */
       }
     }
     for (const peer of Object.keys(out)) out[peer].sort((a, b) => a.ts - b.ts)
@@ -535,7 +537,7 @@ export class NightjarClient {
 
   /** Remove one persisted message (P10d delete / P10e ephemeral cleanup). */
   async removeHistory(peerId: string, dir: 'in' | 'out', id: string): Promise<void> {
-    await this.store.historyRemove(peerId, dir, id)
+    if (this.history) await this.store.historyRemove(this.history.storageKey(peerId, dir, id))
   }
 
   // Fire a queued envelope at the socket and arrange for its outbox entry to be
@@ -557,7 +559,7 @@ export class NightjarClient {
         // Past the retry horizon: give up (DESIGN 7.2). Flag the persisted row
         // failed and notify, so this never-delivered message is not shown as
         // delivered after a reload (P10b), then drop the outbox entry.
-        if (this.history) await this.store.historyMarkFailed(e.to, 'out', e.id).catch(() => {})
+        if (this.history) await this.store.historyMarkFailed(this.history.storageKey(e.to, 'out', e.id)).catch(() => {})
         await this.store.removeOutbox(e.id)
         this.cb.onSendFailed?.(e.id, 'delivery timed out (undelivered for too long)')
         continue

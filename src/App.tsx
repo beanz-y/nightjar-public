@@ -7,6 +7,7 @@
 
 import { useState } from 'react'
 import { About } from './ui/About'
+import { AppLockScreen } from './ui/AppLockScreen'
 import { Diagnostics } from './ui/Diagnostics'
 import { Messenger } from './ui/Messenger'
 import { Onboarding } from './ui/Onboarding'
@@ -31,6 +32,9 @@ export function App() {
     restoreBusy,
     restoreError,
     storagePersisted,
+    lockMethods,
+    bioAvailable,
+    restorePending,
     actions,
   } = useNightjar()
   const canary = useCanary()
@@ -106,6 +110,20 @@ export function App() {
 
             {phase === 'evicted' && (
               <RestoreScreen mode="evicted" busy={restoreBusy} error={restoreError} onRestore={actions.restoreFromBackup} />
+            )}
+
+            {(phase === 'enroll' || phase === 'locked') && (
+              <AppLockScreen
+                mode={phase === 'enroll' ? 'enroll' : 'unlock'}
+                restoring={restorePending}
+                bioAvailable={bioAvailable}
+                lockMethods={lockMethods}
+                onEnroll={actions.enrollLock}
+                makeBiometric={actions.makeBiometricMethod}
+                onUnlock={actions.unlock}
+                onUnlockBiometric={actions.unlockWithBiometric}
+                onReset={actions.resetLock}
+              />
             )}
 
             {phase === 'onboarding' && identity && (

@@ -68,7 +68,7 @@ export function encodeDeleteMessage(id: Uint8Array): Uint8Array {
   return concatBytes(MSG_MAGIC, Uint8Array.from([MSG_VERSION, MSG_KIND_DELETE]), id)
 }
 
-/** Total decoder — never throws. See the file header for the classification. */
+/** Total decoder, never throws. See the file header for the classification. */
 export function decodeMessage(bytes: Uint8Array): DecodedMessage {
   if (!hasMagic(bytes)) {
     return { kind: 'legacy', body: decoder.decode(bytes) } // pre-P10 plain text

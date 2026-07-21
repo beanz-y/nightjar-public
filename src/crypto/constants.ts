@@ -187,3 +187,35 @@ export const INFO_HISTORY = 'Nightjar_History_v1'
  *  VERSION, and binding VERSION here would make every existing row fail to open).
  *  Bump this only on a deliberate history-row format change, with a migration. */
 export const HISTORY_FORMAT_VERSION = 0x01
+
+// App-lock (P10c, mandatory). All at-rest local data (message history bodies AND
+// metadata, and the contact list) is encrypted under a random 32-byte Local Data
+// Key (LDK, `HISTORY_HMK_BYTES` long). The LDK is NEVER stored unwrapped: it is
+// generated in RAM at enrollment and wrapped under a KEK derived from each enabled
+// unlock method (passphrase / PIN via Argon2id, biometric via WebAuthn PRF). A
+// PWA has no OS keychain, so at-rest confidentiality reduces to the strength of
+// the unlock secret; a short PIN is offline-brute-forceable from a device image
+// (disclosed), so passphrase/biometric are the strong options.
+export const LOCK_WRAP_FORMAT_VERSION = 0x01
+/** KDF info expanding a KEK+nonce from the Argon2id output or the PRF secret. */
+export const INFO_LOCK_WRAP = 'Nightjar_LockWrap_v1'
+/** Sub-key derivation infos off the LDK (one independent key per at-rest use). */
+export const INFO_HISTORY_BODY = 'Nightjar_HistBody_v1'
+export const INFO_HISTORY_INDEX = 'Nightjar_HistIndex_v1'
+export const INFO_CONTACTS = 'Nightjar_Contacts_v1'
+/** Argon2id params for a knowledge-factor KEK: same as the backup blob (64 MiB,
+ *  t=3, p=1; ~2.3 s desktop). Reused deliberately so there is one tuned cost. */
+export const LOCK_ARGON2_M_KIB = BACKUP_ARGON2_M_KIB
+export const LOCK_ARGON2_T = BACKUP_ARGON2_T
+export const LOCK_ARGON2_P = BACKUP_ARGON2_P
+/** Fresh CSPRNG salt widths per wrap (Argon2id salt + HKDF salt). */
+export const LOCK_SALT_BYTES = 16
+/** Minimum passphrase length (after NFC+trim), shared with the backup floor. */
+export const LOCK_PASSPHRASE_MIN_LENGTH = PASSPHRASE_MIN_LENGTH
+/** Minimum PIN digits. A numeric PIN is convenience-grade: even this floor is
+ *  weak against an extracted device image (no PWA hardware rate-limiting), so the
+ *  UI must label it as such and steer at-rest-sensitive users to a passphrase. */
+export const PIN_MIN_DIGITS = 6
+/** Fixed WebAuthn PRF evaluation input, pinned so the derived PRF secret is
+ *  stable for a credential across unlocks. */
+export const LOCK_PRF_INPUT = 'Nightjar-applock-prf-v1'

@@ -24,7 +24,7 @@
 import type { BackupPayload } from '../crypto/backup'
 import { serializeIdentity } from '../crypto/identity'
 import type { ContactStore } from '../trust/contactStore'
-import { HISTORY_HMK_KEY } from './historyStore'
+import { HISTORY_LOCK_KEY } from './appLockStore'
 import { IDENTITY_KEY } from './identityStore'
 import type { KeyStore } from './keystore'
 import type { Lock } from './lock'
@@ -43,15 +43,35 @@ export interface RestoreDeps {
   lock: Lock
 }
 
-/** Stage an opened backup as this device's identity. The caller MUST reload the
- *  app afterwards (a clean re-bootstrap is the only supported path back). */
+/** Stage an opened backup as this device's identity, wiping any prior lock so the
+ *  device becomes UNCONFIGURED and re-enrolls (used when the caller has NOT already
+ *  set up a lock). The caller MUST reload afterwards. */
 export async function stageRestore(deps: RestoreDeps, payload: BackupPayload): Promise<void> {
   await deps.lock.withLock(IDENTITY_LOCK, async () => {
-    await deps.sessions.wipeAll() // also clears the history store (P10b)
+    await deps.sessions.wipeAll() // also clears the history store (P10c)
     await deps.keys.delete(PREKEYS_KEY)
-    await deps.keys.delete(HISTORY_HMK_KEY) // drop the prior identity's history key (P10b)
+    // Delete the app-lock record so a restored device is genuinely UNCONFIGURED
+    // and re-enrolls a fresh lock (the red-team caught that leaving this stranded a
+    // forgotten-secret user at an unopenable unlock screen). The old history rows
+    // are wiped above and were unreadable without the old LDK regardless.
+    await deps.keys.delete(HISTORY_LOCK_KEY)
     await deps.keys.put(RESTORE_PENDING_KEY, Uint8Array.from([1]))
     await deps.contacts.replaceAllFromBackup(payload.contacts)
+    await deps.keys.put(IDENTITY_KEY, serializeIdentity(payload.identity))
+    await deps.sentinel.mark()
+  })
+}
+
+/** Stage an opened backup when the app-lock has ALREADY been enrolled in this
+ *  session (P10c restore flow): the LDK is resident, so the contact import is
+ *  encrypted at rest. Does NOT touch the lock record (the caller just created it).
+ *  The caller MUST reload afterwards (into the unlock screen). */
+export async function stageRestoreEnrolled(deps: RestoreDeps, payload: BackupPayload): Promise<void> {
+  await deps.lock.withLock(IDENTITY_LOCK, async () => {
+    await deps.sessions.wipeAll()
+    await deps.keys.delete(PREKEYS_KEY)
+    await deps.keys.put(RESTORE_PENDING_KEY, Uint8Array.from([1]))
+    await deps.contacts.replaceAllFromBackup(payload.contacts) // encrypted under the just-enrolled LDK
     await deps.keys.put(IDENTITY_KEY, serializeIdentity(payload.identity))
     await deps.sentinel.mark()
   })

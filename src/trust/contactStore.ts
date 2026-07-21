@@ -24,7 +24,9 @@
 // to come); this module is the durable trust STATE and the binding checks.
 
 import { deriveUserId } from '../crypto/identity'
+import { openBlob, sealBlob } from '../crypto/appLock'
 import { b64decode, b64encode } from '../wire/codec'
+import type { AppLockStore } from '../storage/appLockStore'
 import type { KeyStore } from '../storage/keystore'
 import type { Lock } from '../storage/lock'
 
@@ -76,16 +78,33 @@ export class ContactStore {
   constructor(
     private readonly store: KeyStore,
     private readonly lock: Lock,
+    /** When present, every contact/pending/alias blob is encrypted at rest under
+     *  the app-lock's contacts sub-key (P10c). Omitted in tests (plaintext) and
+     *  before a lock exists; the real app always supplies an UNLOCKED one, since
+     *  contacts are only ever touched behind the unlock screen. */
+    private readonly appLock?: AppLockStore,
   ) {}
 
+  // Read a keystore blob, decrypting under the contacts sub-key when the app-lock
+  // is wired. `label` (the slot name) is bound in the AEAD so blobs can't be swapped.
+  private async getSealed(key: string, label: string): Promise<Uint8Array | null> {
+    const raw = await this.store.get(key)
+    if (raw == null) return null
+    return this.appLock ? openBlob(this.appLock.contactsKey(), label, raw) : raw
+  }
+
+  private async putSealed(key: string, label: string, bytes: Uint8Array): Promise<void> {
+    await this.store.put(key, this.appLock ? sealBlob(this.appLock.contactsKey(), label, bytes) : bytes)
+  }
+
   private async read(): Promise<Record<string, Contact>> {
-    const bytes = await this.store.get(CONTACTS_KEY)
+    const bytes = await this.getSealed(CONTACTS_KEY, CONTACTS_KEY)
     if (!bytes) return {}
     return JSON.parse(decoder.decode(bytes)) as Record<string, Contact>
   }
 
   private async write(map: Record<string, Contact>): Promise<void> {
-    await this.store.put(CONTACTS_KEY, encoder.encode(JSON.stringify(map)))
+    await this.putSealed(CONTACTS_KEY, CONTACTS_KEY, encoder.encode(JSON.stringify(map)))
   }
 
   private async mutate<T>(fn: (map: Record<string, Contact>) => T): Promise<T> {
@@ -148,7 +167,7 @@ export class ContactStore {
   // could set. Keyed by peerId so a chat can be named before it is a full contact.
 
   async getAliases(): Promise<Record<string, string>> {
-    const bytes = await this.store.get(ALIASES_KEY)
+    const bytes = await this.getSealed(ALIASES_KEY, ALIASES_KEY)
     if (!bytes) return {}
     try {
       const m = JSON.parse(decoder.decode(bytes)) as Record<string, string>
@@ -166,14 +185,14 @@ export class ContactStore {
       if (trimmed) map[peerId] = trimmed
       else delete map[peerId]
       if (Object.keys(map).length === 0) await this.store.delete(ALIASES_KEY)
-      else await this.store.put(ALIASES_KEY, encoder.encode(JSON.stringify(map)))
+      else await this.putSealed(ALIASES_KEY, ALIASES_KEY, encoder.encode(JSON.stringify(map)))
     })
   }
 
   // --- pending trust work (P8 durability) ---------------------------------
 
   async getPendingTrust(): Promise<PendingTrust> {
-    const bytes = await this.store.get(PENDING_KEY)
+    const bytes = await this.getSealed(PENDING_KEY, PENDING_KEY)
     if (!bytes) return { records: [] }
     try {
       const p = JSON.parse(decoder.decode(bytes)) as PendingTrust
@@ -194,7 +213,7 @@ export class ContactStore {
       if (!p.inviterPin && p.records.length === 0) {
         await this.store.delete(PENDING_KEY)
       } else {
-        await this.store.put(PENDING_KEY, encoder.encode(JSON.stringify(p)))
+        await this.putSealed(PENDING_KEY, PENDING_KEY, encoder.encode(JSON.stringify(p)))
       }
     })
   }

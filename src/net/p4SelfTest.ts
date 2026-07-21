@@ -7,6 +7,8 @@
 // vend, X3DH, the ratchet, store-and-deliver, and acks.
 
 import { generateIdentity } from '../crypto/identity'
+import { hash256 } from '../crypto/primitives'
+import { AppLockStore } from '../storage/appLockStore'
 import { HistoryStore } from '../storage/historyStore'
 import { MemoryKeyStore } from '../storage/keystore'
 import { InMemoryLock } from '../storage/lock'
@@ -20,15 +22,21 @@ export interface P4SelfTestResult {
   log: string[]
 }
 
-function makeClient(received: string[], errors: string[]): NightjarClient {
+// Fast Argon2id stand-in so the self-test's app-lock enrollment is instant (the
+// real KDF is exercised by the node/browser lock tests). Dev tooling only.
+const fastKdf = (secret: Uint8Array, salt: Uint8Array) => hash256(new Uint8Array([...secret, ...salt]))
+
+async function makeClient(received: string[], errors: string[]): Promise<NightjarClient> {
   const id = generateIdentity()
   const lock = new InMemoryLock()
   const keys = new MemoryKeyStore()
   const prekeys = new PrekeyStore(keys, lock)
-  const contacts = new ContactStore(keys, lock)
-  // Wire persistent history (P10b) so the self-test also exercises the
-  // send/receive persist path and hydration over the real relay.
-  const history = new HistoryStore(keys, lock)
+  // Enroll + unlock the mandatory app-lock (P10c) so the LDK is resident and the
+  // history + contact stores encrypt at rest, exactly as the real app does.
+  const appLock = new AppLockStore(keys, lock, fastKdf)
+  await appLock.enroll([{ kind: 'pass', secret: 'self-test-passphrase' }])
+  const contacts = new ContactStore(keys, lock, appLock)
+  const history = new HistoryStore(appLock)
   return new NightjarClient(
     id,
     new MemorySessionStore(),
@@ -56,8 +64,8 @@ export async function runP4SelfTest(bootstrapInvite: string): Promise<P4SelfTest
   const aRecv: string[] = []
   const bRecv: string[] = []
   const errors: string[] = []
-  const alice = makeClient(aRecv, errors)
-  const bob = makeClient(bRecv, errors)
+  const alice = await makeClient(aRecv, errors)
+  const bob = await makeClient(bRecv, errors)
 
   try {
     await alice.connect()
@@ -146,8 +154,8 @@ export async function runGlareSelfTest(bootstrapInvite: string): Promise<P4SelfT
   const aRecv: string[] = []
   const bRecv: string[] = []
   const errors: string[] = []
-  const alice = makeClient(aRecv, errors)
-  const bob = makeClient(bRecv, errors)
+  const alice = await makeClient(aRecv, errors)
+  const bob = await makeClient(bRecv, errors)
 
   try {
     await alice.connect()

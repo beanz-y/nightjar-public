@@ -33,7 +33,7 @@ import { decryptOrder, promoteSession, updateSession } from '../session/sessionB
 import type { HistoryStore } from '../storage/historyStore'
 import type { PrekeyStore } from '../storage/prekeyStore'
 import type { Lock } from '../storage/lock'
-import type { HistoryRow, SessionStore } from '../storage/sessionStore'
+import type { HistoryRecord, SessionStore } from '../storage/sessionStore'
 import { type Envelope, b64encode } from '../wire/codec'
 
 export type InboundResult =
@@ -132,19 +132,16 @@ async function dropAndAck(store: SessionStore, envId: string, from: string, reas
 // `seenId` (the transport envelope id) keys a legacy row, which has no content
 // msgId; a structured text keys on its content msgId. decodeMessage is total, so
 // this never throws for parsing reasons.
-async function sealInbound(
-  deps: InboundDeps,
-  from: string,
-  seenId: string,
-  plaintext: Uint8Array,
-): Promise<HistoryRow | undefined> {
+function sealInbound(deps: InboundDeps, from: string, seenId: string, plaintext: Uint8Array): HistoryRecord | undefined {
   if (!deps.history) return undefined
   const decoded = decodeMessage(plaintext)
   if (decoded.kind === 'text' && !decoded.ephemeral) {
-    return deps.history.seal(bytesToHex(decoded.id), from, 'in', deps.now, decoded.body)
+    return deps.history.seal({ id: bytesToHex(decoded.id), peerId: from, dir: 'in', ts: deps.now, text: decoded.body })
   }
   if (decoded.kind === 'legacy') {
-    return deps.history.seal(seenId, from, 'in', deps.now, decoded.body)
+    // Legacy (pre-P10) plain text has no content id; key the row on the transport
+    // envelope id so a redelivery still upserts the same row.
+    return deps.history.seal({ id: seenId, peerId: from, dir: 'in', ts: deps.now, text: decoded.body })
   }
   return undefined
 }
@@ -197,7 +194,7 @@ async function handleInitial(env: Envelope, from: string, deps: InboundDeps): Pr
   // history), and the OPK/contact steps below are skipped (session not committed).
   const book = promoteSession(await store.loadBook(from), serializeRatchet(state), now)
   try {
-    const historyRow = await sealInbound(deps, from, env.id, plaintext)
+    const historyRow = sealInbound(deps, from, env.id, plaintext)
     await store.saveBookWithSeenReplay(from, book, env.id, initId, historyRow)
   } catch (e) {
     throw new HistoryPersistError(e instanceof Error ? e.message : String(e))
@@ -269,7 +266,7 @@ async function handleNormal(env: Envelope, from: string, deps: InboundDeps): Pro
   const { state: pruned } = pruneSkippedKeys(matched.state, now)
   const advanced = updateSession(book, matched.sid, serializeRatchet(pruned), now)
   try {
-    const historyRow = await sealInbound(deps, from, env.id, matched.plaintext)
+    const historyRow = sealInbound(deps, from, env.id, matched.plaintext)
     await store.saveBookWithSeen(from, advanced, env.id, historyRow)
   } catch (e) {
     throw new HistoryPersistError(e instanceof Error ? e.message : String(e))

@@ -3,7 +3,7 @@ import { IDBFactory } from 'fake-indexeddb'
 import { beforeEach, describe, it, expect } from 'vitest'
 import type { RatchetSnapshot } from '../crypto/ratchet'
 import {
-  type HistoryRow,
+  type HistoryRecord,
   IdbSessionStore,
   MemorySessionStore,
   type SessionStore,
@@ -109,116 +109,80 @@ describe('retention maintenance (P8)', () => {
 })
 
 const PEER_A = 'a'.repeat(52)
-const PEER_B = 'b'.repeat(52)
-const hrow = (peerId: string, id: string, dir: 'in' | 'out' = 'in', ts = 1): HistoryRow => ({
-  id,
-  peerId,
-  dir,
-  ts,
+// Opaque history records (P10c): the storage layer treats them as key -> {salt,ct}
+// bytes; only the unlocked HistoryStore can compute keys or read ciphertext.
+const hrec = (key: string, failed?: boolean): HistoryRecord => ({
+  key,
   salt: new Uint8Array(16).fill(7),
-  ct: Uint8Array.from([1, 2, 3, id.charCodeAt(0)]),
+  ct: Uint8Array.from([1, 2, 3, key.charCodeAt(0)]),
+  ...(failed ? { failed: true } : {}),
 })
 
 function historySuite(name: string, make: () => SessionStore) {
-  describe(`history (P10b) — ${name}`, () => {
-    it('writes a history row atomically with the seen marker (normal receive)', async () => {
+  describe(`history (P10c): ${name}`, () => {
+    it('writes a history record atomically with the seen marker (normal receive)', async () => {
       const s = make()
-      await s.saveBookWithSeen(PEER_A, singleSessionBook(snap), 'env-1', hrow(PEER_A, 'c1'))
+      await s.saveBookWithSeen(PEER_A, singleSessionBook(snap), 'env-1', hrec('k1'))
       expect(await s.hasSeen('env-1')).toBe(true)
-      const rows = await s.historyLoad(PEER_A)
-      expect(rows.map((r) => r.id)).toEqual(['c1'])
+      expect((await s.historyLoadAll()).map((r) => r.key)).toEqual(['k1'])
       expect(await s.load(PEER_A)).toEqual(snap) // the book landed too
     })
 
-    it('writes a history row atomically with seen + replay (initial receive)', async () => {
+    it('writes a record atomically with seen + replay (initial receive)', async () => {
       const s = make()
-      await s.saveBookWithSeenReplay(PEER_A, singleSessionBook(snap), 'env-2', 'init-2', hrow(PEER_A, 'c2'))
+      await s.saveBookWithSeenReplay(PEER_A, singleSessionBook(snap), 'env-2', 'init-2', hrec('k2'))
       expect(await s.hasSeen('env-2')).toBe(true)
       expect(await s.hasReplayedInitial('init-2')).toBe(true)
-      expect((await s.historyLoad(PEER_A)).map((r) => r.id)).toEqual(['c2'])
+      expect((await s.historyLoadAll()).map((r) => r.key)).toEqual(['k2'])
     })
 
-    it('writes a history row atomically with the outbox entry (send)', async () => {
+    it('writes a record atomically with the outbox entry (send)', async () => {
       const s = make()
-      await s.saveBookWithOutbox(
-        PEER_A,
-        singleSessionBook(snap),
-        { id: 'env-3', to: PEER_A, env: {}, createdAt: 1 },
-        hrow(PEER_A, 'c3', 'out'),
-      )
+      await s.saveBookWithOutbox(PEER_A, singleSessionBook(snap), { id: 'env-3', to: PEER_A, env: {}, createdAt: 1 }, hrec('k3'))
       expect((await s.pendingOutbox()).map((e) => e.id)).toEqual(['env-3'])
-      expect((await s.historyLoad(PEER_A)).map((r) => r.id)).toEqual(['c3'])
+      expect((await s.historyLoadAll()).map((r) => r.key)).toEqual(['k3'])
     })
 
-    it('omitting the history row persists the book + marker but no row', async () => {
+    it('omitting the record persists the book + marker but no history', async () => {
       const s = make()
       await s.saveBookWithSeen(PEER_A, singleSessionBook(snap), 'env-4')
       expect(await s.hasSeen('env-4')).toBe(true)
-      expect(await s.historyLoad(PEER_A)).toEqual([])
-    })
-
-    it('scopes historyLoad to one peer and returns all via historyLoadAll', async () => {
-      const s = make()
-      await s.saveBookWithSeen(PEER_A, singleSessionBook(snap), 'e1', hrow(PEER_A, 'a1'))
-      await s.saveBookWithSeen(PEER_A, singleSessionBook(snap), 'e2', hrow(PEER_A, 'a2'))
-      await s.saveBookWithSeen(PEER_B, singleSessionBook(snap), 'e3', hrow(PEER_B, 'b1'))
-      expect((await s.historyLoad(PEER_A)).map((r) => r.id).sort()).toEqual(['a1', 'a2'])
-      expect((await s.historyLoad(PEER_B)).map((r) => r.id)).toEqual(['b1'])
-      expect((await s.historyLoadAll()).length).toBe(3)
-    })
-
-    it('upserts by (peer,id): a redelivered row does not duplicate', async () => {
-      const s = make()
-      await s.saveBookWithSeen(PEER_A, singleSessionBook(snap), 'e1', hrow(PEER_A, 'dup', 'in', 1))
-      await s.saveBookWithSeen(PEER_A, singleSessionBook(snap), 'e1b', hrow(PEER_A, 'dup', 'in', 2))
-      const rows = await s.historyLoad(PEER_A)
-      expect(rows.length).toBe(1)
-      expect(rows[0].ts).toBe(2) // last write wins
-    })
-
-    it('removes exactly one row and wipeAll clears history', async () => {
-      const s = make()
-      await s.saveBookWithSeen(PEER_A, singleSessionBook(snap), 'e1', hrow(PEER_A, 'a1'))
-      await s.saveBookWithSeen(PEER_A, singleSessionBook(snap), 'e2', hrow(PEER_A, 'a2'))
-      await s.historyRemove(PEER_A, 'in', 'a1')
-      expect((await s.historyLoad(PEER_A)).map((r) => r.id)).toEqual(['a2'])
-      await s.wipeAll()
       expect(await s.historyLoadAll()).toEqual([])
     })
 
-    it('keys by (peer,dir,id): an inbound and outbound row with the SAME id coexist', async () => {
+    it('upserts by opaque key: a redelivery does not duplicate; a distinct key coexists', async () => {
       const s = make()
-      // The HIGH finding: a peer-chosen inbound id must not address an outbound slot.
-      await s.saveBookWithOutbox(
-        PEER_A,
-        singleSessionBook(snap),
-        { id: 'ex', to: PEER_A, env: {}, createdAt: 1 },
-        hrow(PEER_A, 'SAME', 'out', 5),
-      )
-      await s.saveBookWithSeen(PEER_A, singleSessionBook(snap), 'ei', hrow(PEER_A, 'SAME', 'in', 6))
-      const rows = await s.historyLoad(PEER_A)
-      expect(rows.length).toBe(2) // both survive; neither overwrote the other
-      expect(rows.map((r) => `${r.dir}:${r.ts}`).sort()).toEqual(['in:6', 'out:5'])
-      // Removing the inbound one leaves the outbound one intact.
-      await s.historyRemove(PEER_A, 'in', 'SAME')
-      const left = await s.historyLoad(PEER_A)
-      expect(left.map((r) => r.dir)).toEqual(['out'])
+      await s.saveBookWithSeen(PEER_A, singleSessionBook(snap), 'e1', hrec('dup'))
+      await s.saveBookWithSeen(PEER_A, singleSessionBook(snap), 'e1b', hrec('dup')) // same key -> upsert
+      await s.saveBookWithSeen(PEER_A, singleSessionBook(snap), 'e2', hrec('other'))
+      expect((await s.historyLoadAll()).map((r) => r.key).sort()).toEqual(['dup', 'other'])
     })
 
-    it('marks an outbound row failed (survives a reload as "not sent")', async () => {
+    it('removes exactly one record by key; historyClear wipes only history; wipeAll clears it too', async () => {
       const s = make()
-      await s.saveBookWithOutbox(
-        PEER_A,
-        singleSessionBook(snap),
-        { id: 'ex', to: PEER_A, env: {}, createdAt: 1 },
-        hrow(PEER_A, 'm1', 'out', 1),
-      )
-      expect((await s.historyLoad(PEER_A))[0].failed).toBeUndefined()
-      await s.historyMarkFailed(PEER_A, 'out', 'm1')
-      expect((await s.historyLoad(PEER_A))[0].failed).toBe(true)
-      // A no-op when the row is absent (wrong dir / unknown id).
-      await s.historyMarkFailed(PEER_A, 'in', 'm1')
-      await s.historyMarkFailed(PEER_A, 'out', 'nope')
+      await s.saveBookWithSeen(PEER_A, singleSessionBook(snap), 'e1', hrec('a1'))
+      await s.saveBookWithSeen(PEER_A, singleSessionBook(snap), 'e2', hrec('a2'))
+      await s.historyRemove('a1')
+      expect((await s.historyLoadAll()).map((r) => r.key)).toEqual(['a2'])
+      // historyClear drops history but keeps sessions/seen (the forgot-secret reset).
+      await s.historyClear()
+      expect(await s.historyLoadAll()).toEqual([])
+      expect(await s.hasSeen('e1')).toBe(true)
+      expect(await s.load(PEER_A)).toEqual(snap)
+      // wipeAll clears everything including history.
+      await s.saveBookWithSeen(PEER_A, singleSessionBook(snap), 'e3', hrec('a3'))
+      await s.wipeAll()
+      expect(await s.historyLoadAll()).toEqual([])
+      expect(await s.hasSeen('e1')).toBe(false)
+    })
+
+    it('marks a record failed by key (survives a reload as "not sent")', async () => {
+      const s = make()
+      await s.saveBookWithSeen(PEER_A, singleSessionBook(snap), 'e1', hrec('m1'))
+      expect((await s.historyLoadAll())[0].failed).toBeUndefined()
+      await s.historyMarkFailed('m1')
+      expect((await s.historyLoadAll())[0].failed).toBe(true)
+      await s.historyMarkFailed('nope') // no-op when absent
     })
   })
 }
@@ -255,8 +219,8 @@ describe('v4 -> v5 history-store migration (P10b)', () => {
     const store = new IdbSessionStore()
     expect(await store.load(PEER_A)).toEqual(snap) // pre-existing session preserved
     // The new history store is usable.
-    await store.saveBookWithSeen(PEER_A, singleSessionBook(snap), 'e1', hrow(PEER_A, 'a1'))
-    expect((await store.historyLoad(PEER_A)).map((r) => r.id)).toEqual(['a1'])
+    await store.saveBookWithSeen(PEER_A, singleSessionBook(snap), 'e1', hrec('a1'))
+    expect((await store.historyLoadAll()).map((r) => r.key)).toEqual(['a1'])
   })
 })
 

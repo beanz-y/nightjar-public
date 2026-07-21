@@ -70,9 +70,10 @@ cryptographic code was written; the roadmap in section 12 tracks what has shippe
    under a message key deleted after use. The one exception is a bounded set of
    skipped message keys retained transiently for out-of-order delivery (section
    5.3). This is a property of the *protocol keys*, not of local storage: the
-   device now **retains past message plaintext in at-rest history** (section 8.5),
-   so a forensic image of the device is a separate exposure that forward secrecy
-   does not address (section 1.3).
+   device now **retains past messages in at-rest history**, encrypted behind the
+   mandatory app-lock (section 8.5), so a forensic image is a separate exposure
+   bounded by the unlock secret's strength, which forward secrecy does not address
+   (section 1.3).
 3. **Post-compromise security, against a later-passive attacker.** After a
    *ratchet/session-key* compromise, the conversation recovers once one
    uncompromised DH round-trip occurs. This does not heal compromise of the
@@ -124,7 +125,7 @@ cryptographic code was written; the roadmap in section 12 tracks what has shippe
 | Thief of our server / subpoena at rest | No stored plaintext; only undelivered ciphertext (30-day TTL, 7.1) and any opt-in server-stored identity backups, which reduce to passphrase strength (8.3) | Transient routing state only | n/a |
 | Global passive network adversary | No (content) | Yes (out of scope for any practical messenger) | n/a |
 | Thief of your unlocked device | Yes (it is your device) | Yes | n/a |
-| Thief / forensic image of your at-rest (locked or powered-off) device | **Yes for stored message history.** As of this release history is persisted locally with its at-rest key stored unwrapped, so a filesystem image yields past plaintext. The optional app-lock (section 8.5) that wraps that key under a passphrase/biometric is a subsequent release; until then, at-rest history is effectively plaintext (an honest downgrade from the pre-history "RAM-only, nothing at rest" posture). Identity and session keys are also stored unencrypted (needed to run headless), so an image can additionally decrypt *future* traffic and reveal the contact graph. | Yes (local contact list) | n/a |
+| Thief / forensic image of your at-rest (locked or powered-off) device | **Message history and the contact list are encrypted at rest** behind the mandatory app-lock (section 8.5); reading them reduces to the unlock secret's strength (strong for a passphrase/biometric, **weak for a short PIN** against an offline brute-force of the image). BUT the identity and ratchet **session keys stay unencrypted** (needed to run after unlock), so an image can still decrypt *future* traffic once the device is used again. | No (contact list is encrypted; but future-traffic decryption can rebuild it) | n/a |
 
 Honest one-sentence version: **Nightjar makes the content of your conversations
 unreadable to everyone but the people in them, once those people have verified
@@ -650,37 +651,57 @@ Strict CSP (no inline script, no third-party origins, everything self-hosted and
 bundled) and DOM hygiene (render message content as text, never `innerHTML`).
 This is elevated and specified further in section 10.2.
 
-### 8.5 Persistent message history (at rest)
+### 8.5 Persistent message history + the app-lock (at rest)
 
 Message history is stored on the device (before this, it lived only in RAM and was
-lost on reload). Each message is a per-message row in the sessions IndexedDB,
-sealed with XChaCha20-Poly1305 under a key+nonce derived (HKDF, info
-`Nightjar_History_v1`) from a random 32-byte **History Master Key (HMK)** and a
-**fresh per-record salt** stored beside the row; the AEAD AAD binds the peer id,
-the content message id, and the version, so a row cannot be relabelled to another
-conversation or id. A row is written in the **same IndexedDB transaction** as the
-ratchet advance and the dedup marker, so an acked message is always durably in
-history (no ack-without-history loss), and rows are keyed by content id so one
-delete removes exactly one row and a redelivery upserts the same row.
+lost on reload), encrypted at rest behind a **mandatory app-lock**. A random
+32-byte **Local Data Key (LDK)** protects all at-rest local data; per-use sub-keys
+(HKDF from the LDK) protect message history and the contact list. Each message is a
+per-message record in the sessions IndexedDB whose **whole content, not just the
+body** (content id, peer, direction, timestamp, and text) is sealed with
+XChaCha20-Poly1305 under a key+nonce derived (HKDF, info `Nightjar_History_v1`,
+**fresh per-record salt**) from the history sub-key; the record's IndexedDB key is
+an **opaque HMAC** of (peer, direction, content id) under an index sub-key, so the
+database reveals no peer/timestamp/count at rest. The AEAD AAD binds that storage
+key + a history-format version. A record is written in the **same IndexedDB
+transaction** as the ratchet advance and dedup marker (no ack-without-history
+loss). The **contact list** (and pending-trust / aliases) is likewise sealed under
+a contacts sub-key.
 
-Honest at-rest posture, stated plainly because it is a downgrade from the prior
-"nothing at rest" property:
+The LDK is **never stored unwrapped**: it is generated in RAM at enrollment,
+wrapped under each enabled unlock method, and only the wraps are persisted. Methods
+(at least one knowledge factor required, biometric optional):
+- **passphrase / PIN**: `kek = HKDF(Argon2id(secret, salt, 64 MiB/t3/p1), fresh
+  salt, "Nightjar_LockWrap_v1")`, `AEAD(kek, LDK)`;
+- **biometric (WebAuthn PRF)**: `kek = HKDF(prfSecret, fresh salt, same info)`;
+  unlock requires and **verifies user-verification** (the UV flag), not mere
+  presence.
 
-- **As of this release the HMK is stored unwrapped**, so history is effectively
-  **plaintext at rest**: a forensic image of the device yields past plaintext
-  (1.3). This is the same at-rest exposure the identity and ratchet keys already
-  have, but it now includes readable message content.
-- **An optional app-lock is a subsequent release (not shipped here).** It will
-  wrap the HMK under a key derived from a PIN/passphrase (Argon2id) and/or a
-  biometric (WebAuthn PRF), each with its own fresh salt, gating an unlock screen
-  before the messenger. When enabled it bounds at-rest history to the strength of
-  that passphrase/biometric (a short PIN is weak against an extracted blob).
-- **The app-lock, once it exists, protects history only, and is not
-  forward-secret.** It is a single at-rest key; the identity and ratchet session
-  keys stay unencrypted (the app must run headless to receive), so a locked or
-  imaged device can still decrypt *future* traffic and reveal the contact graph.
-  We do **not** claim parity with Signal/WhatsApp defaults, which encrypt local
-  data under an OS-keychain/device key; our no-lock default is weaker.
+Because Nightjar is a PWA with no OS keychain, at-rest confidentiality reduces to
+"you unlock each session": the app builds no network client and processes no
+inbound messages while locked (the socket is never opened), and locking (idle
+timeout / "lock now") clears the LDK and the decrypted history from RAM. Forgetting
+the secret erases the saved history (a sanctioned reset), but never the identity,
+which is recovered from the separate backup passphrase.
+
+Honest at-rest posture, stated plainly:
+
+- **Confidentiality of at-rest history + contacts reduces to the unlock secret's
+  strength.** A strong passphrase or a hardware biometric is strong; a short
+  **numeric PIN is weak against an extracted device image** (a PWA has no hardware
+  rate-limiting, so an attacker brute-forces the small numeric space offline).
+  Methods are wrapped independently, so at-rest security is that of the **weakest
+  enrolled method**. The UI labels the PIN accordingly and steers at-rest-sensitive
+  users to a passphrase.
+- **The lock protects message history + the contact list only, and is not
+  forward-secret.** The identity and ratchet **session keys stay unencrypted** (the
+  app must be able to authenticate + decrypt after unlock), so a forensic image of
+  the device can still decrypt *future* traffic once the device is used. We do
+  **not** claim parity with Signal/WhatsApp defaults (OS-keychain-backed).
+- **Biometric strength is the authenticator's.** A hardware platform authenticator
+  is strong; a synced/software passkey is weaker. Biometric is never the sole
+  factor (a knowledge factor always remains, so a lost authenticator is not a
+  permanent lockout).
 
 ---
 
@@ -997,10 +1018,11 @@ Native (Tauri) is **not** on the critical path; it is a demand-gated v2 (10.5).
 6. Classical crypto; not yet post-quantum (but downgrade-protected, 4.4).
 7. History is persisted on the device (section 8.5) but per-device: it is not
    synced, and the identity backup does not carry it, so it does not transfer to a
-   new device and is lost on device loss. It is stored **readable at rest** (the
-   at-rest key is unwrapped in this release; the passphrase/biometric app-lock that
-   would protect it is a later release, 8.5), so it is exposed to a forensic image
-   of the device (1.3).
+   new device and is lost on device loss. It is **encrypted at rest behind the
+   mandatory app-lock** (as is the contact list), so its at-rest confidentiality is
+   the strength of the unlock secret (weak for a short PIN against a device image,
+   8.5). The identity + ratchet session keys are NOT under the lock, so a device
+   image can still decrypt future traffic (1.3).
 8. Message-header metadata and message length are visible to the relay in v1;
    header encryption and padding deferred.
 9. OPK depletion can force new inbound sessions onto the weaker no-OPK path;
@@ -1054,7 +1076,8 @@ Native (Tauri) is **not** on the critical path; it is a demand-gated v2 (10.5).
 | Backup blob format | magic `"NJBK"`, format version `0x01`, then m/t/p/salt header, then AEAD body; download-only in v1 | 8.3 |
 | Message payload format | magic `"NJM1"`, format version `0x01`, kind (`0x01` text / `0x02` delete), 16-B content msgId, then (text) a flags byte (bit0 = ephemeral, other bits reserved) + utf8 body; the ratchet plaintext. A payload with no magic is legacy plain text; a magic-but-invalid/unknown-version/unknown-kind payload is clean-ignored (never thrown or rendered) | 8.5 |
 | Content vs transport id | the 16-B content msgId lives inside the ratchet plaintext (history key / delete target); the relay-visible transport envelope id is separate (dedup/ack/outbox). A first-send text may reuse its content id as the transport id (brand-new, safe); a delete gets its own fresh transport id | 8.5 |
-| History at rest | per-message row in the sessions IndexedDB keyed `${peerId}:${dir}:${id}`, XChaCha20-Poly1305 body under key+nonce = HKDF(HMK, **fresh 16-B per-record salt**, info `"Nightjar_History_v1"`); HMK is 32 random bytes; AAD binds peerId + **direction** + content msgId + a dedicated **history-format version** (NOT the wire ciphersuite octet, so a protocol bump never invalidates stored rows); row written in the same tx as the ratchet advance + dedup marker. Direction is in the key + AAD so a peer-chosen inbound content id can never address or open one of your outbound rows. HMK stored unwrapped in this release (readable at rest); passphrase/biometric wrap is a later release | 8.5 |
+| App-lock + at-rest data | random 32-B **LDK** wraps all local at-rest data; the LDK is never stored unwrapped, only wrapped per method: passphrase/PIN via `HKDF(Argon2id(secret, 64 MiB/t3/p1, 16-B salt), 16-B salt, "Nightjar_LockWrap_v1")`, biometric via `HKDF(prfSecret, 16-B salt, same info)`, each `XChaCha20-Poly1305(kek, LDK)` with the method kind bound in the AAD. Mandatory; >=1 knowledge factor; PIN min 6 digits (disclosed weak). Sub-keys `HKDF(LDK, "Nightjar_HistBody_v1" / "Nightjar_HistIndex_v1" / "Nightjar_Contacts_v1")` | 8.5 |
+| History at rest | per-message record in the sessions IndexedDB; the **whole message** (content id, peer, direction, ts, text) sealed with XChaCha20-Poly1305 under key+nonce = HKDF(history-body sub-key, **fresh 16-B per-record salt**, info `"Nightjar_History_v1"`); IndexedDB key = `hex(HMAC(history-index sub-key, peer‖dir‖id))` (opaque: the DB reveals no peer/ts/count); AAD binds that storage key + a history-format version; written in the same tx as the ratchet advance + dedup marker. Contacts/pending/aliases sealed under the contacts sub-key with a fresh 16-B salt | 8.5 |
 | Version octet | starts at `0x01` (classical X25519) | 4.4 |
 | Reproducible build inputs | digest-pinned container (Node + OS + arch), committed lockfile (`npm ci`), no build-time dynamic values (`__APP_VERSION__` injected, never a clock). *`SOURCE_DATE_EPOCH`/`strip-nondeterminism` are inert here (vite emits no timestamps; the manifest hashes content only) and kept only as documented no-ops* | 10.1, P7 |
 | Release hash | `sha256(manifest.txt)`; `manifest.txt` = each `dist/` file as `<sha256-hex>  <relpath>\n`, byte-sorted, LF (one recipe: `scripts/release-hash.mjs` == the pure-shell pipeline). Hashes the **build output**, so the honest claim is "rebuild and diff", not "diff the served bytes" | 10.1, P7 |
