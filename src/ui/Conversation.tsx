@@ -11,6 +11,9 @@ import type { Message } from './useNightjar'
 // over, and a small localized time under each message. All display-only, using
 // the viewer's locale.
 const DAY_MS = 24 * 60 * 60 * 1000
+// Rapid messages from the same person within this window are grouped: only the last
+// one in the run shows a timestamp, so a quick burst is not stamped on every line.
+const GROUP_MS = 2 * 60 * 1000
 function startOfDay(ts: number): number {
   const d = new Date(ts)
   d.setHours(0, 0, 0, 0)
@@ -154,7 +157,11 @@ export function Conversation({ peer, name, messages, trust, onSend, onVerify, on
         {messages.length === 0 && <p className="muted small">No messages yet. Say hello.</p>}
         {messages.map((m, i) => {
           const prev = messages[i - 1]
+          const next = messages[i + 1]
           const showDay = !prev || !sameDay(prev.ts, m.ts)
+          // Show the time only at the END of a run of same-sender messages sent within
+          // GROUP_MS of each other (the newest message therefore always shows a time).
+          const showTime = !next || next.dir !== m.dir || next.ts - m.ts > GROUP_MS
           return (
             <Fragment key={m.id}>
               {showDay && (
@@ -202,11 +209,13 @@ export function Conversation({ peer, name, messages, trust, onSend, onVerify, on
                     </div>
                   )}
                 </div>
-                <span className="msg-meta tiny muted" title={new Date(m.ts).toLocaleString()}>
-                  {formatTime(m.ts)}
-                  {m.ephemeral && <span className="ephemeral-mark"> · session-only, not saved</span>}
-                  {m.failed && <span className="error"> · not sent</span>}
-                </span>
+                {(showTime || m.ephemeral || m.failed) && (
+                  <span className="msg-meta tiny muted" title={new Date(m.ts).toLocaleString()}>
+                    {showTime && formatTime(m.ts)}
+                    {m.ephemeral && <span className="ephemeral-mark">{showTime ? ' · ' : ''}session-only, not saved</span>}
+                    {m.failed && <span className="error">{showTime || m.ephemeral ? ' · ' : ''}not sent</span>}
+                  </span>
+                )}
               </div>
             </Fragment>
           )

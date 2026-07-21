@@ -547,7 +547,7 @@ textarea.mono {
 .msgs {
   flex: 1;
   overflow-y: auto;
-  padding: 0.75rem 0;
+  padding: 0.75rem 0.5rem;
   display: flex;
   flex-direction: column;
   gap: 0.4rem;
@@ -555,14 +555,18 @@ textarea.mono {
 .msg {
   display: flex;
   flex-direction: column;
-  align-items: flex-start;
+  /* Stretch the row + meta to the full chat width so a bubble's max-width resolves
+     against the real column width, not a shrink-wrapped parent (which collapsed long
+     text to one word per line). The bubble itself is positioned left/right within the
+     full-width row by justify-content below. */
+  align-items: stretch;
   gap: 0.1rem;
-}
-.msg-out {
-  align-items: flex-end;
 }
 .msg-meta {
   padding: 0 0.35rem;
+}
+.msg-out .msg-meta {
+  text-align: right;
 }
 /* Centered day separator, like common messengers. */
 .day-sep {
@@ -579,24 +583,30 @@ textarea.mono {
   padding: 0.15rem 0.7rem;
 }
 .bubble {
-  max-width: 80%;
+  /* Span the full width of the row when the content needs it; short messages still
+     shrink-wrap and sit on their sender's side. min-width:0 + overflow-wrap let the
+     flex item shrink and wrap normally instead of forcing one word per line. */
+  max-width: 100%;
+  min-width: 0;
   padding: 0.45rem 0.7rem;
   border-radius: 0.7rem;
   background: var(--panel);
   border: 1px solid var(--border);
   white-space: pre-wrap;
-  word-break: break-word;
+  overflow-wrap: anywhere;
 }
 .msg-out .bubble {
   background: #1a2740;
   border-color: #24406b;
 }
-/* Message row: bubble plus (own messages) a delete affordance (P10d). */
+/* Message row: bubble plus (own messages) a delete affordance (P10d). Full width so
+   the bubble can grow across the chat; justify-content puts a short bubble on its
+   sender's side (incoming left; outgoing right via row-reverse). */
 .msg-row {
   display: flex;
-  align-items: center;
+  align-items: flex-end;
   gap: 0.25rem;
-  max-width: 100%;
+  width: 100%;
   position: relative;
 }
 .msg-out .msg-row {
