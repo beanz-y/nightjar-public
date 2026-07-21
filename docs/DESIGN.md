@@ -703,6 +703,44 @@ Honest at-rest posture, stated plainly:
   factor (a knowledge factor always remains, so a lost authenticator is not a
   permanent lockout).
 
+### 8.6 Delete-for-everyone (best-effort, honest-client-dependent)
+
+You can delete a message you sent. Locally this always removes the copy from your
+device (history + the on-screen bubble). Whether the OTHER side removes it depends
+on state:
+
+- If the message is **still queued** in your outbox (not yet delivered), the send
+  is **cancelled**: the outbox entry is dropped and nothing is transmitted. There
+  is nothing to recall, so no delete is chased after a message that never left.
+- If the message was **already delivered**, a small `delete{targetContentId}`
+  control is sent to the peer on the current session, asking their device to remove
+  it too.
+
+The control rides the ratchet like any message, but it carries its **own fresh
+transport (envelope) id**, never the target's content id (the two-id rule of
+section 8.5 / NJM1): reusing the id would make the relay treat the delete as a
+duplicate of the original and drop it, and would clobber a still-queued original.
+The receiver removes only a message matching the **compound key** (this peer, an
+inbound direction, and the target content id), so a delete from one contact can
+never remove your own messages or another contact's. Because a delete can arrive
+**before** the message it targets (they are separate envelopes and the relay may
+reorder or redeliver within its TTL), an unmatched delete records a **tombstone**
+(keyed by the same opaque history key, aged out on the envelope-TTL bound) so the
+target is suppressed instead of stored-and-shown when it later arrives. The removal
+and the tombstone are written in the **same transaction** as the ratchet advance
+and dedup marker, so an acked delete always durably removes.
+
+Honest posture, stated in the UI and here:
+
+- **It is best-effort and honest-client-dependent, never a guarantee.** We deliver a
+  request; we get no delivery/removal confirmation, and a modified or non-compliant
+  client (or a device that copied/screenshotted the message, or that is offline past
+  the redelivery window) need not honour it. The sender UI therefore says **"delete
+  sent"**, never "deleted for everyone" as a fact.
+- The delete is **content, doubly encrypted like any message**; the relay sees only
+  another opaque envelope. It does not retroactively unsend: the ciphertext the peer
+  already received cannot be recalled, only asked to be discarded.
+
 ---
 
 ## 9. Metadata: the complete leak list and our honest posture
@@ -1076,6 +1114,7 @@ Native (Tauri) is **not** on the critical path; it is a demand-gated v2 (10.5).
 | Backup blob format | magic `"NJBK"`, format version `0x01`, then m/t/p/salt header, then AEAD body; download-only in v1 | 8.3 |
 | Message payload format | magic `"NJM1"`, format version `0x01`, kind (`0x01` text / `0x02` delete), 16-B content msgId, then (text) a flags byte (bit0 = ephemeral, other bits reserved) + utf8 body; the ratchet plaintext. A payload with no magic is legacy plain text; a magic-but-invalid/unknown-version/unknown-kind payload is clean-ignored (never thrown or rendered) | 8.5 |
 | Content vs transport id | the 16-B content msgId lives inside the ratchet plaintext (history key / delete target); the relay-visible transport envelope id is separate (dedup/ack/outbox). A first-send text may reuse its content id as the transport id (brand-new, safe); a delete gets its own fresh transport id | 8.5 |
+| Delete-for-everyone | `delete{targetContentId}` (kind `0x02`) sent on the current session with its OWN fresh transport id; receiver removes only the compound (this peer, dir=in, target id), records a **tombstone** (opaque history key, TTL = envelope TTL 30 d) so a target arriving after its delete is suppressed; removal + tombstone ride the same tx as the ratchet advance. A still-outboxed target is cancelled, not chased. Best-effort, honest-client-dependent; UI says "delete sent" | 8.6 |
 | App-lock + at-rest data | random 32-B **LDK** wraps all local at-rest data; the LDK is never stored unwrapped, only wrapped per method: passphrase/PIN via `HKDF(Argon2id(secret, 64 MiB/t3/p1, 16-B salt), 16-B salt, "Nightjar_LockWrap_v1")`, biometric via `HKDF(prfSecret, 16-B salt, same info)`, each `XChaCha20-Poly1305(kek, LDK)` with the method kind bound in the AAD. Mandatory; >=1 knowledge factor; PIN min 6 digits (disclosed weak). Sub-keys `HKDF(LDK, "Nightjar_HistBody_v1" / "Nightjar_HistIndex_v1" / "Nightjar_Contacts_v1")` | 8.5 |
 | History at rest | per-message record in the sessions IndexedDB; the **whole message** (content id, peer, direction, ts, text) sealed with XChaCha20-Poly1305 under key+nonce = HKDF(history-body sub-key, **fresh 16-B per-record salt**, info `"Nightjar_History_v1"`); IndexedDB key = `hex(HMAC(history-index sub-key, peer‖dir‖id))` (opaque: the DB reveals no peer/ts/count); AAD binds that storage key + a history-format version; written in the same tx as the ratchet advance + dedup marker. Contacts/pending/aliases sealed under the contacts sub-key with a fresh 16-B salt | 8.5 |
 | Version octet | starts at `0x01` (classical X25519) | 4.4 |

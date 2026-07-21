@@ -233,11 +233,59 @@ describe('processInbound + persistent history (P10c)', () => {
     expect(await storedMsgs()).toEqual([{ id: 'env-3', peerId: ctx.alice.userId, dir: 'in', ts: NOW, text: 'old style' }])
   })
 
-  it('does NOT persist a delete control message', async () => {
-    const m = aliceInitialBytes(ctx.alice, ctx.bundle, 'env-4', encodeDeleteMessage(newMsgId()))
+  it('does NOT persist a delete control message, but records a tombstone (P10d)', async () => {
+    const target = newMsgId()
+    const m = aliceInitialBytes(ctx.alice, ctx.bundle, 'env-4', encodeDeleteMessage(target))
     const res = await processInbound(m.env, ctx.alice.userId, deps())
     expect(res.kind).toBe('delivered')
-    expect(await ctx.store.historyLoadAll()).toEqual([])
+    expect(await ctx.store.historyLoadAll()).toEqual([]) // the control itself is never stored
+    // A tombstone for the (inbound, from-this-peer) target is recorded, so a target
+    // that arrives after its delete is later suppressed.
+    const key = history.storageKey(ctx.alice.userId, 'in', bytesToHex(target))
+    expect(await ctx.store.hasTombstone(key)).toBe(true)
+  })
+
+  it('a delete removes an already-persisted inbound message and tombstones it (P10d)', async () => {
+    const cid = newMsgId()
+    // Establish + persist the target (initial), then delete it (a normal on the
+    // same ratchet).
+    const first = aliceInitialBytes(ctx.alice, ctx.bundle, 'env-t', encodeTextMessage(cid, 'delete me', false))
+    await processInbound(first.env, ctx.alice.userId, deps())
+    expect((await storedMsgs()).map((m) => m.id)).toEqual([bytesToHex(cid)])
+
+    const del = aliceNormalBytes(first.state, 'env-d', encodeDeleteMessage(cid))
+    const res = await processInbound(del.env, ctx.alice.userId, deps())
+    expect(res.kind).toBe('delivered')
+    expect(await ctx.store.hasSeen('env-d')).toBe(true) // ratchet advanced + acked
+    expect(await ctx.store.historyLoadAll()).toEqual([]) // the target row is gone
+    const key = history.storageKey(ctx.alice.userId, 'in', bytesToHex(cid))
+    expect(await ctx.store.hasTombstone(key)).toBe(true)
+  })
+
+  it('a delete arriving BEFORE its target suppresses the later target (reorder, P10d)', async () => {
+    const cid = newMsgId()
+    // Establish a session with an unrelated first message.
+    const est = aliceInitialBytes(ctx.alice, ctx.bundle, 'env-e', encodeTextMessage(newMsgId(), 'hi', false))
+    await processInbound(est.env, ctx.alice.userId, deps())
+
+    // Alice sends the target then a delete for it; Bob receives the DELETE first
+    // (the target is a skipped message key), then the target.
+    const target = aliceNormalBytes(est.state, 'env-target', encodeTextMessage(cid, 'to be deleted', false))
+    const del = aliceNormalBytes(target.state, 'env-del', encodeDeleteMessage(cid))
+
+    const rDel = await processInbound(del.env, ctx.alice.userId, deps())
+    expect(rDel.kind).toBe('delivered')
+    const key = history.storageKey(ctx.alice.userId, 'in', bytesToHex(cid))
+    expect(await ctx.store.hasTombstone(key)).toBe(true)
+
+    const rTarget = await processInbound(target.env, ctx.alice.userId, deps())
+    expect(rTarget.kind).toBe('delivered')
+    // The target decrypted (so it is acked) but was SUPPRESSED: not persisted, not
+    // rendered by the caller.
+    if (rTarget.kind === 'delivered') expect(rTarget.suppressed).toBe(true)
+    expect(await ctx.store.hasSeen('env-target')).toBe(true)
+    // Only the establishing "hi" remains; the deleted target was never stored.
+    expect((await storedMsgs()).map((m) => m.text)).toEqual(['hi'])
   })
 
   it('persists a normal established-session message and a redelivery does not double-store', async () => {

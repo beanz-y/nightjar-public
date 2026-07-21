@@ -25,7 +25,7 @@
 // is still enforced one layer up by the inbound processor / client holding the
 // per-peer lock.
 
-import { ENVELOPE_TTL_MS } from '../crypto/constants'
+import { ENVELOPE_TTL_MS, TOMBSTONE_TTL_MS } from '../crypto/constants'
 import type { RatchetSnapshot } from '../crypto/ratchet'
 
 /** One ratchet session inside a peer's book. `id` is a stable local handle
@@ -74,6 +74,16 @@ export interface HistoryRecord {
   failed?: boolean
 }
 
+/** A delete-for-everyone (P10d) applied inside a receive commit: remove the target
+ *  history row at `key` AND record a tombstone at the same `key`, so a target that
+ *  arrives AFTER its delete (reorder / redelivery) is later suppressed instead of
+ *  persisted. Both live in the sessions DB so they ride the SAME transaction as the
+ *  ratchet advance + dedup marker (an acked delete always durably removes). `key`
+ *  is the opaque HMAC storage key of (peer, 'in', targetContentId). */
+export interface HistoryDelete {
+  key: string
+}
+
 
 export interface SessionStore {
   // --- session book ------------------------------------------------------
@@ -84,17 +94,27 @@ export interface SessionStore {
   /** Persist the book AND the consumed message id atomically (normal receive).
    *  An optional history record is written in the SAME transaction, so an acked
    *  inbound message is always durably in history (omitted for an ephemeral or
-   *  unpersistable message). */
-  saveBookWithSeen(peerId: string, book: SessionBook, msgId: string, history?: HistoryRecord): Promise<void>
+   *  unpersistable message). `del`, when the inbound message was a delete-for-
+   *  everyone control, removes the target history row and records its tombstone in
+   *  that SAME transaction (P10d). `history` and `del` are mutually exclusive (a
+   *  delete control is not itself persisted). */
+  saveBookWithSeen(
+    peerId: string,
+    book: SessionBook,
+    msgId: string,
+    history?: HistoryRecord,
+    del?: HistoryDelete,
+  ): Promise<void>
   /** Persist the book (with a freshly-promoted session), the consumed message id,
    *  AND the initial-message id, all atomically (the initial accept path), plus an
-   *  optional history record in the same transaction. */
+   *  optional history record OR delete (P10d) in the same transaction. */
   saveBookWithSeenReplay(
     peerId: string,
     book: SessionBook,
     msgId: string,
     initId: string,
     history?: HistoryRecord,
+    del?: HistoryDelete,
   ): Promise<void>
   /** Persist the advanced book AND the outbox entry atomically, BEFORE the
    *  envelope is handed to the socket (commit before release), plus an optional
@@ -137,16 +157,27 @@ export interface SessionStore {
    *  messages while keeping sessions/dedup/outbox so live messaging still works). */
   historyClear(): Promise<void>
 
+  // --- delete tombstones (P10d) ------------------------------------------
+  /** Whether a delete-for-everyone has already been applied for this opaque
+   *  history key, so a target message arriving after its delete is suppressed. */
+  hasTombstone(key: string): Promise<boolean>
+  /** All tombstoned history keys (boot hydration defence-in-depth: a row that
+   *  somehow coexists with a tombstone for it is dropped rather than shown). */
+  tombstoneKeys(): Promise<string[]>
+
   // --- maintenance (P8) ----------------------------------------------------
   /** Age out dedup + failure rows past ENVELOPE_TTL_MS: the relay redelivers an
    *  unacked envelope for up to that long, so a `seen` row must outlive the whole
    *  redelivery window (pruning at the shorter seen-id TTL would let a late
    *  redelivery skip dedup and burn poison-drop attempts). `failures` age out on
    *  the same bound (the envelope they count no longer exists past it). The
-   *  REPLAY store is never pruned, by design (DESIGN 4.3). */
+   *  REPLAY store is never pruned, by design (DESIGN 4.3). Delete tombstones age
+   *  out on the same envelope-TTL bound (past it their target can no longer be in
+   *  flight); they are not counted in the returned tally. */
   pruneExpired(now: number): Promise<{ seen: number; failures: number }>
   /** Erase every store (restore, DESIGN 8.3): a restored identity starts with
-   *  no sessions, dedup state, failure counters, queued outbox, or history. */
+   *  no sessions, dedup state, failure counters, queued outbox, history, or
+   *  delete tombstones. */
   wipeAll(): Promise<void>
 }
 
@@ -179,6 +210,7 @@ export class MemorySessionStore implements SessionStore {
   private readonly failures = new Map<string, { count: number; ts: number }>()
   private readonly outbox = new Map<string, OutboxEntry>()
   private readonly history = new Map<string, HistoryRecord>() // opaque storage key -> record
+  private readonly tombstones = new Map<string, number>() // opaque history key -> tombstoned-at ms
 
   async loadBook(peerId: string): Promise<SessionBook | null> {
     const b = this.books.get(peerId)
@@ -189,10 +221,17 @@ export class MemorySessionStore implements SessionStore {
     this.books.set(peerId, clone(book))
   }
 
-  async saveBookWithSeen(peerId: string, book: SessionBook, msgId: string, history?: HistoryRecord): Promise<void> {
+  async saveBookWithSeen(
+    peerId: string,
+    book: SessionBook,
+    msgId: string,
+    history?: HistoryRecord,
+    del?: HistoryDelete,
+  ): Promise<void> {
     this.books.set(peerId, clone(book))
     this.seen.set(msgId, Date.now())
     if (history) this.history.set(history.key, clone(history))
+    if (del) this.applyDelete(del)
   }
 
   async saveBookWithSeenReplay(
@@ -201,11 +240,18 @@ export class MemorySessionStore implements SessionStore {
     msgId: string,
     initId: string,
     history?: HistoryRecord,
+    del?: HistoryDelete,
   ): Promise<void> {
     this.books.set(peerId, clone(book))
     this.seen.set(msgId, Date.now())
     this.replay.add(initId)
     if (history) this.history.set(history.key, clone(history))
+    if (del) this.applyDelete(del)
+  }
+
+  private applyDelete(del: HistoryDelete): void {
+    this.history.delete(del.key)
+    this.tombstones.set(del.key, Date.now())
   }
 
   async saveBookWithOutbox(peerId: string, book: SessionBook, entry: OutboxEntry, history?: HistoryRecord): Promise<void> {
@@ -289,6 +335,14 @@ export class MemorySessionStore implements SessionStore {
     this.history.clear()
   }
 
+  async hasTombstone(key: string): Promise<boolean> {
+    return this.tombstones.has(key)
+  }
+
+  async tombstoneKeys(): Promise<string[]> {
+    return [...this.tombstones.keys()]
+  }
+
   async pruneExpired(now: number): Promise<{ seen: number; failures: number }> {
     let seen = 0
     for (const [id, ts] of this.seen) {
@@ -304,6 +358,9 @@ export class MemorySessionStore implements SessionStore {
         failures += 1
       }
     }
+    for (const [key, ts] of this.tombstones) {
+      if (now - ts > TOMBSTONE_TTL_MS) this.tombstones.delete(key)
+    }
     return { seen, failures }
   }
 
@@ -314,6 +371,7 @@ export class MemorySessionStore implements SessionStore {
     this.failures.clear()
     this.outbox.clear()
     this.history.clear()
+    this.tombstones.clear()
   }
 }
 
@@ -326,7 +384,16 @@ const REPLAY = 'replay'
 const FAILURES = 'failures'
 const OUTBOX = 'outbox'
 const HISTORY = 'history'
-const DB_VERSION = 5
+const TOMBSTONES = 'tombstones'
+const DB_VERSION = 6
+
+// A delete-for-everyone inside a receive transaction: remove the target history
+// row and record its tombstone, both keyed by the same opaque history key. The
+// caller has already added HISTORY + TOMBSTONES to the transaction's scope.
+function applyDeleteTx(t: IDBTransaction, del: HistoryDelete): void {
+  t.objectStore(HISTORY).delete(del.key)
+  t.objectStore(TOMBSTONES).put(Date.now(), del.key)
+}
 
 export class IdbSessionStore implements SessionStore {
   private dbPromise: Promise<IDBDatabase> | null = null
@@ -346,6 +413,10 @@ export class IdbSessionStore implements SessionStore {
           // createObjectStore-if-absent above already handles a brand-new DB; an
           // upgrade from v4 just adds the empty store (no data to migrate).
           if (!db.objectStoreNames.contains(HISTORY)) db.createObjectStore(HISTORY)
+          // v5 -> v6 (P10d): a `tombstones` store keyed by an opaque history key,
+          // recording a delete-for-everyone so a target arriving after its delete is
+          // suppressed. New empty store; nothing to migrate.
+          if (!db.objectStoreNames.contains(TOMBSTONES)) db.createObjectStore(TOMBSTONES)
           // v2 -> v3: a v2 `sessions` value was a bare RatchetSnapshot; wrap each
           // as a one-session book so a pre-P5 conversation is not lost. (Prod has
           // none yet: the only durable sessions before P5 were isolated dev
@@ -403,12 +474,19 @@ export class IdbSessionStore implements SessionStore {
     await this.tx(SESSIONS, 'readwrite', (t) => t.objectStore(SESSIONS).put(book, peerId))
   }
 
-  async saveBookWithSeen(peerId: string, book: SessionBook, msgId: string, history?: HistoryRecord): Promise<void> {
-    const stores = history ? [SESSIONS, SEEN, HISTORY] : [SESSIONS, SEEN]
+  async saveBookWithSeen(
+    peerId: string,
+    book: SessionBook,
+    msgId: string,
+    history?: HistoryRecord,
+    del?: HistoryDelete,
+  ): Promise<void> {
+    const stores = history || del ? [SESSIONS, SEEN, HISTORY, TOMBSTONES] : [SESSIONS, SEEN]
     await this.tx(stores, 'readwrite', (t) => {
       t.objectStore(SESSIONS).put(book, peerId)
       t.objectStore(SEEN).put(Date.now(), msgId)
       if (history) t.objectStore(HISTORY).put(history, history.key)
+      if (del) applyDeleteTx(t, del)
       return null
     })
   }
@@ -419,13 +497,15 @@ export class IdbSessionStore implements SessionStore {
     msgId: string,
     initId: string,
     history?: HistoryRecord,
+    del?: HistoryDelete,
   ): Promise<void> {
-    const stores = history ? [SESSIONS, SEEN, REPLAY, HISTORY] : [SESSIONS, SEEN, REPLAY]
+    const stores = history || del ? [SESSIONS, SEEN, REPLAY, HISTORY, TOMBSTONES] : [SESSIONS, SEEN, REPLAY]
     await this.tx(stores, 'readwrite', (t) => {
       t.objectStore(SESSIONS).put(book, peerId)
       t.objectStore(SEEN).put(Date.now(), msgId)
       t.objectStore(REPLAY).put(1, initId)
       if (history) t.objectStore(HISTORY).put(history, history.key)
+      if (del) applyDeleteTx(t, del)
       return null
     })
   }
@@ -553,10 +633,20 @@ export class IdbSessionStore implements SessionStore {
     })
   }
 
+  async hasTombstone(key: string): Promise<boolean> {
+    const v = await this.tx<unknown>(TOMBSTONES, 'readonly', (t) => t.objectStore(TOMBSTONES).get(key))
+    return v !== undefined
+  }
+
+  async tombstoneKeys(): Promise<string[]> {
+    const keys = await this.tx<IDBValidKey[]>(TOMBSTONES, 'readonly', (t) => t.objectStore(TOMBSTONES).getAllKeys())
+    return (keys ?? []).map(String)
+  }
+
   async pruneExpired(now: number): Promise<{ seen: number; failures: number }> {
     const db = await this.open()
     return new Promise((resolve, reject) => {
-      const t = db.transaction([SEEN, FAILURES], 'readwrite')
+      const t = db.transaction([SEEN, FAILURES, TOMBSTONES], 'readwrite')
       let seen = 0
       let failures = 0
       const sweep = (store: IDBObjectStore, expired: (v: unknown) => boolean, bump: () => void) => {
@@ -581,6 +671,12 @@ export class IdbSessionStore implements SessionStore {
         (v) => typeof v === 'object' && v !== null && now - (v as { ts: number }).ts > ENVELOPE_TTL_MS,
         () => (failures += 1),
       )
+      // Tombstones age out on the envelope-TTL bound too; not counted in the tally.
+      sweep(
+        t.objectStore(TOMBSTONES),
+        (v) => typeof v === 'number' && now - v > TOMBSTONE_TTL_MS,
+        () => {},
+      )
       t.oncomplete = () => resolve({ seen, failures })
       t.onabort = () => reject(t.error)
       t.onerror = () => reject(t.error)
@@ -588,13 +684,14 @@ export class IdbSessionStore implements SessionStore {
   }
 
   async wipeAll(): Promise<void> {
-    await this.tx([SESSIONS, SEEN, REPLAY, FAILURES, OUTBOX, HISTORY], 'readwrite', (t) => {
+    await this.tx([SESSIONS, SEEN, REPLAY, FAILURES, OUTBOX, HISTORY, TOMBSTONES], 'readwrite', (t) => {
       t.objectStore(SESSIONS).clear()
       t.objectStore(SEEN).clear()
       t.objectStore(REPLAY).clear()
       t.objectStore(FAILURES).clear()
       t.objectStore(OUTBOX).clear()
       t.objectStore(HISTORY).clear()
+      t.objectStore(TOMBSTONES).clear()
       return null
     })
   }

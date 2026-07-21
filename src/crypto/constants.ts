@@ -188,6 +188,16 @@ export const INFO_HISTORY = 'Nightjar_History_v1'
  *  Bump this only on a deliberate history-row format change, with a migration. */
 export const HISTORY_FORMAT_VERSION = 0x01
 
+// Delete-for-everyone (P10d). A received delete may arrive BEFORE the message it
+// targets (the two ride different envelopes and the relay can reorder / redeliver
+// within its TTL). A `tombstone` records "this content id was deleted" so a later-
+// arriving target is suppressed instead of persisted+shown. A tombstone need only
+// outlive the redelivery window of its target, so it ages out on the SAME bound as
+// an undelivered envelope: past `ENVELOPE_TTL_MS` the target can no longer be in
+// flight, so the tombstone is dead weight. Keyed by the same opaque HMAC storage
+// key as the history row it suppresses (so it too reveals no peer/id at rest).
+export const TOMBSTONE_TTL_MS = ENVELOPE_TTL_MS
+
 // App-lock (P10c, mandatory). All at-rest local data (message history bodies AND
 // metadata, and the contact list) is encrypted under a random 32-byte Local Data
 // Key (LDK, `HISTORY_HMK_BYTES` long). The LDK is NEVER stored unwrapped: it is

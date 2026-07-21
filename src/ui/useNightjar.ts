@@ -217,6 +217,11 @@ export function useNightjar() {
             appendMessage(from, { id: msg.id, dir: 'in', text: msg.text, ts: msg.ts })
             void client.listContacts().then(setContacts).catch(() => {})
           },
+          onDelete: (from, id) => {
+            // Delete-for-everyone from a peer (P10d): drop the bubble. The stored
+            // row was already removed atomically inside the client.
+            setConversations((prev) => ({ ...prev, [from]: (prev[from] ?? []).filter((m) => m.id !== id) }))
+          },
           onError: (detail) => setNotice(detail),
           onSecurity: (detail) => setSecurityNotices((prev) => (prev.includes(detail) ? prev : [...prev, detail])),
           onSendFailed: (envId, reason) => {
@@ -544,6 +549,28 @@ export function useNightjar() {
     [appendMessage],
   )
 
+  // Delete-for-everyone a message YOU sent (P10d). Optimistically removes the
+  // bubble, then asks the client to remove the local copy and (if delivered) ask
+  // the peer to remove it too. Honest copy: never claims a guaranteed deletion.
+  const deleteMessage = useCallback(async (peer: string, id: string, failed?: boolean) => {
+    const live = liveRef.current
+    if (!live) return
+    setConversations((prev) => ({ ...prev, [peer]: (prev[peer] ?? []).filter((m) => m.id !== id) }))
+    try {
+      if (failed) {
+        // Never delivered (send failed/timed out): a local-only removal. No point
+        // asking the peer to delete a message they never received.
+        await live.client.removeHistory(peer, 'out', id)
+        setNotice('message deleted')
+        return
+      }
+      const { requested } = await live.client.deleteForEveryone(peer, id)
+      setNotice(requested ? 'delete sent (the other device removes it if it is online and running an honest app)' : 'message deleted')
+    } catch (e) {
+      setNotice(`could not delete: ${String(e instanceof Error ? e.message : e)}`)
+    }
+  }, [])
+
   const startChat = useCallback((peer: string) => {
     setConversations((prev) => (prev[peer] ? prev : { ...prev, [peer]: [] }))
   }, [])
@@ -740,6 +767,7 @@ export function useNightjar() {
       resetLock,
       join,
       send,
+      deleteMessage,
       startChat,
       openFromCode,
       renameChat,

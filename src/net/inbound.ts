@@ -37,7 +37,17 @@ import type { HistoryRecord, SessionStore } from '../storage/sessionStore'
 import { type Envelope, b64encode } from '../wire/codec'
 
 export type InboundResult =
-  | { kind: 'delivered'; peerId: string; plaintext: Uint8Array; consumedOpk: boolean }
+  | {
+      kind: 'delivered'
+      peerId: string
+      plaintext: Uint8Array
+      consumedOpk: boolean
+      /** P10d: this inbound TEXT was already deleted-for-everyone (its delete
+       *  control arrived earlier and left a tombstone), so it was NOT persisted
+       *  and the caller must NOT render it. The ratchet still advanced and the
+       *  envelope is acked (it decrypted); only the display + storage are skipped. */
+      suppressed?: boolean
+    }
   | { kind: 'duplicate'; peerId: string }
   /** Permanently un-processable (replayed, or never decrypted after the poison
    *  bound). The caller ACKS so the relay stops redelivering. */
@@ -120,30 +130,60 @@ async function dropAndAck(store: SessionStore, envId: string, from: string, reas
   return { kind: 'dropped', peerId: from, reason }
 }
 
-// Decide whether a just-decrypted inbound plaintext should be persisted, and if
-// so seal it into a history row (written atomically by the caller). The persist
-// gate FAILS CLOSED (P10e): persist ONLY an explicitly non-ephemeral structured
-// text, or a legacy (pre-P10) plain-text message. An ephemeral text, a delete
-// control, or a malformed record is never persisted; a dropped/undefined flag can
-// therefore never accidentally persist a should-be-ephemeral message. A sealing
-// failure propagates (the caller does not commit or ack), so history persistence
-// is part of the atomic commit, never silently skipped.
-//
-// `seenId` (the transport envelope id) keys a legacy row, which has no content
-// msgId; a structured text keys on its content msgId. decodeMessage is total, so
-// this never throws for parsing reasons.
-function sealInbound(deps: InboundDeps, from: string, seenId: string, plaintext: Uint8Array): HistoryRecord | undefined {
-  if (!deps.history) return undefined
+/** What a just-decrypted inbound plaintext does to persistent history, decided
+ *  under the per-peer lock and applied ATOMICALLY in the same commit as the
+ *  ratchet advance + dedup marker (so an acked message is always durably reflected
+ *  in history):
+ *   - `put`      persist this message (non-ephemeral text, or legacy plain text);
+ *   - `delete`   this was a delete-for-everyone control -> remove the target row
+ *                and record its tombstone (P10d);
+ *   - `suppress` this text was ALREADY deleted (a tombstone exists) -> do not
+ *                persist and do not render;
+ *   - `none`     nothing to persist (ephemeral / malformed / no history wired). */
+type HistoryPlan =
+  | { kind: 'put'; row: HistoryRecord }
+  | { kind: 'delete'; key: string }
+  | { kind: 'suppress' }
+  | { kind: 'none' }
+
+// Classify the plaintext for history. The persist gate FAILS CLOSED (P10e):
+// persist ONLY an explicitly non-ephemeral structured text or a legacy (pre-P10)
+// plain-text message; an ephemeral text, a delete control, or a malformed record is
+// never persisted. decodeMessage is total, so this never throws for parsing
+// reasons. A tombstone check (P10d) makes a text whose delete already arrived a
+// `suppress`, and a delete control a `delete` op targeting the opaque history key
+// of (peer, 'in', targetContentId). All history work needs the LDK-backed
+// HistoryStore; without it (tests / pre-P10 callers) everything is `none`.
+async function planHistory(
+  deps: InboundDeps,
+  from: string,
+  seenId: string,
+  plaintext: Uint8Array,
+): Promise<HistoryPlan> {
+  if (!deps.history) return { kind: 'none' }
   const decoded = decodeMessage(plaintext)
-  if (decoded.kind === 'text' && !decoded.ephemeral) {
-    return deps.history.seal({ id: bytesToHex(decoded.id), peerId: from, dir: 'in', ts: deps.now, text: decoded.body })
+  if (decoded.kind === 'text') {
+    if (decoded.ephemeral) return { kind: 'none' }
+    const id = bytesToHex(decoded.id)
+    const key = deps.history.storageKey(from, 'in', id)
+    // A delete-for-everyone for this id may have arrived first: suppress it.
+    if (await deps.store.hasTombstone(key)) return { kind: 'suppress' }
+    return { kind: 'put', row: deps.history.seal({ id, peerId: from, dir: 'in', ts: deps.now, text: decoded.body }) }
   }
   if (decoded.kind === 'legacy') {
     // Legacy (pre-P10) plain text has no content id; key the row on the transport
-    // envelope id so a redelivery still upserts the same row.
-    return deps.history.seal({ id: seenId, peerId: from, dir: 'in', ts: deps.now, text: decoded.body })
+    // envelope id so a redelivery still upserts the same row. Legacy messages are
+    // never a delete target (deletes only address NJM1 content ids), so no tombstone
+    // check is needed.
+    return { kind: 'put', row: deps.history.seal({ id: seenId, peerId: from, dir: 'in', ts: deps.now, text: decoded.body }) }
   }
-  return undefined
+  if (decoded.kind === 'delete') {
+    // Remove the (inbound-from-this-peer) target and tombstone it. The compound key
+    // (this peer AND dir='in' AND the target content id) means a delete from a peer
+    // can only remove a message THEY sent us, never our own or another peer's.
+    return { kind: 'delete', key: deps.history.storageKey(from, 'in', bytesToHex(decoded.id)) }
+  }
+  return { kind: 'none' } // malformed -> clean-ignore
 }
 
 async function handleInitial(env: Envelope, from: string, deps: InboundDeps): Promise<InboundResult> {
@@ -193,9 +233,18 @@ async function handleInitial(env: Envelope, from: string, deps: InboundDeps): Pr
   // poison-dropped (the message decrypted; losing it would break no-ack-without-
   // history), and the OPK/contact steps below are skipped (session not committed).
   const book = promoteSession(await store.loadBook(from), serializeRatchet(state), now)
+  let suppressed = false
   try {
-    const historyRow = sealInbound(deps, from, env.id, plaintext)
-    await store.saveBookWithSeenReplay(from, book, env.id, initId, historyRow)
+    const plan = await planHistory(deps, from, env.id, plaintext)
+    suppressed = plan.kind === 'suppress'
+    await store.saveBookWithSeenReplay(
+      from,
+      book,
+      env.id,
+      initId,
+      plan.kind === 'put' ? plan.row : undefined,
+      plan.kind === 'delete' ? { key: plan.key } : undefined,
+    )
   } catch (e) {
     throw new HistoryPersistError(e instanceof Error ? e.message : String(e))
   }
@@ -228,7 +277,7 @@ async function handleInitial(env: Envelope, from: string, deps: InboundDeps): Pr
         .catch(() => {})
     }
   }
-  return { kind: 'delivered', peerId: from, plaintext, consumedOpk }
+  return { kind: 'delivered', peerId: from, plaintext, consumedOpk, ...(suppressed ? { suppressed: true } : {}) }
 }
 
 async function handleNormal(env: Envelope, from: string, deps: InboundDeps): Promise<InboundResult> {
@@ -265,11 +314,19 @@ async function handleNormal(env: Envelope, from: string, deps: InboundDeps): Pro
   // poison-dropped), NOT a decrypt miss.
   const { state: pruned } = pruneSkippedKeys(matched.state, now)
   const advanced = updateSession(book, matched.sid, serializeRatchet(pruned), now)
+  let suppressed = false
   try {
-    const historyRow = sealInbound(deps, from, env.id, matched.plaintext)
-    await store.saveBookWithSeen(from, advanced, env.id, historyRow)
+    const plan = await planHistory(deps, from, env.id, matched.plaintext)
+    suppressed = plan.kind === 'suppress'
+    await store.saveBookWithSeen(
+      from,
+      advanced,
+      env.id,
+      plan.kind === 'put' ? plan.row : undefined,
+      plan.kind === 'delete' ? { key: plan.key } : undefined,
+    )
   } catch (e) {
     throw new HistoryPersistError(e instanceof Error ? e.message : String(e))
   }
-  return { kind: 'delivered', peerId: from, plaintext: matched.plaintext, consumedOpk: false }
+  return { kind: 'delivered', peerId: from, plaintext: matched.plaintext, consumedOpk: false, ...(suppressed ? { suppressed: true } : {}) }
 }

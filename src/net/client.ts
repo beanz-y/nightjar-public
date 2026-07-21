@@ -16,7 +16,7 @@
 import { bytesToHex, hexToBytes } from '@noble/hashes/utils'
 import { type Identity, deriveUserId } from '../crypto/identity'
 import type { PushSubscriptionInfo } from '../platform'
-import { decodeMessage, encodeTextMessage, newMsgId } from '../crypto/message'
+import { decodeMessage, encodeDeleteMessage, encodeTextMessage, newMsgId } from '../crypto/message'
 import { OPK_BATCH, OPK_REPLENISH_THRESHOLD, OUTBOX_RETRY_HORIZON_MS, SPK_ROTATION_MS } from '../crypto/constants'
 import { OWN_BUNDLE_VERSION, buildOwnBundle, generateOneTimePrekeys, generateSignedPrekey } from '../crypto/prekeys'
 import { deserializeRatchet, initRatchetInitiator, ratchetEncrypt, serializeRatchet } from '../crypto/ratchet'
@@ -78,6 +78,10 @@ export interface StoredMessage {
 export interface ClientCallbacks {
   /** A decrypted message arrived from `from`. */
   onMessage: (from: string, msg: ClientMessage) => void
+  /** Optional (P10d): `from` deleted-for-everyone the message with content id
+   *  `id`. The local history row was already removed atomically; the UI should
+   *  drop that bubble. Idempotent (a redelivered delete repeats harmlessly). */
+  onDelete?: (from: string, id: string) => void
   /** Optional: an inbound envelope failed to process or was dropped (transient
    *  operational noise; the UI may show it as an overwritable notice). */
   onError?: (detail: string) => void
@@ -520,8 +524,14 @@ export class NightjarClient {
   async loadAllHistory(): Promise<Record<string, StoredMessage[]>> {
     if (!this.history) return {}
     const rows = await this.store.historyLoadAll()
+    // Defence-in-depth (P10d): the atomic delete commit removes a row and writes
+    // its tombstone together, so a row and a tombstone for it should never coexist;
+    // if a crash ever left one behind, drop it here rather than resurrect a deleted
+    // message on reload.
+    const tombstoned = new Set(await this.store.tombstoneKeys())
     const out: Record<string, StoredMessage[]> = {}
     for (const row of rows) {
+      if (tombstoned.has(row.key)) continue
       try {
         const m = this.history.open(row)
         const msg: StoredMessage = { id: m.id, dir: m.dir, text: m.text, ts: m.ts }
@@ -538,6 +548,66 @@ export class NightjarClient {
   /** Remove one persisted message (P10d delete / P10e ephemeral cleanup). */
   async removeHistory(peerId: string, dir: 'in' | 'out', id: string): Promise<void> {
     if (this.history) await this.store.historyRemove(this.history.storageKey(peerId, dir, id))
+  }
+
+  /**
+   * Delete-for-everyone a message YOU sent (P10d, DESIGN 8.6). Always removes the
+   * local copy; whether the peer is asked to remove it too depends on delivery
+   * state:
+   *   - still queued in your OWN outbox (not yet delivered): CANCEL the send
+   *     (drop the outbox entry) rather than transmit it and then chase it with a
+   *     delete. Nothing was delivered, so there is nothing to recall.
+   *   - already delivered (not in the outbox): send a `delete{contentId}` control
+   *     with its OWN fresh transport id (the two-id rule) on the current session.
+   *
+   * `id` is the content msgId (hex) the bubble/history is keyed by. Returns whether
+   * a delete request was actually sent to the peer. Best-effort and honest-client-
+   * dependent: a delivered delete only asks; it is never a guarantee (see 8.6), so
+   * the UI says "delete sent", never "deleted for everyone".
+   */
+  async deleteForEveryone(peer: string, id: string): Promise<{ requested: boolean }> {
+    // A text's outbox entry is keyed by its content id (the two-id rule makes them
+    // equal for a first-send text), so a still-queued target is found by that id.
+    const stillQueued = (await this.store.pendingOutbox()).some((e) => e.id === id && e.to === peer)
+    // Remove the local sent copy regardless (dir='out').
+    if (this.history) await this.store.historyRemove(this.history.storageKey(peer, 'out', id)).catch(() => {})
+    if (stillQueued) {
+      await this.store.removeOutbox(id).catch(() => {})
+      return { requested: false }
+    }
+    const sent = await this.sendDeleteControl(peer, id)
+    return { requested: sent }
+  }
+
+  // Encrypt + queue a delete control targeting content id `targetId` on the peer's
+  // current session, with its OWN fresh transport id (never the target's id: reusing
+  // it would make the relay treat the delete as a duplicate of the original and drop
+  // it, and would clobber a still-queued original in the outbox). The control is not
+  // itself persisted to history. If no session exists we never delivered the target,
+  // so there is nothing to recall.
+  private async sendDeleteControl(peer: string, targetId: string): Promise<boolean> {
+    const plaintext = encodeDeleteMessage(hexToBytes(targetId))
+    const entry = await this.lock.withLock(sessionLock(peer), async () => {
+      const now = Date.now()
+      const book = await this.store.loadBook(peer)
+      const current = currentSession(book)
+      if (!current) return null
+      const { state, header, ciphertext } = ratchetEncrypt(deserializeRatchet(current.snapshot, now), plaintext)
+      const transportId = bytesToHex(newMsgId()) // fresh 16-byte id, distinct from targetId
+      const env: WireEnvelope = {
+        id: transportId,
+        kind: 'normal',
+        header: encodeMessageHeaderWire(header),
+        ciphertext: b64encode(ciphertext),
+      }
+      const advanced = updateSession(book!, current.id, serializeRatchet(state), now)
+      const e: OutboxEntry = { id: transportId, to: peer, env, createdAt: now }
+      await this.store.saveBookWithOutbox(peer, advanced, e) // commit before release; no history row
+      return e
+    })
+    if (!entry) return false
+    this.fire(entry)
+    return true
   }
 
   // Fire a queued envelope at the socket and arrange for its outbox entry to be
@@ -613,12 +683,19 @@ export class NightjarClient {
       // (P10d) -> apply a removal; malformed -> render nothing (forward-compat).
       const decoded = decodeMessage(res.plaintext)
       if (decoded.kind === 'text') {
-        this.cb.onMessage(from, { id: bytesToHex(decoded.id), text: decoded.body, ts: now, ephemeral: decoded.ephemeral })
+        // A text whose delete-for-everyone already arrived was suppressed by the
+        // inbound processor (not persisted, tombstoned): do not render it.
+        if (!res.suppressed) {
+          this.cb.onMessage(from, { id: bytesToHex(decoded.id), text: decoded.body, ts: now, ephemeral: decoded.ephemeral })
+        }
       } else if (decoded.kind === 'legacy') {
         this.cb.onMessage(from, { id: env.id, text: decoded.body, ts: now })
+      } else if (decoded.kind === 'delete') {
+        // Delete-for-everyone (P10d). The target row was removed + tombstoned
+        // atomically inside processInbound; tell the UI to drop the bubble too.
+        this.cb.onDelete?.(from, bytesToHex(decoded.id))
       }
-      // decoded.kind 'delete' | 'malformed': no UI render in P10b (delete handling
-      // arrives in P10d; a malformed record is clean-ignored).
+      // decoded.kind 'malformed': clean-ignored (forward-compat).
       if (res.consumedOpk) {
         // Mirror the server-side vend so the tracked Directory count trends down
         // between connects and replenishment fires before the Directory depletes.

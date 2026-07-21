@@ -184,6 +184,41 @@ function historySuite(name: string, make: () => SessionStore) {
       expect((await s.historyLoadAll())[0].failed).toBe(true)
       await s.historyMarkFailed('nope') // no-op when absent
     })
+
+    it('a delete op removes the target row and records its tombstone in one commit (P10d)', async () => {
+      const s = make()
+      await s.saveBookWithSeen(PEER_A, singleSessionBook(snap), 'e1', hrec('victim'))
+      expect(await s.hasTombstone('victim')).toBe(false)
+      // The delete rides the NEXT receive commit (its own seen marker + the del op).
+      await s.saveBookWithSeen(PEER_A, singleSessionBook(snap), 'e-del', undefined, { key: 'victim' })
+      expect(await s.hasSeen('e-del')).toBe(true) // the delete envelope was consumed
+      expect(await s.historyLoadAll()).toEqual([]) // the target row is gone
+      expect(await s.hasTombstone('victim')).toBe(true)
+      expect(await s.tombstoneKeys()).toEqual(['victim'])
+    })
+
+    it('a delete op via the initial-receive path also removes + tombstones (P10d)', async () => {
+      const s = make()
+      await s.saveBookWithSeen(PEER_A, singleSessionBook(snap), 'e1', hrec('victim'))
+      await s.saveBookWithSeenReplay(PEER_A, singleSessionBook(snap), 'e-del', 'init-x', undefined, { key: 'victim' })
+      expect(await s.hasReplayedInitial('init-x')).toBe(true)
+      expect(await s.historyLoadAll()).toEqual([])
+      expect(await s.hasTombstone('victim')).toBe(true)
+    })
+
+    it('tombstones age out on the envelope-TTL bound and wipeAll clears them (P10d)', async () => {
+      const s = make()
+      await s.saveBookWithSeen(PEER_A, singleSessionBook(snap), 'e-del', undefined, { key: 'ghost' })
+      expect(await s.hasTombstone('ghost')).toBe(true)
+      await s.pruneExpired(Date.now() + 1000) // not old enough
+      expect(await s.hasTombstone('ghost')).toBe(true)
+      await s.pruneExpired(Date.now() + 40 * 86_400_000) // past the TTL
+      expect(await s.hasTombstone('ghost')).toBe(false)
+      // wipeAll clears tombstones too.
+      await s.saveBookWithSeen(PEER_A, singleSessionBook(snap), 'e-del2', undefined, { key: 'ghost2' })
+      await s.wipeAll()
+      expect(await s.tombstoneKeys()).toEqual([])
+    })
   })
 }
 

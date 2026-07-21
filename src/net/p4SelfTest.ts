@@ -26,7 +26,7 @@ export interface P4SelfTestResult {
 // real KDF is exercised by the node/browser lock tests). Dev tooling only.
 const fastKdf = (secret: Uint8Array, salt: Uint8Array) => hash256(new Uint8Array([...secret, ...salt]))
 
-async function makeClient(received: string[], errors: string[]): Promise<NightjarClient> {
+async function makeClient(received: string[], errors: string[], deletes: string[] = []): Promise<NightjarClient> {
   const id = generateIdentity()
   const lock = new InMemoryLock()
   const keys = new MemoryKeyStore()
@@ -46,6 +46,7 @@ async function makeClient(received: string[], errors: string[]): Promise<Nightja
     {
       onMessage: (_from, msg) => received.push(msg.text),
       onError: (detail) => errors.push(detail),
+      onDelete: (_from, msgId) => deletes.push(msgId),
     },
     history,
   )
@@ -63,9 +64,10 @@ export async function runP4SelfTest(bootstrapInvite: string): Promise<P4SelfTest
   const log: string[] = []
   const aRecv: string[] = []
   const bRecv: string[] = []
+  const bDel: string[] = []
   const errors: string[] = []
   const alice = await makeClient(aRecv, errors)
-  const bob = await makeClient(bRecv, errors)
+  const bob = await makeClient(bRecv, errors, bDel)
 
   try {
     await alice.connect()
@@ -121,6 +123,22 @@ export async function runP4SelfTest(bootstrapInvite: string): Promise<P4SelfTest
       aliceTexts.join(',') === ['in:hi back from bob', 'out:and a second one', 'out:hello from alice'].sort().join(',')
     log.push(`history persisted + decrypted both ways: ${historyOk ? 'PASS' : 'FAIL'}`)
 
+    // Delete-for-everyone (P10d): Alice sends a message, then deletes it. Bob's
+    // onDelete fires for the same content id, and the message is gone from BOTH
+    // sides' persistent history.
+    const delId = await alice.sendText(bob.userId, 'delete me')
+    await waitUntil(() => bRecv.includes('delete me'))
+    const { requested } = await alice.deleteForEveryone(bob.userId, delId)
+    await waitUntil(() => bDel.includes(delId))
+    const bobAfter = (await bob.loadAllHistory())[alice.userId] ?? []
+    const aliceAfter = (await alice.loadAllHistory())[bob.userId] ?? []
+    const deleteOk =
+      requested &&
+      bDel.includes(delId) &&
+      !bobAfter.some((m) => m.text === 'delete me') &&
+      !aliceAfter.some((m) => m.text === 'delete me')
+    log.push(`delete-for-everyone removed it on both sides: ${deleteOk ? 'PASS' : 'FAIL'}`)
+
     const ok =
       bRecv[0] === 'hello from alice' &&
       aRecv[0] === 'hi back from bob' &&
@@ -128,6 +146,7 @@ export async function runP4SelfTest(bootstrapInvite: string): Promise<P4SelfTest
       bobToAlice === 'invite' &&
       aliceToBob === 'unverified' &&
       historyOk &&
+      deleteOk &&
       errors.length === 0
     // Surface the FULL ids (both stay registered in the Directory) so the app can
     // message one and exercise the contact + verify UI against a real peer.

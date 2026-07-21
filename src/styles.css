@@ -591,17 +591,90 @@ textarea.mono {
   background: #1a2740;
   border-color: #24406b;
 }
+/* Message row: bubble plus (own messages) a delete affordance (P10d). */
+.msg-row {
+  display: flex;
+  align-items: center;
+  gap: 0.25rem;
+  max-width: 100%;
+  position: relative;
+}
+.msg-out .msg-row {
+  flex-direction: row-reverse;
+}
+.msg-actions {
+  position: relative;
+  flex-shrink: 0;
+}
+.msg-actions-btn {
+  opacity: 0;
+  font-size: 1rem;
+  line-height: 1;
+  padding: 0 0.2rem;
+}
+/* Reveal on hover (desktop); always visible when its menu is open (tap/mobile). */
+.msg:hover .msg-actions-btn,
+.msg-actions-btn:focus-visible {
+  opacity: 0.6;
+}
+.msg-menu {
+  position: absolute;
+  top: 100%;
+  right: 0;
+  z-index: 5;
+  margin-top: 0.2rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+  padding: 0.5rem;
+  min-width: 12rem;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 0.5rem;
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.35);
+}
+.msg-menu-note {
+  padding: 0 0.1rem;
+}
 .compose {
   display: flex;
   gap: 0.5rem;
-  padding-top: 0.6rem;
-  /* Clear the iPhone home indicator so the bar is never behind it. */
-  padding-bottom: env(safe-area-inset-bottom, 0);
+  align-items: center;
+  padding: 0.55rem 0.5rem;
+  /* Lift the bar off the very bottom edge so it reads as a natural bar (and clear
+     the iPhone home indicator so it is never behind it). */
+  padding-bottom: calc(0.7rem + env(safe-area-inset-bottom, 0));
   border-top: 1px solid var(--border);
+  background: var(--panel);
   flex-shrink: 0; /* the message list scrolls; the compose bar stays put */
 }
 .compose input {
   flex: 1;
+  border-radius: 1.3rem;
+  padding: 0.55rem 0.95rem;
+}
+.compose .primary {
+  border-radius: 1.3rem;
+  padding-left: 1.1rem;
+  padding-right: 1.1rem;
+}
+
+/* Unread ("new message") indicator on the conversation list. */
+.thread-left {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  min-width: 0;
+}
+.thread-unread .thread-name {
+  font-weight: 700;
+}
+.unread-dot {
+  width: 0.55rem;
+  height: 0.55rem;
+  border-radius: 50%;
+  background: var(--accent);
+  flex-shrink: 0;
 }
 
 /* --- verify (safety number) -------------------------------------------- */

@@ -6,7 +6,7 @@
 // This replaces the earlier control-panel MainApp. All security-critical wiring
 // (send, verify, invite pinning, trust badges) is unchanged; only the shell is.
 
-import { useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import type { Identity } from '../crypto/identity'
 import type { Contact } from '../trust/contactStore'
 import type { CanaryResult } from '../verify/canary'
@@ -28,6 +28,7 @@ interface Props {
   canary: CanaryResult | null
   actions: {
     send: (peer: string, text: string) => void
+    deleteMessage: (peer: string, id: string, failed?: boolean) => void
     startChat: (peer: string) => void
     openFromCode: (input: string) => Promise<string | null>
     renameChat: (peer: string, name: string) => void
@@ -49,8 +50,44 @@ export function Messenger({ identity, contacts, aliases, conversations, notify, 
   const [chatView, setChatView] = useState<'chat' | 'verify'>('chat')
   const [overlay, setOverlay] = useState<Overlay>('none')
   const [minted, setMinted] = useState<MintedInvite | null>(null)
+  const [unread, setUnread] = useState<Set<string>>(() => new Set())
 
   const contactById = useMemo(() => new Map(contacts.map((c) => [c.peerId, c])), [contacts])
+
+  // Track unread ("new message") chats. The first render seeds the baseline from
+  // the already-hydrated history (so past messages are not marked new); after
+  // that, a peer whose message count grows with an INBOUND message, while it is
+  // not the open chat, is flagged. Opening a chat clears its flag.
+  const prevCounts = useRef<Record<string, number> | null>(null)
+  useEffect(() => {
+    const counts: Record<string, number> = {}
+    for (const [p, msgs] of Object.entries(conversations)) counts[p] = msgs.length
+    const prev = prevCounts.current
+    prevCounts.current = counts
+    if (!prev) return // baseline: hydrated history is already "read"
+    const fresh: string[] = []
+    for (const [p, c] of Object.entries(counts)) {
+      const before = prev[p] ?? 0
+      if (c > before && p !== selected && (conversations[p] ?? []).slice(before).some((m) => m.dir === 'in')) {
+        fresh.push(p)
+      }
+    }
+    if (fresh.length) {
+      setUnread((u) => {
+        const n = new Set(u)
+        for (const p of fresh) n.add(p)
+        return n
+      })
+    }
+  }, [conversations, selected])
+
+  const clearUnread = (peer: string) =>
+    setUnread((u) => {
+      if (!u.has(peer)) return u
+      const n = new Set(u)
+      n.delete(peer)
+      return n
+    })
 
   // Threads = everyone we have a contact for, a conversation with, OR a name for
   // (a named chat persists in the list even before a message or contact record),
@@ -69,6 +106,7 @@ export function Messenger({ identity, contacts, aliases, conversations, notify, 
   }, [contacts, conversations, aliases])
 
   function openChat(peer: string) {
+    clearUnread(peer)
     setSelected(peer)
     setChatView('chat')
     setOverlay('none')
@@ -136,14 +174,18 @@ export function Messenger({ identity, contacts, aliases, conversations, notify, 
             const c = contactById.get(peer)
             const msgs = conversations[peer] ?? []
             const last = msgs[msgs.length - 1]
+            const isUnread = unread.has(peer) && selected !== peer
             return (
               <button
                 key={peer}
-                className={`thread ${selected === peer ? 'thread-active' : ''}`}
+                className={`thread ${selected === peer ? 'thread-active' : ''} ${isUnread ? 'thread-unread' : ''}`}
                 onClick={() => openChat(peer)}
               >
                 <div className="thread-top">
-                  <span className="thread-name">{displayName(peer)}</span>
+                  <span className="thread-left">
+                    {isUnread && <span className="unread-dot" title="new messages" />}
+                    <span className="thread-name">{displayName(peer)}</span>
+                  </span>
                   {c ? <TrustBadge trust={c.trust} /> : <span className="badge badge-unknown">new</span>}
                 </div>
                 {aliases[peer]?.trim() && <span className="mono tiny muted">{shortId(peer)}</span>}
@@ -181,6 +223,7 @@ export function Messenger({ identity, contacts, aliases, conversations, notify, 
             onSend={(t) => actions.send(selected, t)}
             onVerify={() => selectedContact && setChatView('verify')}
             onRename={(n) => actions.renameChat(selected, n)}
+            onDelete={(id, failed) => void actions.deleteMessage(selected, id, failed)}
             onBack={() => setSelected(null)}
           />
         )}

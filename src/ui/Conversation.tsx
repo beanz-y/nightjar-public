@@ -41,19 +41,37 @@ interface Props {
   onSend: (text: string) => void
   onVerify: () => void
   onRename: (name: string) => void
+  /** Delete-for-everyone a message you sent (P10d). `failed` is true for a
+   *  never-delivered message (removed locally only). */
+  onDelete: (id: string, failed?: boolean) => void
   /** Narrow-screen navigation: return to the conversation list. */
   onBack?: () => void
 }
 
-export function Conversation({ peer, name, messages, trust, onSend, onVerify, onRename, onBack }: Props) {
+export function Conversation({ peer, name, messages, trust, onSend, onVerify, onRename, onDelete, onBack }: Props) {
   const [draft, setDraft] = useState('')
   const [renaming, setRenaming] = useState(false)
   const [nameDraft, setNameDraft] = useState(name)
+  // The outbound message whose delete menu is open (P10d), or null.
+  const [menuFor, setMenuFor] = useState<string | null>(null)
   const endRef = useRef<HTMLDivElement>(null)
 
   useEffect(() => {
     endRef.current?.scrollIntoView({ block: 'end' })
   }, [messages.length])
+
+  // Close the delete menu on any outside click / Escape.
+  useEffect(() => {
+    if (!menuFor) return
+    const close = () => setMenuFor(null)
+    const onKey = (e: KeyboardEvent) => e.key === 'Escape' && setMenuFor(null)
+    document.addEventListener('click', close)
+    document.addEventListener('keydown', onKey)
+    return () => {
+      document.removeEventListener('click', close)
+      document.removeEventListener('keydown', onKey)
+    }
+  }, [menuFor])
 
   function submit() {
     const t = draft.trim()
@@ -139,7 +157,40 @@ export function Conversation({ peer, name, messages, trust, onSend, onVerify, on
                 </div>
               )}
               <div className={`msg msg-${m.dir}`}>
-                <span className={`bubble${m.failed ? ' bubble-failed' : ''}`}>{m.text}</span>
+                <div className="msg-row">
+                  <span className={`bubble${m.failed ? ' bubble-failed' : ''}`}>{m.text}</span>
+                  {m.dir === 'out' && (
+                    <div className="msg-actions">
+                      <button
+                        className="icon-btn msg-actions-btn"
+                        title="message options"
+                        aria-label="message options"
+                        onClick={(e) => {
+                          e.stopPropagation()
+                          setMenuFor((cur) => (cur === m.id ? null : m.id))
+                        }}
+                      >
+                        ⋯
+                      </button>
+                      {menuFor === m.id && (
+                        <div className="msg-menu" onClick={(e) => e.stopPropagation()}>
+                          <button
+                            className="danger small"
+                            onClick={() => {
+                              setMenuFor(null)
+                              onDelete(m.id, m.failed)
+                            }}
+                          >
+                            {m.failed ? 'Delete' : 'Delete for everyone'}
+                          </button>
+                          {!m.failed && (
+                            <span className="tiny muted msg-menu-note">Asks their device to remove it too. Not guaranteed.</span>
+                          )}
+                        </div>
+                      )}
+                    </div>
+                  )}
+                </div>
                 <span className="msg-meta tiny muted" title={new Date(m.ts).toLocaleString()}>
                   {formatTime(m.ts)}
                   {m.failed && <span className="error"> · not sent</span>}
