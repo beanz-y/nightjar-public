@@ -144,3 +144,41 @@ describe('ContactStore at-rest encryption (P10c)', () => {
     await expect(new ContactStore(keys, lock, appLock).list()).rejects.toThrow()
   })
 })
+
+describe('ContactStore pre-P10c plaintext migration', () => {
+  it('adopts a legacy plaintext contacts blob under a new app-lock and re-seals it', async () => {
+    const { AppLockStore } = await import('../storage/appLockStore')
+    const { hash256 } = await import('../crypto/primitives')
+    const { b64encode } = await import('../wire/codec')
+    const stubKdf = (s: Uint8Array, salt: Uint8Array) => hash256(new Uint8Array([...s, ...salt]))
+    const keys = new MemoryKeyStore()
+    const lock = new InMemoryLock()
+
+    // Simulate a pre-P10c device: contacts stored as PLAINTEXT JSON.
+    const a = generateIdentity()
+    const plain = {
+      [a.userId]: { peerId: a.userId, ikSig: b64encode(a.ikSig.publicKey), trust: 'unverified', firstSeen: NOW, verifiedAt: null },
+    }
+    await keys.put('contacts.v1', new TextEncoder().encode(JSON.stringify(plain)))
+
+    // The user enrolls an app-lock and opens the store.
+    const appLock = new AppLockStore(keys, lock, stubKdf)
+    await appLock.enroll([{ kind: 'pass', secret: 'upgrade-secret' }])
+    const store = new ContactStore(keys, lock, appLock)
+
+    // The legacy contact is readable (migration), not a crash.
+    expect((await store.get(a.userId))?.peerId).toBe(a.userId)
+    // The on-disk blob is now sealed (no longer plaintext JSON).
+    const raw = await keys.get('contacts.v1')
+    const stillPlain = (() => {
+      try {
+        return typeof JSON.parse(new TextDecoder().decode(raw!)) === 'object'
+      } catch {
+        return false
+      }
+    })()
+    expect(stillPlain).toBe(false)
+    // A fresh store reads the now-sealed blob.
+    expect((await new ContactStore(keys, lock, appLock).get(a.userId))?.peerId).toBe(a.userId)
+  })
+})

@@ -65,6 +65,18 @@ const MAX_ALIAS_LENGTH = 60
 const encoder = new TextEncoder()
 const decoder = new TextDecoder()
 
+/** True if `raw` is a pre-P10c PLAINTEXT blob (our JSON object), as opposed to a
+ *  sealed blob (salt||ciphertext, effectively random and never valid JSON). Used
+ *  to migrate a device that predates the app-lock. */
+function isLegacyPlaintextJson(raw: Uint8Array): boolean {
+  try {
+    const v = JSON.parse(decoder.decode(raw)) as unknown
+    return typeof v === 'object' && v !== null
+  } catch {
+    return false
+  }
+}
+
 /** Trust work that failed transiently and must not be lost (P8): an inviter pin
  *  whose bundle fetch failed after registration consumed the invite, and inbound
  *  first-contact records whose write failed after the session committed. Both
@@ -87,10 +99,27 @@ export class ContactStore {
 
   // Read a keystore blob, decrypting under the contacts sub-key when the app-lock
   // is wired. `label` (the slot name) is bound in the AEAD so blobs can't be swapped.
+  //
+  // Upgrade path (P10c): a device that predates the app-lock stored these blobs as
+  // PLAINTEXT JSON. When the lock is first enrolled, the old blob cannot be opened
+  // (it is not a sealed blob). We detect that a decrypt failure is actually legacy
+  // plaintext (it still parses as our JSON), adopt it, and re-seal it now so it is
+  // encrypted at rest going forward. A genuinely corrupt or wrong-key sealed blob is
+  // not valid JSON, so it re-throws (never silently treated as data).
   private async getSealed(key: string, label: string): Promise<Uint8Array | null> {
     const raw = await this.store.get(key)
     if (raw == null) return null
-    return this.appLock ? openBlob(this.appLock.contactsKey(), label, raw) : raw
+    if (!this.appLock) return raw
+    const ck = this.appLock.contactsKey() // throws AppLockedError when locked (propagates)
+    try {
+      return openBlob(ck, label, raw)
+    } catch (e) {
+      if (isLegacyPlaintextJson(raw)) {
+        await this.putSealed(key, label, raw).catch(() => {}) // one-time migration to sealed
+        return raw
+      }
+      throw e
+    }
   }
 
   private async putSealed(key: string, label: string, bytes: Uint8Array): Promise<void> {
