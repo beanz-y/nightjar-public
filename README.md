@@ -72,7 +72,8 @@ Double Ratchet) and the verifiability hardening.
 
 ## License
 
-TBD. The crypto core is a clean-room implementation from public Signal
-specifications on MIT-licensed `@noble` primitives; we deliberately do not link
-Signal's AGPL `libsignal`. Reproducible builds and public source are a security
-requirement here, not just a preference (see `docs/DESIGN.md` section 10).
+Licensed under the [Apache License, Version 2.0](LICENSE). The crypto core is a
+clean-room implementation from public Signal specifications on MIT-licensed
+`@noble` primitives; we deliberately do not link Signal's AGPL `libsignal`.
+Reproducible builds and public source are a security requirement here, not just a
+preference (see `docs/DESIGN.md` section 10).
