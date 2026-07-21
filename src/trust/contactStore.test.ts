@@ -182,3 +182,34 @@ describe('ContactStore pre-P10c plaintext migration', () => {
     expect((await new ContactStore(keys, lock, appLock).get(a.userId))?.peerId).toBe(a.userId)
   })
 })
+
+describe('ContactStore app-lock reset (forgot secret)', () => {
+  it('wipeLocalData lets a re-enrolled lock (new LDK) start without a decrypt crash', async () => {
+    const { AppLockStore } = await import('../storage/appLockStore')
+    const { hash256 } = await import('../crypto/primitives')
+    const stubKdf = (s: Uint8Array, salt: Uint8Array) => hash256(new Uint8Array([...s, ...salt]))
+    const keys = new MemoryKeyStore()
+    const lock = new InMemoryLock()
+
+    // First lock + a sealed contact.
+    const appLock = new AppLockStore(keys, lock, stubKdf)
+    await appLock.enroll([{ kind: 'pass', secret: 'first-secret' }])
+    const a = generateIdentity()
+    const store = new ContactStore(keys, lock, appLock)
+    await store.recordFirstContact(a.userId, a.ikSig.publicKey, NOW)
+    expect((await store.get(a.userId))?.peerId).toBe(a.userId)
+
+    // Forgot-secret reset: wipe local contact data, then reset the lock.
+    await store.wipeLocalData()
+    await appLock.reset()
+
+    // Re-enroll a NEW lock (fresh LDK) and open the store: no crash, empty list.
+    await appLock.enroll([{ kind: 'pin', secret: '445566' }])
+    const store2 = new ContactStore(keys, lock, appLock)
+    await expect(store2.list()).resolves.toEqual([])
+    await expect(store2.getAliases()).resolves.toEqual({})
+    // And the store is usable again (records under the new LDK).
+    await store2.recordFirstContact(a.userId, a.ikSig.publicKey, NOW)
+    expect((await store2.get(a.userId))?.peerId).toBe(a.userId)
+  })
+})

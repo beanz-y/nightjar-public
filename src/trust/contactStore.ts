@@ -247,6 +247,19 @@ export class ContactStore {
     })
   }
 
+  /** Erase all local contact/pending/alias blobs. Used by the forgot-secret
+   *  app-lock reset (P10c): these blobs are sealed under the Local Data Key, so
+   *  once the LDK is discarded they are unrecoverable ciphertext and MUST be
+   *  cleared, or a re-enrolled lock (a new LDK) cannot open them and the app fails
+   *  to start. The contact list can be recovered from a backup afterwards. */
+  async wipeLocalData(): Promise<void> {
+    await this.lock.withLock(CONTACTS_LOCK, async () => {
+      await this.store.delete(CONTACTS_KEY)
+      await this.store.delete(PENDING_KEY)
+      await this.store.delete(ALIASES_KEY)
+    })
+  }
+
   /** Replace the whole contact map from a restored backup (P8, DESIGN 8.3).
    *  Restore-only: it runs against a freshly wiped device, so replacing (not
    *  merging) is the correct semantics. Every row is re-checked against the

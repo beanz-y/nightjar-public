@@ -170,8 +170,9 @@ function Unlock({ bioAvailable, lockMethods, onUnlock, onUnlockBiometric, onRese
       ) : (
         <div className="lock-reset">
           <p className="small">
-            Resetting the app-lock <strong>erases the saved messages on this device</strong>. Your identity and
-            contacts are kept (and can also be recovered from a backup). Type <code>ERASE</code> to confirm.
+            Resetting the app-lock <strong>erases the saved messages and contacts on this device</strong> (they are
+            encrypted with the secret you forgot, so they cannot be kept). Your <strong>identity is kept</strong>, and
+            your contacts can be recovered from a backup afterwards. Type <code>ERASE</code> to confirm.
           </p>
           <input className="mono" placeholder="ERASE" value={confirmText} onChange={(e) => setConfirmText(e.target.value)} />
           <div className="row">

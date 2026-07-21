@@ -468,12 +468,20 @@ export function useNightjar() {
     if (!stores) return
     teardownLive()
     try {
+      // History AND contacts/pending/aliases are sealed under the Local Data Key
+      // being discarded here, so they are unrecoverable ciphertext now and must be
+      // cleared (else a re-enrolled lock's new LDK cannot open them and the app
+      // fails to start). The identity survives (it is not under the lock); contacts
+      // can be recovered from a backup.
       await stores.sessions.historyClear()
+      await stores.contacts.wipeLocalData()
       await stores.appLock.reset()
     } catch {
       /* best-effort */
     }
     setConversations({})
+    setContacts([])
+    setAliases({})
     restorePayloadRef.current = null
     setRestorePending(false)
     setPhase('enroll')
