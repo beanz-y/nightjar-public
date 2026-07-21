@@ -57,6 +57,27 @@ export interface OutboxEntry {
   createdAt: number
 }
 
+/** One persisted message (P10b). The body is sealed at rest (see historyStore.ts:
+ *  `ct` is XChaCha20-Poly1305 over the plaintext, `salt` the fresh per-record HKDF
+ *  salt). Rows are keyed by (peerId, dir, id): direction is part of the identity
+ *  so a peer-chosen inbound content id can never address the slot of one of YOUR
+ *  outbound rows, and so one delete removes exactly one row. `id` is the content
+ *  msgId hex for a structured message, or the transport envelope id for a legacy
+ *  one. A history row is written in the SAME transaction as the ratchet advance +
+ *  dedup marker, so an acked message is always durably in history. */
+export interface HistoryRow {
+  id: string
+  peerId: string
+  dir: 'in' | 'out'
+  ts: number
+  salt: Uint8Array
+  ct: Uint8Array
+  /** Set on an outbound row whose delivery permanently failed or timed out, so a
+   *  reload re-renders it as "not sent" rather than as an ordinary delivered
+   *  bubble. Plain metadata (not inside the AEAD); absent means not failed. */
+  failed?: boolean
+}
+
 
 export interface SessionStore {
   // --- session book ------------------------------------------------------
@@ -64,14 +85,25 @@ export interface SessionStore {
   loadBook(peerId: string): Promise<SessionBook | null>
   /** Overwrite the peer's book (non-atomic convenience; tests + resend paths). */
   saveBook(peerId: string, book: SessionBook): Promise<void>
-  /** Persist the book AND the consumed message id atomically (normal receive). */
-  saveBookWithSeen(peerId: string, book: SessionBook, msgId: string): Promise<void>
+  /** Persist the book AND the consumed message id atomically (normal receive).
+   *  An optional history row is written in the SAME transaction (P10b), so an
+   *  acked inbound message is always durably in history (omitted for an ephemeral
+   *  or unpersistable message). */
+  saveBookWithSeen(peerId: string, book: SessionBook, msgId: string, history?: HistoryRow): Promise<void>
   /** Persist the book (with a freshly-promoted session), the consumed message id,
-   *  AND the initial-message id, all atomically (the initial accept path). */
-  saveBookWithSeenReplay(peerId: string, book: SessionBook, msgId: string, initId: string): Promise<void>
+   *  AND the initial-message id, all atomically (the initial accept path), plus an
+   *  optional history row in the same transaction (P10b). */
+  saveBookWithSeenReplay(
+    peerId: string,
+    book: SessionBook,
+    msgId: string,
+    initId: string,
+    history?: HistoryRow,
+  ): Promise<void>
   /** Persist the advanced book AND the outbox entry atomically, BEFORE the
-   *  envelope is handed to the socket (commit before release). */
-  saveBookWithOutbox(peerId: string, book: SessionBook, entry: OutboxEntry): Promise<void>
+   *  envelope is handed to the socket (commit before release), plus an optional
+   *  history row for the sent message in the same transaction (P10b). */
+  saveBookWithOutbox(peerId: string, book: SessionBook, entry: OutboxEntry, history?: HistoryRow): Promise<void>
 
   // --- single-session convenience (the P3 RatchetSession wrapper + tests) --
   /** The CURRENT session's snapshot, or null. */
@@ -95,6 +127,17 @@ export interface SessionStore {
   removeOutbox(id: string): Promise<void>
   pendingOutbox(): Promise<OutboxEntry[]>
 
+  // --- history (P10b) ----------------------------------------------------
+  /** All persisted rows for one peer (unordered; the caller sorts by ts). */
+  historyLoad(peerId: string): Promise<HistoryRow[]>
+  /** Every persisted row across all peers (boot hydration). */
+  historyLoadAll(): Promise<HistoryRow[]>
+  /** Remove exactly one row (delete-for-everyone / ephemeral cleanup, P10d/e). */
+  historyRemove(peerId: string, dir: 'in' | 'out', id: string): Promise<void>
+  /** Mark one row failed (an outbound send that was permanently rejected or timed
+   *  out), so a reload does not render it as delivered. No-op if the row is gone. */
+  historyMarkFailed(peerId: string, dir: 'in' | 'out', id: string): Promise<void>
+
   // --- maintenance (P8) ----------------------------------------------------
   /** Age out dedup + failure rows past ENVELOPE_TTL_MS: the relay redelivers an
    *  unacked envelope for up to that long, so a `seen` row must outlive the whole
@@ -104,9 +147,18 @@ export interface SessionStore {
    *  REPLAY store is never pruned, by design (DESIGN 4.3). */
   pruneExpired(now: number): Promise<{ seen: number; failures: number }>
   /** Erase every store (restore, DESIGN 8.3): a restored identity starts with
-   *  no sessions, dedup state, failure counters, or queued outbox. */
+   *  no sessions, dedup state, failure counters, queued outbox, or history. */
   wipeAll(): Promise<void>
 }
+
+/** Compound history key `${peerId}:${dir}:${id}`. peerId is a fixed-width base32
+ *  userId, so `:` cleanly delimits the parts and no two peers' keys collide or
+ *  prefix-overlap. `dir` is part of the key so a peer-chosen inbound content id
+ *  can never overwrite one of your locally-generated outbound rows. Because ':'
+ *  (0x3A) sorts below ';' (0x3B), the half-open peer range [`${peerId}:`,
+ *  `${peerId};`) still captures both the `:in:` and `:out:` keys. */
+const historyKey = (peerId: string, dir: 'in' | 'out', id: string): string => `${peerId}:${dir}:${id}`
+const rowKey = (r: HistoryRow): string => historyKey(r.peerId, r.dir, r.id)
 
 // --- helpers shared by both implementations --------------------------------
 
@@ -135,6 +187,7 @@ export class MemorySessionStore implements SessionStore {
   private readonly replay = new Set<string>()
   private readonly failures = new Map<string, { count: number; ts: number }>()
   private readonly outbox = new Map<string, OutboxEntry>()
+  private readonly history = new Map<string, HistoryRow>() // `${peerId}:${id}` -> row
 
   async loadBook(peerId: string): Promise<SessionBook | null> {
     const b = this.books.get(peerId)
@@ -145,20 +198,29 @@ export class MemorySessionStore implements SessionStore {
     this.books.set(peerId, clone(book))
   }
 
-  async saveBookWithSeen(peerId: string, book: SessionBook, msgId: string): Promise<void> {
+  async saveBookWithSeen(peerId: string, book: SessionBook, msgId: string, history?: HistoryRow): Promise<void> {
     this.books.set(peerId, clone(book))
     this.seen.set(msgId, Date.now())
+    if (history) this.history.set(rowKey(history), clone(history))
   }
 
-  async saveBookWithSeenReplay(peerId: string, book: SessionBook, msgId: string, initId: string): Promise<void> {
+  async saveBookWithSeenReplay(
+    peerId: string,
+    book: SessionBook,
+    msgId: string,
+    initId: string,
+    history?: HistoryRow,
+  ): Promise<void> {
     this.books.set(peerId, clone(book))
     this.seen.set(msgId, Date.now())
     this.replay.add(initId)
+    if (history) this.history.set(rowKey(history), clone(history))
   }
 
-  async saveBookWithOutbox(peerId: string, book: SessionBook, entry: OutboxEntry): Promise<void> {
+  async saveBookWithOutbox(peerId: string, book: SessionBook, entry: OutboxEntry, history?: HistoryRow): Promise<void> {
     this.books.set(peerId, clone(book))
     this.outbox.set(entry.id, clone(entry))
+    if (history) this.history.set(rowKey(history), clone(history))
   }
 
   async load(peerId: string): Promise<RatchetSnapshot | null> {
@@ -219,6 +281,23 @@ export class MemorySessionStore implements SessionStore {
     return [...this.outbox.values()].map(clone)
   }
 
+  async historyLoad(peerId: string): Promise<HistoryRow[]> {
+    return [...this.history.values()].filter((r) => r.peerId === peerId).map(clone)
+  }
+
+  async historyLoadAll(): Promise<HistoryRow[]> {
+    return [...this.history.values()].map(clone)
+  }
+
+  async historyRemove(peerId: string, dir: 'in' | 'out', id: string): Promise<void> {
+    this.history.delete(historyKey(peerId, dir, id))
+  }
+
+  async historyMarkFailed(peerId: string, dir: 'in' | 'out', id: string): Promise<void> {
+    const r = this.history.get(historyKey(peerId, dir, id))
+    if (r) r.failed = true
+  }
+
   async pruneExpired(now: number): Promise<{ seen: number; failures: number }> {
     let seen = 0
     for (const [id, ts] of this.seen) {
@@ -243,6 +322,7 @@ export class MemorySessionStore implements SessionStore {
     this.replay.clear()
     this.failures.clear()
     this.outbox.clear()
+    this.history.clear()
   }
 }
 
@@ -254,7 +334,8 @@ const SEEN = 'seen'
 const REPLAY = 'replay'
 const FAILURES = 'failures'
 const OUTBOX = 'outbox'
-const DB_VERSION = 4
+const HISTORY = 'history'
+const DB_VERSION = 5
 
 export class IdbSessionStore implements SessionStore {
   private dbPromise: Promise<IDBDatabase> | null = null
@@ -270,6 +351,10 @@ export class IdbSessionStore implements SessionStore {
           if (!db.objectStoreNames.contains(REPLAY)) db.createObjectStore(REPLAY)
           if (!db.objectStoreNames.contains(FAILURES)) db.createObjectStore(FAILURES)
           if (!db.objectStoreNames.contains(OUTBOX)) db.createObjectStore(OUTBOX)
+          // v4 -> v5 (P10b): a `history` store keyed by `${peerId}:${id}`. The
+          // createObjectStore-if-absent above already handles a brand-new DB; an
+          // upgrade from v4 just adds the empty store (no data to migrate).
+          if (!db.objectStoreNames.contains(HISTORY)) db.createObjectStore(HISTORY)
           // v2 -> v3: a v2 `sessions` value was a bare RatchetSnapshot; wrap each
           // as a one-session book so a pre-P5 conversation is not lost. (Prod has
           // none yet: the only durable sessions before P5 were isolated dev
@@ -327,27 +412,39 @@ export class IdbSessionStore implements SessionStore {
     await this.tx(SESSIONS, 'readwrite', (t) => t.objectStore(SESSIONS).put(book, peerId))
   }
 
-  async saveBookWithSeen(peerId: string, book: SessionBook, msgId: string): Promise<void> {
-    await this.tx([SESSIONS, SEEN], 'readwrite', (t) => {
+  async saveBookWithSeen(peerId: string, book: SessionBook, msgId: string, history?: HistoryRow): Promise<void> {
+    const stores = history ? [SESSIONS, SEEN, HISTORY] : [SESSIONS, SEEN]
+    await this.tx(stores, 'readwrite', (t) => {
       t.objectStore(SESSIONS).put(book, peerId)
       t.objectStore(SEEN).put(Date.now(), msgId)
+      if (history) t.objectStore(HISTORY).put(history, rowKey(history))
       return null
     })
   }
 
-  async saveBookWithSeenReplay(peerId: string, book: SessionBook, msgId: string, initId: string): Promise<void> {
-    await this.tx([SESSIONS, SEEN, REPLAY], 'readwrite', (t) => {
+  async saveBookWithSeenReplay(
+    peerId: string,
+    book: SessionBook,
+    msgId: string,
+    initId: string,
+    history?: HistoryRow,
+  ): Promise<void> {
+    const stores = history ? [SESSIONS, SEEN, REPLAY, HISTORY] : [SESSIONS, SEEN, REPLAY]
+    await this.tx(stores, 'readwrite', (t) => {
       t.objectStore(SESSIONS).put(book, peerId)
       t.objectStore(SEEN).put(Date.now(), msgId)
       t.objectStore(REPLAY).put(1, initId)
+      if (history) t.objectStore(HISTORY).put(history, rowKey(history))
       return null
     })
   }
 
-  async saveBookWithOutbox(peerId: string, book: SessionBook, entry: OutboxEntry): Promise<void> {
-    await this.tx([SESSIONS, OUTBOX], 'readwrite', (t) => {
+  async saveBookWithOutbox(peerId: string, book: SessionBook, entry: OutboxEntry, history?: HistoryRow): Promise<void> {
+    const stores = history ? [SESSIONS, OUTBOX, HISTORY] : [SESSIONS, OUTBOX]
+    await this.tx(stores, 'readwrite', (t) => {
       t.objectStore(SESSIONS).put(book, peerId)
       t.objectStore(OUTBOX).put(entry, entry.id)
+      if (history) t.objectStore(HISTORY).put(history, rowKey(history))
       return null
     })
   }
@@ -429,6 +526,47 @@ export class IdbSessionStore implements SessionStore {
     return entries ?? []
   }
 
+  async historyLoad(peerId: string): Promise<HistoryRow[]> {
+    // All keys are `${peerId}:${id}`; a half-open range [`${peerId}:`, `${peerId};`)
+    // returns exactly this peer's rows without an index. ';' is the code point
+    // immediately after ':', so every `${peerId}:<id>` sorts inside it while the
+    // next peer's keys fall outside. peerIds are a fixed 52 chars, so ranges never
+    // overlap. ASCII-only bounds (no U+FFFF sentinel) keep the source portable.
+    const range = IDBKeyRange.bound(`${peerId}:`, `${peerId};`, false, true)
+    const rows = await this.tx<HistoryRow[]>(HISTORY, 'readonly', (t) => t.objectStore(HISTORY).getAll(range))
+    return rows ?? []
+  }
+
+  async historyLoadAll(): Promise<HistoryRow[]> {
+    const rows = await this.tx<HistoryRow[]>(HISTORY, 'readonly', (t) => t.objectStore(HISTORY).getAll())
+    return rows ?? []
+  }
+
+  async historyRemove(peerId: string, dir: 'in' | 'out', id: string): Promise<void> {
+    await this.tx(HISTORY, 'readwrite', (t) => t.objectStore(HISTORY).delete(historyKey(peerId, dir, id)))
+  }
+
+  async historyMarkFailed(peerId: string, dir: 'in' | 'out', id: string): Promise<void> {
+    const key = historyKey(peerId, dir, id)
+    const db = await this.open()
+    await new Promise<void>((resolve, reject) => {
+      const t = db.transaction(HISTORY, 'readwrite')
+      const store = t.objectStore(HISTORY)
+      const get = store.get(key)
+      get.onsuccess = () => {
+        const row = get.result as HistoryRow | undefined
+        if (row) {
+          row.failed = true
+          store.put(row, key)
+        }
+      }
+      get.onerror = () => reject(get.error)
+      t.oncomplete = () => resolve()
+      t.onabort = () => reject(t.error)
+      t.onerror = () => reject(t.error)
+    })
+  }
+
   async pruneExpired(now: number): Promise<{ seen: number; failures: number }> {
     const db = await this.open()
     return new Promise((resolve, reject) => {
@@ -464,12 +602,13 @@ export class IdbSessionStore implements SessionStore {
   }
 
   async wipeAll(): Promise<void> {
-    await this.tx([SESSIONS, SEEN, REPLAY, FAILURES, OUTBOX], 'readwrite', (t) => {
+    await this.tx([SESSIONS, SEEN, REPLAY, FAILURES, OUTBOX, HISTORY], 'readwrite', (t) => {
       t.objectStore(SESSIONS).clear()
       t.objectStore(SEEN).clear()
       t.objectStore(REPLAY).clear()
       t.objectStore(FAILURES).clear()
       t.objectStore(OUTBOX).clear()
+      t.objectStore(HISTORY).clear()
       return null
     })
   }

@@ -168,3 +168,22 @@ export const BACKUP_MAX_CONTACTS = 1000
 /** Minimum typed-passphrase length (after trim + NFC). The offered generated
  *  passphrase is 20 base32 characters (~100 bits) and always passes. */
 export const PASSPHRASE_MIN_LENGTH = 12
+
+// Persistent local message history (P10b, DESIGN 8.1/8.3, 14). Each history
+// row's body is sealed with a per-record key+nonce derived from a random 32-byte
+// History Master Key (HMK) and a FRESH per-record salt. The fresh salt is
+// load-bearing: a constant key with a constant salt would reuse the XChaCha
+// keystream across rows (the trap in backup.ts's zero-salt deriveKeyNonce, which
+// is safe there only because its key is single-use). The AEAD AAD binds the
+// peerId + content msgId + version so a row cannot be moved between conversations
+// or ids. P10b stores the HMK UNWRAPPED (history is therefore plaintext-at-rest,
+// disclosed); P10c wraps it under an app-lock without changing this row format.
+export const HISTORY_HMK_BYTES = 32
+export const HISTORY_SALT_BYTES = 16
+export const INFO_HISTORY = 'Nightjar_History_v1'
+/** History-ROW format version bound into each row's AEAD AAD. Deliberately
+ *  SEPARATE from the wire ciphersuite `VERSION`: history is an at-rest artifact
+ *  and must not be invalidated by a wire-protocol bump (a v2 PQXDH upgrade bumps
+ *  VERSION, and binding VERSION here would make every existing row fail to open).
+ *  Bump this only on a deliberate history-row format change, with a migration. */
+export const HISTORY_FORMAT_VERSION = 0x01

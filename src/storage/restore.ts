@@ -3,7 +3,12 @@
 // ordered for fail-safety and gated by a durable one-shot flag:
 //
 //   1. wipe session-layer state (old sessions/dedup/outbox/prekeys belong to a
-//      dead ratchet world and could never be used by the restored identity);
+//      dead ratchet world and could never be used by the restored identity), AND
+//      the persistent history + its at-rest key (P10b): the prior identity's
+//      message history must never be readable by or confused with the restored
+//      one. sessions.wipeAll() clears the history ROWS (they live in the sessions
+//      DB); deleting the HMK record forces the restored identity to mint a fresh
+//      history key (the old rows are gone anyway);
 //   2. set RESTORE_PENDING (BEFORE the identity: the flag must already be
 //      durable when a loadable identity first exists, so the forced fresh-
 //      prekey publish can never be skipped by a crash);
@@ -19,6 +24,7 @@
 import type { BackupPayload } from '../crypto/backup'
 import { serializeIdentity } from '../crypto/identity'
 import type { ContactStore } from '../trust/contactStore'
+import { HISTORY_HMK_KEY } from './historyStore'
 import { IDENTITY_KEY } from './identityStore'
 import type { KeyStore } from './keystore'
 import type { Lock } from './lock'
@@ -41,8 +47,9 @@ export interface RestoreDeps {
  *  app afterwards (a clean re-bootstrap is the only supported path back). */
 export async function stageRestore(deps: RestoreDeps, payload: BackupPayload): Promise<void> {
   await deps.lock.withLock(IDENTITY_LOCK, async () => {
-    await deps.sessions.wipeAll()
+    await deps.sessions.wipeAll() // also clears the history store (P10b)
     await deps.keys.delete(PREKEYS_KEY)
+    await deps.keys.delete(HISTORY_HMK_KEY) // drop the prior identity's history key (P10b)
     await deps.keys.put(RESTORE_PENDING_KEY, Uint8Array.from([1]))
     await deps.contacts.replaceAllFromBackup(payload.contacts)
     await deps.keys.put(IDENTITY_KEY, serializeIdentity(payload.identity))

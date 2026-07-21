@@ -25,13 +25,15 @@
 import { bytesToHex } from '@noble/hashes/utils'
 import { POISON_MAX_ATTEMPTS } from '../crypto/constants'
 import { type Identity, deriveUserId } from '../crypto/identity'
+import { decodeMessage } from '../crypto/message'
 import { deserializeRatchet, initRatchetResponder, pruneSkippedKeys, ratchetDecrypt, serializeRatchet } from '../crypto/ratchet'
 import { initialMessageId, x3dhRespond } from '../crypto/x3dh'
 import { type ContactStore, KeyConflictError } from '../trust/contactStore'
 import { decryptOrder, promoteSession, updateSession } from '../session/sessionBook'
+import type { HistoryStore } from '../storage/historyStore'
 import type { PrekeyStore } from '../storage/prekeyStore'
 import type { Lock } from '../storage/lock'
-import type { SessionStore } from '../storage/sessionStore'
+import type { HistoryRow, SessionStore } from '../storage/sessionStore'
 import { type Envelope, b64encode } from '../wire/codec'
 
 export type InboundResult =
@@ -52,6 +54,11 @@ export interface InboundDeps {
   contacts?: ContactStore
   /** Explicit pinned peer IK_sig, used only when no contact store is supplied. */
   knownPeerIkSig?: Uint8Array
+  /** Persistent history (P10b). When present, a persistable inbound message is
+   *  sealed and written in the SAME transaction as the ratchet advance + dedup
+   *  marker, so an acked message is always durably in history. Absent in tests
+   *  and pre-P10 callers (persistence simply skipped). */
+  history?: HistoryStore
 }
 
 const lockName = (peerId: string) => `nightjar-session:${peerId}`
@@ -59,6 +66,14 @@ const lockName = (peerId: string) => `nightjar-session:${peerId}`
 /** A rejection that is permanent, so the envelope is acked-and-dropped rather
  *  than retried (a replayed initial). */
 class PermanentReject extends Error {}
+
+/** A message DECRYPTED fine but could not be durably persisted (history seal or
+ *  the atomic commit failed). It must be retried on redelivery, NOT counted
+ *  toward the poison bound: poison-dropping a decryptable message would ack-and-
+ *  lose real content, violating the "no ack-without-history" invariant. Thrown
+ *  only after a session authenticated, so it is never confused with a decrypt
+ *  miss (a genuinely undecryptable envelope still bumps toward the poison drop). */
+class HistoryPersistError extends Error {}
 
 /**
  * Process one delivered envelope from `from`. Returns the plaintext (to hand to
@@ -80,6 +95,10 @@ export async function processInbound(env: Envelope, from: string, deps: InboundD
       return res
     } catch (e) {
       if (e instanceof KeyConflictError) throw e // surface loudly; do not ack, do not count
+      // A post-decrypt persistence failure: retry on redelivery, but NEVER count
+      // it toward the poison bound (the message decrypted, so dropping it would be
+      // silent content loss). Not acked -> the relay redelivers within its TTL.
+      if (e instanceof HistoryPersistError) throw e
       if (e instanceof PermanentReject) return dropAndAck(store, env.id, from, e.message)
       // Generic decrypt / x3dh / no-session failure: retry a bounded number of
       // times (a reordered message may become decryptable once its initial lands),
@@ -99,6 +118,35 @@ async function dropAndAck(store: SessionStore, envId: string, from: string, reas
   await store.markSeen(envId)
   await store.clearFailure(envId).catch(() => {})
   return { kind: 'dropped', peerId: from, reason }
+}
+
+// Decide whether a just-decrypted inbound plaintext should be persisted, and if
+// so seal it into a history row (written atomically by the caller). The persist
+// gate FAILS CLOSED (P10e): persist ONLY an explicitly non-ephemeral structured
+// text, or a legacy (pre-P10) plain-text message. An ephemeral text, a delete
+// control, or a malformed record is never persisted; a dropped/undefined flag can
+// therefore never accidentally persist a should-be-ephemeral message. A sealing
+// failure propagates (the caller does not commit or ack), so history persistence
+// is part of the atomic commit, never silently skipped.
+//
+// `seenId` (the transport envelope id) keys a legacy row, which has no content
+// msgId; a structured text keys on its content msgId. decodeMessage is total, so
+// this never throws for parsing reasons.
+async function sealInbound(
+  deps: InboundDeps,
+  from: string,
+  seenId: string,
+  plaintext: Uint8Array,
+): Promise<HistoryRow | undefined> {
+  if (!deps.history) return undefined
+  const decoded = decodeMessage(plaintext)
+  if (decoded.kind === 'text' && !decoded.ephemeral) {
+    return deps.history.seal(bytesToHex(decoded.id), from, 'in', deps.now, decoded.body)
+  }
+  if (decoded.kind === 'legacy') {
+    return deps.history.seal(seenId, from, 'in', deps.now, decoded.body)
+  }
+  return undefined
 }
 
 async function handleInitial(env: Envelope, from: string, deps: InboundDeps): Promise<InboundResult> {
@@ -141,9 +189,19 @@ async function handleInitial(env: Envelope, from: string, deps: InboundDeps): Pr
   const { state, plaintext } = ratchetDecrypt(state0, env.header, env.ciphertext, now)
 
   // Promote the new responder session to current, archiving the prior current
-  // (glare/re-establishment safety), then commit book + seen + replay atomically.
+  // (glare/re-establishment safety), then commit book + seen + replay + history
+  // atomically. Sealing happens before the commit so the history row rides the
+  // same transaction (ack only after durable history). A seal-or-commit failure
+  // is raised as HistoryPersistError so it is retried on redelivery and never
+  // poison-dropped (the message decrypted; losing it would break no-ack-without-
+  // history), and the OPK/contact steps below are skipped (session not committed).
   const book = promoteSession(await store.loadBook(from), serializeRatchet(state), now)
-  await store.saveBookWithSeenReplay(from, book, env.id, initId)
+  try {
+    const historyRow = await sealInbound(deps, from, env.id, plaintext)
+    await store.saveBookWithSeenReplay(from, book, env.id, initId, historyRow)
+  } catch (e) {
+    throw new HistoryPersistError(e instanceof Error ? e.message : String(e))
+  }
 
   // Single-use OPK: consume after the session is durable. A redelivery is caught
   // by hasSeen above, so the OPK is never needed again. Best-effort: the message
@@ -186,21 +244,35 @@ async function handleNormal(env: Envelope, from: string, deps: InboundDeps): Pro
   }
 
   // Try each session, current first. The one whose AEAD authenticates wins; a
-  // wrong session throws (leaving its state untouched) and we move on.
+  // wrong session throws (leaving its state untouched) and we move on. Only the
+  // DECRYPT is inside this loop's catch: a persistence failure must not be
+  // mistaken for a decrypt miss (that would poison-drop a decryptable message).
+  let matched: { sid: string; state: ReturnType<typeof deserializeRatchet>; plaintext: Uint8Array } | null = null
   let lastErr: unknown = new Error('inbound: message did not match any session')
   for (const s of decryptOrder(book)) {
     try {
       const { state, plaintext } = ratchetDecrypt(deserializeRatchet(s.snapshot, now), env.header, env.ciphertext, now)
-      // Expire aged skipped keys on the state we are about to persist (DESIGN
-      // 5.3/14: the count cap lives in the ratchet; the time bound is enforced
-      // here, where a real clock exists).
-      const { state: pruned } = pruneSkippedKeys(state, now)
-      const advanced = updateSession(book, s.id, serializeRatchet(pruned), now)
-      await store.saveBookWithSeen(from, advanced, env.id)
-      return { kind: 'delivered', peerId: from, plaintext, consumedOpk: false }
+      matched = { sid: s.id, state, plaintext }
+      break
     } catch (e) {
       lastErr = e
     }
   }
-  throw lastErr instanceof Error ? lastErr : new Error(String(lastErr))
+  if (!matched) throw lastErr instanceof Error ? lastErr : new Error(String(lastErr))
+
+  // A session authenticated. Expire aged skipped keys on the state we persist
+  // (DESIGN 5.3/14: the count cap lives in the ratchet; the time bound is enforced
+  // here, where a real clock exists), seal the message for history (if
+  // persistable), and commit the advance + dedup + history in one transaction. A
+  // seal-or-commit failure is a HistoryPersistError (retry on redelivery, never
+  // poison-dropped), NOT a decrypt miss.
+  const { state: pruned } = pruneSkippedKeys(matched.state, now)
+  const advanced = updateSession(book, matched.sid, serializeRatchet(pruned), now)
+  try {
+    const historyRow = await sealInbound(deps, from, env.id, matched.plaintext)
+    await store.saveBookWithSeen(from, advanced, env.id, historyRow)
+  } catch (e) {
+    throw new HistoryPersistError(e instanceof Error ? e.message : String(e))
+  }
+  return { kind: 'delivered', peerId: from, plaintext: matched.plaintext, consumedOpk: false }
 }

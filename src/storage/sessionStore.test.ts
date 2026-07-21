@@ -2,7 +2,13 @@ import 'fake-indexeddb/auto'
 import { IDBFactory } from 'fake-indexeddb'
 import { beforeEach, describe, it, expect } from 'vitest'
 import type { RatchetSnapshot } from '../crypto/ratchet'
-import { IdbSessionStore, MemorySessionStore, type SessionStore, singleSessionBook } from './sessionStore'
+import {
+  type HistoryRow,
+  IdbSessionStore,
+  MemorySessionStore,
+  type SessionStore,
+  singleSessionBook,
+} from './sessionStore'
 
 beforeEach(() => {
   globalThis.indexedDB = new IDBFactory()
@@ -99,6 +105,158 @@ describe('retention maintenance (P8)', () => {
     await store.bumpFailure('f') // later bumps must not refresh ts
     const r = await store.pruneExpired(Date.now() + 40 * DAY)
     expect(r.failures).toBe(1)
+  })
+})
+
+const PEER_A = 'a'.repeat(52)
+const PEER_B = 'b'.repeat(52)
+const hrow = (peerId: string, id: string, dir: 'in' | 'out' = 'in', ts = 1): HistoryRow => ({
+  id,
+  peerId,
+  dir,
+  ts,
+  salt: new Uint8Array(16).fill(7),
+  ct: Uint8Array.from([1, 2, 3, id.charCodeAt(0)]),
+})
+
+function historySuite(name: string, make: () => SessionStore) {
+  describe(`history (P10b) — ${name}`, () => {
+    it('writes a history row atomically with the seen marker (normal receive)', async () => {
+      const s = make()
+      await s.saveBookWithSeen(PEER_A, singleSessionBook(snap), 'env-1', hrow(PEER_A, 'c1'))
+      expect(await s.hasSeen('env-1')).toBe(true)
+      const rows = await s.historyLoad(PEER_A)
+      expect(rows.map((r) => r.id)).toEqual(['c1'])
+      expect(await s.load(PEER_A)).toEqual(snap) // the book landed too
+    })
+
+    it('writes a history row atomically with seen + replay (initial receive)', async () => {
+      const s = make()
+      await s.saveBookWithSeenReplay(PEER_A, singleSessionBook(snap), 'env-2', 'init-2', hrow(PEER_A, 'c2'))
+      expect(await s.hasSeen('env-2')).toBe(true)
+      expect(await s.hasReplayedInitial('init-2')).toBe(true)
+      expect((await s.historyLoad(PEER_A)).map((r) => r.id)).toEqual(['c2'])
+    })
+
+    it('writes a history row atomically with the outbox entry (send)', async () => {
+      const s = make()
+      await s.saveBookWithOutbox(
+        PEER_A,
+        singleSessionBook(snap),
+        { id: 'env-3', to: PEER_A, env: {}, createdAt: 1 },
+        hrow(PEER_A, 'c3', 'out'),
+      )
+      expect((await s.pendingOutbox()).map((e) => e.id)).toEqual(['env-3'])
+      expect((await s.historyLoad(PEER_A)).map((r) => r.id)).toEqual(['c3'])
+    })
+
+    it('omitting the history row persists the book + marker but no row', async () => {
+      const s = make()
+      await s.saveBookWithSeen(PEER_A, singleSessionBook(snap), 'env-4')
+      expect(await s.hasSeen('env-4')).toBe(true)
+      expect(await s.historyLoad(PEER_A)).toEqual([])
+    })
+
+    it('scopes historyLoad to one peer and returns all via historyLoadAll', async () => {
+      const s = make()
+      await s.saveBookWithSeen(PEER_A, singleSessionBook(snap), 'e1', hrow(PEER_A, 'a1'))
+      await s.saveBookWithSeen(PEER_A, singleSessionBook(snap), 'e2', hrow(PEER_A, 'a2'))
+      await s.saveBookWithSeen(PEER_B, singleSessionBook(snap), 'e3', hrow(PEER_B, 'b1'))
+      expect((await s.historyLoad(PEER_A)).map((r) => r.id).sort()).toEqual(['a1', 'a2'])
+      expect((await s.historyLoad(PEER_B)).map((r) => r.id)).toEqual(['b1'])
+      expect((await s.historyLoadAll()).length).toBe(3)
+    })
+
+    it('upserts by (peer,id): a redelivered row does not duplicate', async () => {
+      const s = make()
+      await s.saveBookWithSeen(PEER_A, singleSessionBook(snap), 'e1', hrow(PEER_A, 'dup', 'in', 1))
+      await s.saveBookWithSeen(PEER_A, singleSessionBook(snap), 'e1b', hrow(PEER_A, 'dup', 'in', 2))
+      const rows = await s.historyLoad(PEER_A)
+      expect(rows.length).toBe(1)
+      expect(rows[0].ts).toBe(2) // last write wins
+    })
+
+    it('removes exactly one row and wipeAll clears history', async () => {
+      const s = make()
+      await s.saveBookWithSeen(PEER_A, singleSessionBook(snap), 'e1', hrow(PEER_A, 'a1'))
+      await s.saveBookWithSeen(PEER_A, singleSessionBook(snap), 'e2', hrow(PEER_A, 'a2'))
+      await s.historyRemove(PEER_A, 'in', 'a1')
+      expect((await s.historyLoad(PEER_A)).map((r) => r.id)).toEqual(['a2'])
+      await s.wipeAll()
+      expect(await s.historyLoadAll()).toEqual([])
+    })
+
+    it('keys by (peer,dir,id): an inbound and outbound row with the SAME id coexist', async () => {
+      const s = make()
+      // The HIGH finding: a peer-chosen inbound id must not address an outbound slot.
+      await s.saveBookWithOutbox(
+        PEER_A,
+        singleSessionBook(snap),
+        { id: 'ex', to: PEER_A, env: {}, createdAt: 1 },
+        hrow(PEER_A, 'SAME', 'out', 5),
+      )
+      await s.saveBookWithSeen(PEER_A, singleSessionBook(snap), 'ei', hrow(PEER_A, 'SAME', 'in', 6))
+      const rows = await s.historyLoad(PEER_A)
+      expect(rows.length).toBe(2) // both survive; neither overwrote the other
+      expect(rows.map((r) => `${r.dir}:${r.ts}`).sort()).toEqual(['in:6', 'out:5'])
+      // Removing the inbound one leaves the outbound one intact.
+      await s.historyRemove(PEER_A, 'in', 'SAME')
+      const left = await s.historyLoad(PEER_A)
+      expect(left.map((r) => r.dir)).toEqual(['out'])
+    })
+
+    it('marks an outbound row failed (survives a reload as "not sent")', async () => {
+      const s = make()
+      await s.saveBookWithOutbox(
+        PEER_A,
+        singleSessionBook(snap),
+        { id: 'ex', to: PEER_A, env: {}, createdAt: 1 },
+        hrow(PEER_A, 'm1', 'out', 1),
+      )
+      expect((await s.historyLoad(PEER_A))[0].failed).toBeUndefined()
+      await s.historyMarkFailed(PEER_A, 'out', 'm1')
+      expect((await s.historyLoad(PEER_A))[0].failed).toBe(true)
+      // A no-op when the row is absent (wrong dir / unknown id).
+      await s.historyMarkFailed(PEER_A, 'in', 'm1')
+      await s.historyMarkFailed(PEER_A, 'out', 'nope')
+    })
+  })
+}
+
+historySuite('MemorySessionStore', () => new MemorySessionStore())
+historySuite('IdbSessionStore', () => new IdbSessionStore())
+
+describe('v4 -> v5 history-store migration (P10b)', () => {
+  it('adds the history store to a v4 DB while preserving existing sessions', async () => {
+    const NAME = 'nightjar-sessions'
+    // Build a v4 database by hand: the five pre-P10 stores, one session row.
+    await new Promise<void>((resolve, reject) => {
+      const req = indexedDB.open(NAME, 4)
+      req.onupgradeneeded = () => {
+        const db = req.result
+        for (const st of ['sessions', 'seen', 'replay', 'failures', 'outbox']) {
+          if (!db.objectStoreNames.contains(st)) db.createObjectStore(st)
+        }
+      }
+      req.onsuccess = () => {
+        const db = req.result
+        const tx = db.transaction('sessions', 'readwrite')
+        tx.objectStore('sessions').put(singleSessionBook(snap), PEER_A)
+        tx.oncomplete = () => {
+          db.close()
+          resolve()
+        }
+        tx.onerror = () => reject(tx.error)
+      }
+      req.onerror = () => reject(req.error)
+    })
+
+    // Opening via IdbSessionStore triggers the v4 -> v5 upgrade (adds `history`).
+    const store = new IdbSessionStore()
+    expect(await store.load(PEER_A)).toEqual(snap) // pre-existing session preserved
+    // The new history store is usable.
+    await store.saveBookWithSeen(PEER_A, singleSessionBook(snap), 'e1', hrow(PEER_A, 'a1'))
+    expect((await store.historyLoad(PEER_A)).map((r) => r.id)).toEqual(['a1'])
   })
 })
 

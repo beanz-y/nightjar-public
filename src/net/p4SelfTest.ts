@@ -7,6 +7,7 @@
 // vend, X3DH, the ratchet, store-and-deliver, and acks.
 
 import { generateIdentity } from '../crypto/identity'
+import { HistoryStore } from '../storage/historyStore'
 import { MemoryKeyStore } from '../storage/keystore'
 import { InMemoryLock } from '../storage/lock'
 import { PrekeyStore } from '../storage/prekeyStore'
@@ -25,10 +26,21 @@ function makeClient(received: string[], errors: string[]): NightjarClient {
   const keys = new MemoryKeyStore()
   const prekeys = new PrekeyStore(keys, lock)
   const contacts = new ContactStore(keys, lock)
-  return new NightjarClient(id, new MemorySessionStore(), prekeys, contacts, lock, {
-    onMessage: (_from, text) => received.push(text),
-    onError: (detail) => errors.push(detail),
-  })
+  // Wire persistent history (P10b) so the self-test also exercises the
+  // send/receive persist path and hydration over the real relay.
+  const history = new HistoryStore(keys, lock)
+  return new NightjarClient(
+    id,
+    new MemorySessionStore(),
+    prekeys,
+    contacts,
+    lock,
+    {
+      onMessage: (_from, msg) => received.push(msg.text),
+      onError: (detail) => errors.push(detail),
+    },
+    history,
+  )
 }
 
 async function waitUntil(pred: () => boolean, ms = 4000): Promise<void> {
@@ -84,12 +96,30 @@ export async function runP4SelfTest(bootstrapInvite: string): Promise<P4SelfTest
     const aliceToBob = await alice.trustOf(bob.userId)
     log.push(`trust: bob->alice = ${bobToAlice}, alice->bob = ${aliceToBob}`)
 
+    // Persistent history (P10b): both sent and received messages are durably
+    // stored per peer, keyed by content id, sealed at rest and decrypted back on
+    // load. Bob's thread with Alice = 2 received + 1 sent; Alice's = 2 sent + 1
+    // received. This is exactly what a reload would hydrate.
+    const bobHist = (await bob.loadAllHistory())[alice.userId] ?? []
+    const aliceHist = (await alice.loadAllHistory())[bob.userId] ?? []
+    const bobTexts = bobHist.map((m) => `${m.dir}:${m.text}`).sort()
+    const aliceTexts = aliceHist.map((m) => `${m.dir}:${m.text}`).sort()
+    log.push(`bob history (${bobHist.length}): ${bobTexts.join(' | ')}`)
+    log.push(`alice history (${aliceHist.length}): ${aliceTexts.join(' | ')}`)
+    const historyOk =
+      bobHist.length === 3 &&
+      bobTexts.join(',') === ['in:and a second one', 'in:hello from alice', 'out:hi back from bob'].sort().join(',') &&
+      aliceHist.length === 3 &&
+      aliceTexts.join(',') === ['in:hi back from bob', 'out:and a second one', 'out:hello from alice'].sort().join(',')
+    log.push(`history persisted + decrypted both ways: ${historyOk ? 'PASS' : 'FAIL'}`)
+
     const ok =
       bRecv[0] === 'hello from alice' &&
       aRecv[0] === 'hi back from bob' &&
       bRecv[1] === 'and a second one' &&
       bobToAlice === 'invite' &&
       aliceToBob === 'unverified' &&
+      historyOk &&
       errors.length === 0
     // Surface the FULL ids (both stay registered in the Directory) so the app can
     // message one and exercise the contact + verify UI against a real peer.

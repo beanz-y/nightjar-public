@@ -65,9 +65,14 @@ cryptographic code was written; the roadmap in section 12 tracks what has shippe
    bundle it serves and read content (section 6.1). This conditionality is stated
    everywhere the promise appears; it is not fine print.
 2. **Forward secrecy, for processed messages.** Compromising a device's current
-   keys does not expose past delivered-and-processed messages: each is encrypted
-   under a key deleted after use. The one exception is a bounded set of skipped
-   message keys retained transiently for out-of-order delivery (section 5.3).
+   *ratchet* keys (or capturing the ciphertext in transit and later stealing those
+   keys) does not expose past delivered-and-processed messages: each is encrypted
+   under a message key deleted after use. The one exception is a bounded set of
+   skipped message keys retained transiently for out-of-order delivery (section
+   5.3). This is a property of the *protocol keys*, not of local storage: the
+   device now **retains past message plaintext in at-rest history** (section 8.5),
+   so a forensic image of the device is a separate exposure that forward secrecy
+   does not address (section 1.3).
 3. **Post-compromise security, against a later-passive attacker.** After a
    *ratchet/session-key* compromise, the conversation recovers once one
    uncompromised DH round-trip occurs. This does not heal compromise of the
@@ -96,8 +101,9 @@ cryptographic code was written; the roadmap in section 12 tracks what has shippe
 4. **Post-quantum.** Classical X25519 in v1, downgrade-protected (section 4.4) so
    a v2 PQXDH upgrade cannot be silently stripped.
 5. **Anonymity / sealed sender / cover traffic.**
-6. **Forward-secret synced history and cloud backup.** History lives on your
-   device; we back up your *identity* (section 8.3), not your history.
+6. **Forward-secret synced history and cloud backup.** History is persisted on
+   your device (section 8.5) but is per-device: it is not synced, and the identity
+   backup (section 8.3) does not carry it, so it does not transfer to a new device.
 7. **Endpoint security.** A compromised device is outside the guarantees.
 8. **A trustless web client.** A PWA cannot prove to the user that the code it
    runs is honest (section 1.4). We do not pretend otherwise; we harden it,
@@ -118,6 +124,7 @@ cryptographic code was written; the roadmap in section 12 tracks what has shippe
 | Thief of our server / subpoena at rest | No stored plaintext; only undelivered ciphertext (30-day TTL, 7.1) and any opt-in server-stored identity backups, which reduce to passphrase strength (8.3) | Transient routing state only | n/a |
 | Global passive network adversary | No (content) | Yes (out of scope for any practical messenger) | n/a |
 | Thief of your unlocked device | Yes (it is your device) | Yes | n/a |
+| Thief / forensic image of your at-rest (locked or powered-off) device | **Yes for stored message history.** As of this release history is persisted locally with its at-rest key stored unwrapped, so a filesystem image yields past plaintext. The optional app-lock (section 8.5) that wraps that key under a passphrase/biometric is a subsequent release; until then, at-rest history is effectively plaintext (an honest downgrade from the pre-history "RAM-only, nothing at rest" posture). Identity and session keys are also stored unencrypted (needed to run headless), so an image can additionally decrypt *future* traffic and reveal the contact graph. | Yes (local contact list) | n/a |
 
 Honest one-sentence version: **Nightjar makes the content of your conversations
 unreadable to everyone but the people in them, once those people have verified
@@ -631,14 +638,49 @@ Implemented in P8, **download-only** in v1.
   rather than silently leaving the Directory serving dead prekeys. In-flight
   initial messages sent in the seconds before invalidation are unrecoverable, and
   we say so.
-- **History does not come back.** Per-device only; syncing ratchet sessions would
-  break forward secrecy. Encrypted history export/import is a v2 candidate.
+- **History does not come back.** The backup carries the identity and contact
+  trust, not message history (8.5): history is per-device, and syncing ratchet
+  sessions would break forward secrecy. A restored device starts with an empty
+  history and a fresh at-rest history key. Encrypted history export/import is a v2
+  candidate.
 
 ### 8.4 XSS is the real endpoint enemy
 
 Strict CSP (no inline script, no third-party origins, everything self-hosted and
 bundled) and DOM hygiene (render message content as text, never `innerHTML`).
 This is elevated and specified further in section 10.2.
+
+### 8.5 Persistent message history (at rest)
+
+Message history is stored on the device (before this, it lived only in RAM and was
+lost on reload). Each message is a per-message row in the sessions IndexedDB,
+sealed with XChaCha20-Poly1305 under a key+nonce derived (HKDF, info
+`Nightjar_History_v1`) from a random 32-byte **History Master Key (HMK)** and a
+**fresh per-record salt** stored beside the row; the AEAD AAD binds the peer id,
+the content message id, and the version, so a row cannot be relabelled to another
+conversation or id. A row is written in the **same IndexedDB transaction** as the
+ratchet advance and the dedup marker, so an acked message is always durably in
+history (no ack-without-history loss), and rows are keyed by content id so one
+delete removes exactly one row and a redelivery upserts the same row.
+
+Honest at-rest posture, stated plainly because it is a downgrade from the prior
+"nothing at rest" property:
+
+- **As of this release the HMK is stored unwrapped**, so history is effectively
+  **plaintext at rest**: a forensic image of the device yields past plaintext
+  (1.3). This is the same at-rest exposure the identity and ratchet keys already
+  have, but it now includes readable message content.
+- **An optional app-lock is a subsequent release (not shipped here).** It will
+  wrap the HMK under a key derived from a PIN/passphrase (Argon2id) and/or a
+  biometric (WebAuthn PRF), each with its own fresh salt, gating an unlock screen
+  before the messenger. When enabled it bounds at-rest history to the strength of
+  that passphrase/biometric (a short PIN is weak against an extracted blob).
+- **The app-lock, once it exists, protects history only, and is not
+  forward-secret.** It is a single at-rest key; the identity and ratchet session
+  keys stay unencrypted (the app must run headless to receive), so a locked or
+  imaged device can still decrypt *future* traffic and reveal the contact graph.
+  We do **not** claim parity with Signal/WhatsApp defaults, which encrypt local
+  data under an OS-keychain/device key; our no-lock default is weaker.
 
 ---
 
@@ -953,8 +995,12 @@ Native (Tauri) is **not** on the critical path; it is a demand-gated v2 (10.5).
 4. One device per identity; no multi-device.
 5. 1:1 only; no groups.
 6. Classical crypto; not yet post-quantum (but downgrade-protected, 4.4).
-7. History is per-device and lost on device loss; even with an identity backup,
-   history itself does not transfer (8.3).
+7. History is persisted on the device (section 8.5) but per-device: it is not
+   synced, and the identity backup does not carry it, so it does not transfer to a
+   new device and is lost on device loss. It is stored **readable at rest** (the
+   at-rest key is unwrapped in this release; the passphrase/biometric app-lock that
+   would protect it is a later release, 8.5), so it is exposed to a forensic image
+   of the device (1.3).
 8. Message-header metadata and message length are visible to the relay in v1;
    header encryption and padding deferred.
 9. OPK depletion can force new inbound sessions onto the weaker no-OPK path;
@@ -1006,6 +1052,9 @@ Native (Tauri) is **not** on the critical path; it is a demand-gated v2 (10.5).
 | Argon2id (backup) | m = 64 MiB, t = 3, p = 1 (measured ~2.3 s desktop via `@noble/hashes`; 256 MiB was ~9 s and risks OOM in an iOS Safari worker; RFC 9106 constrained-env recommendation); 16-B salt; XChaCha20-Poly1305 body with the header as AAD; key+nonce via HKDF-SHA256 info `"Nightjar_Backup_v1"`; restore bounds m to [8 MiB, 256 MiB], t <= 6, p == 1 before running the KDF | 8.3 |
 | Passphrase floor | typed passphrases >= 12 chars (after NFC-trim); the offered generated passphrase is 20 base32 chars (~100 bits) | 8.3 |
 | Backup blob format | magic `"NJBK"`, format version `0x01`, then m/t/p/salt header, then AEAD body; download-only in v1 | 8.3 |
+| Message payload format | magic `"NJM1"`, format version `0x01`, kind (`0x01` text / `0x02` delete), 16-B content msgId, then (text) a flags byte (bit0 = ephemeral, other bits reserved) + utf8 body; the ratchet plaintext. A payload with no magic is legacy plain text; a magic-but-invalid/unknown-version/unknown-kind payload is clean-ignored (never thrown or rendered) | 8.5 |
+| Content vs transport id | the 16-B content msgId lives inside the ratchet plaintext (history key / delete target); the relay-visible transport envelope id is separate (dedup/ack/outbox). A first-send text may reuse its content id as the transport id (brand-new, safe); a delete gets its own fresh transport id | 8.5 |
+| History at rest | per-message row in the sessions IndexedDB keyed `${peerId}:${dir}:${id}`, XChaCha20-Poly1305 body under key+nonce = HKDF(HMK, **fresh 16-B per-record salt**, info `"Nightjar_History_v1"`); HMK is 32 random bytes; AAD binds peerId + **direction** + content msgId + a dedicated **history-format version** (NOT the wire ciphersuite octet, so a protocol bump never invalidates stored rows); row written in the same tx as the ratchet advance + dedup marker. Direction is in the key + AAD so a peer-chosen inbound content id can never address or open one of your outbound rows. HMK stored unwrapped in this release (readable at rest); passphrase/biometric wrap is a later release | 8.5 |
 | Version octet | starts at `0x01` (classical X25519) | 4.4 |
 | Reproducible build inputs | digest-pinned container (Node + OS + arch), committed lockfile (`npm ci`), no build-time dynamic values (`__APP_VERSION__` injected, never a clock). *`SOURCE_DATE_EPOCH`/`strip-nondeterminism` are inert here (vite emits no timestamps; the manifest hashes content only) and kept only as documented no-ops* | 10.1, P7 |
 | Release hash | `sha256(manifest.txt)`; `manifest.txt` = each `dist/` file as `<sha256-hex>  <relpath>\n`, byte-sorted, LF (one recipe: `scripts/release-hash.mjs` == the pure-shell pipeline). Hashes the **build output**, so the honest claim is "rebuild and diff", not "diff the served bytes" | 10.1, P7 |

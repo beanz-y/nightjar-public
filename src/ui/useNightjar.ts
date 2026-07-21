@@ -7,7 +7,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { PRESENCE_HEARTBEAT_MS } from '../crypto/constants'
 import type { Identity } from '../crypto/identity'
-import { NightjarClient } from '../net/client'
+import { NightjarClient, type StoredMessage } from '../net/client'
 import { getRelayOrigin } from '../platform'
 import {
   clearNotifications,
@@ -21,8 +21,11 @@ import {
   unsubscribePush,
 } from '../platform/webpush'
 import { openBackup, parseBackupHeader, sealBackup } from '../crypto/backup'
+import { bytesToHex } from '@noble/hashes/utils'
+import { newMsgId } from '../crypto/message'
 import { createBackupKdf } from '../platform/backupKdf'
 import { IdbKeyStore, type KeyStore } from '../storage/keystore'
+import { HistoryStore } from '../storage/historyStore'
 import { bootstrapIdentity } from '../storage/identityStore'
 import { IdbSessionStore } from '../storage/sessionStore'
 import { type Lock, createLock } from '../storage/lock'
@@ -76,10 +79,34 @@ interface Stores {
   sentinel: Sentinel
   sessions: IdbSessionStore
   contacts: ContactStore
+  history: HistoryStore
 }
 
-const uid = () => (globalThis.crypto?.randomUUID?.() ?? `m-${Math.random().toString(36).slice(2)}`)
 const appOrigin = () => globalThis.location?.origin || getRelayOrigin()
+
+/** Merge hydrated history (authoritative for persisted messages) with whatever is
+ *  already in state, deduping by id so a live message and its hydrated copy never
+ *  double-render, and preserving live-only entries (opened-but-empty chats, a
+ *  not-yet-persisted failed send) that history does not contain. */
+function mergeHistory(
+  hist: Record<string, StoredMessage[]>,
+  prev: Record<string, Message[]>,
+): Record<string, Message[]> {
+  const out: Record<string, Message[]> = {}
+  for (const [peer, msgs] of Object.entries(hist)) {
+    out[peer] = msgs.map((m) => (m.failed ? { id: m.id, dir: m.dir, text: m.text, ts: m.ts, failed: true } : { id: m.id, dir: m.dir, text: m.text, ts: m.ts }))
+  }
+  for (const [peer, msgs] of Object.entries(prev)) {
+    if (!out[peer]) {
+      out[peer] = msgs
+      continue
+    }
+    const have = new Set(out[peer].map((m) => m.id))
+    const extra = msgs.filter((m) => !have.has(m.id))
+    if (extra.length) out[peer] = [...out[peer], ...extra].sort((a, b) => a.ts - b.ts)
+  }
+  return out
+}
 // Well under the relay's 64 KiB ciphertext cap; a text messenger never needs more.
 const MAX_MESSAGE_CHARS = 8000
 /** Full-width userId shape: lowercase unpadded base32 of a 32-byte hash. */
@@ -136,8 +163,15 @@ export function useNightjar() {
     setContacts(await live.client.listContacts())
   }, [])
 
+  // Append a message, idempotent by id: a message already present (e.g. an
+  // optimistic outbound bubble, or a redelivery that reached the UI twice) is not
+  // duplicated. This is what lets a live bubble and its hydrated copy coexist.
   const appendMessage = useCallback((peer: string, m: Message) => {
-    setConversations((prev) => ({ ...prev, [peer]: [...(prev[peer] ?? []), m] }))
+    setConversations((prev) => {
+      const cur = prev[peer] ?? []
+      if (cur.some((x) => x.id === m.id)) return prev
+      return { ...prev, [peer]: [...cur, m] }
+    })
   }, [])
 
   // Consume a pending-restore flag (P8): the forced fresh-prekey publish that
@@ -185,7 +219,8 @@ export function useNightjar() {
         const sentinel = createSentinel()
         const sessions = new IdbSessionStore()
         const contactStore = new ContactStore(keys, lock)
-        storesRef.current = { keys, lock, sentinel, sessions, contacts: contactStore }
+        const history = new HistoryStore(keys, lock)
+        storesRef.current = { keys, lock, sentinel, sessions, contacts: contactStore, history }
         const boot = await bootstrapIdentity(keys, sentinel, lock)
         if (cancelled) return
         if (boot.state === 'evicted-needs-restore' || !boot.identity) {
@@ -195,8 +230,11 @@ export function useNightjar() {
         const id = boot.identity
         const prekeys = new PrekeyStore(keys, lock)
         const client = new NightjarClient(id, sessions, prekeys, contactStore, lock, {
-          onMessage: (from, text) => {
-            appendMessage(from, { id: uid(), dir: 'in', text, ts: Date.now() })
+          onMessage: (from, msg) => {
+            // Key the bubble by the content msgId (P10b), so a live message and its
+            // later-hydrated copy share one id and never double-render. Ephemeral
+            // messages (P10e) are shown live but are not in history.
+            appendMessage(from, { id: msg.id, dir: 'in', text: msg.text, ts: msg.ts })
             void client.listContacts().then(setContacts)
           },
           onError: (detail) => setNotice(detail),
@@ -234,7 +272,7 @@ export function useNightjar() {
             void client.listContacts().then(setContacts).catch(() => {})
             setPhase((prev) => (prev === 'error' ? (client.isRegistered ? 'ready' : 'onboarding') : prev))
           },
-        })
+        }, history)
         liveRef.current = { client, identity: id }
         setIdentity(id)
 
@@ -251,6 +289,19 @@ export function useNightjar() {
         if (cancelled) return
         setContacts(await client.listContacts())
         setAliases(await client.listAliases())
+
+        // Hydrate persistent history (P10b). Merge with whatever already arrived
+        // live during connect (keyed by id, so nothing double-renders) rather than
+        // clobbering it. History is the source of truth for anything persisted;
+        // live-only messages (ephemeral, or a not-yet-persisted failed send) that
+        // are not in history are preserved.
+        try {
+          const hist = await client.loadAllHistory()
+          if (!cancelled) setConversations((prev) => mergeHistory(hist, prev))
+        } catch {
+          /* history hydration is best-effort; a failure just shows no past messages */
+        }
+
         setPhase(authed.registered ? 'ready' : 'onboarding')
 
         // Web Push (P6). Record the relay's key for the UI, and if this device
@@ -342,12 +393,17 @@ export function useNightjar() {
         setNotice(`message is too long (limit ${MAX_MESSAGE_CHARS.toLocaleString()} characters)`)
         return
       }
-      const msgId = uid()
-      appendMessage(peer, { id: msgId, dir: 'out', text, ts: Date.now() })
+      // The content msgId (P10b): one stable id for the optimistic bubble, the
+      // envelope, the history row, and a later send-failure ref. Survives reload
+      // because history is keyed by the same id.
+      const msgId = bytesToHex(newMsgId())
+      const ts = Date.now()
+      appendMessage(peer, { id: msgId, dir: 'out', text, ts })
       try {
-        // Pass msgId so the envelope id equals this bubble's id; a later async
-        // permanent rejection (onSendFailed) can then mark this exact bubble.
-        await live.client.sendText(peer, text, msgId)
+        // Pass msgId so the envelope id equals this bubble's id (a later permanent
+        // rejection can mark this exact bubble), and `ts` so the persisted history
+        // row is stamped identically to the bubble (stable ordering across reload).
+        await live.client.sendText(peer, text, msgId, ts)
         setContacts(await live.client.listContacts())
       } catch (e) {
         // The optimistic bubble must never read as delivered: flag it failed.

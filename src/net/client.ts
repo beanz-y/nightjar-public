@@ -13,9 +13,10 @@
 //     relay should stop redelivering): it is acked like a duplicate.
 //   - One-time prekeys auto-replenish when the local stock runs low.
 
+import { bytesToHex, hexToBytes } from '@noble/hashes/utils'
 import { type Identity, deriveUserId } from '../crypto/identity'
 import type { PushSubscriptionInfo } from '../platform'
-import { utf8 } from '../crypto/primitives'
+import { decodeMessage, encodeTextMessage, newMsgId } from '../crypto/message'
 import { OPK_BATCH, OPK_REPLENISH_THRESHOLD, OUTBOX_RETRY_HORIZON_MS, SPK_ROTATION_MS } from '../crypto/constants'
 import { OWN_BUNDLE_VERSION, buildOwnBundle, generateOneTimePrekeys, generateSignedPrekey } from '../crypto/prekeys'
 import { deserializeRatchet, initRatchetInitiator, ratchetEncrypt, serializeRatchet } from '../crypto/ratchet'
@@ -23,6 +24,7 @@ import { x3dhInitiate } from '../crypto/x3dh'
 import { type Contact, type ContactStore, type TrustLevel, KeyConflictError } from '../trust/contactStore'
 import type { InviteArtifact } from '../trust/inviteArtifact'
 import { currentSession, promoteSession, updateSession } from '../session/sessionBook'
+import type { HistoryStore } from '../storage/historyStore'
 import type { Lock } from '../storage/lock'
 import type { PrekeyStore } from '../storage/prekeyStore'
 import type { OutboxEntry, SessionStore } from '../storage/sessionStore'
@@ -41,7 +43,6 @@ import { processInbound } from './inbound'
 import { DirectoryClient } from './directoryClient'
 import { type AuthedInfo, Transport } from './transport'
 
-const decode = (b: Uint8Array) => new TextDecoder().decode(b)
 const sessionLock = (peerId: string) => `nightjar-session:${peerId}`
 const REPLENISH_LOCK = 'nightjar-opk-replenish'
 
@@ -50,9 +51,33 @@ const REPLENISH_LOCK = 'nightjar-opk-replenish'
 const RECONNECT_MIN_MS = 1000
 const RECONNECT_MAX_MS = 60 * 1000
 
+/** A message as the UI/history layer sees it: keyed by the content msgId (P10b)
+ *  for a structured message, or the transport envelope id for a legacy one. The
+ *  same id is used for the optimistic bubble, the history row, and (P10d) a
+ *  delete target, so a live bubble and its later-hydrated copy share one id. */
+export interface ClientMessage {
+  id: string
+  text: string
+  ts: number
+  /** Session-only (P10e): shown live but never persisted. */
+  ephemeral?: boolean
+}
+
+/** A message loaded back from persistent history (P10b): carries its direction
+ *  since history holds both sent and received messages. */
+export interface StoredMessage {
+  id: string
+  dir: 'in' | 'out'
+  text: string
+  ts: number
+  /** An outbound message whose delivery permanently failed/timed out; kept so the
+   *  reloaded bubble still reads as "not sent", never as delivered. */
+  failed?: boolean
+}
+
 export interface ClientCallbacks {
   /** A decrypted message arrived from `from`. */
-  onMessage: (from: string, text: string) => void
+  onMessage: (from: string, msg: ClientMessage) => void
   /** Optional: an inbound envelope failed to process or was dropped (transient
    *  operational noise; the UI may show it as an overwritable notice). */
   onError?: (detail: string) => void
@@ -85,6 +110,9 @@ export class NightjarClient {
     private readonly contacts: ContactStore,
     private readonly lock: Lock,
     private readonly cb: ClientCallbacks,
+    /** Persistent history (P10b). When omitted, messages are delivered but not
+     *  persisted (tests, self-tests). The real app always supplies one. */
+    private readonly history?: HistoryStore,
   ) {
     this.transport = new Transport(identity)
     this.directory = new DirectoryClient(this.transport)
@@ -257,7 +285,22 @@ export class NightjarClient {
   private handleSendError(ref: string, code: string, msg: string): void {
     const permanent = code === 'bad_to' || code === 'bad_envelope' || code === 'too_large'
     if (!permanent) return
-    void this.store.removeOutbox(ref).catch(() => {})
+    // Flag the persisted outbound row failed BEFORE dropping the outbox entry, so
+    // a reload re-renders it as "not sent" rather than as delivered. The row is
+    // keyed by (peer, out, contentId); the peer comes from the outbox entry (both
+    // keyed by ref == contentId). Best-effort: the live onSendFailed already flags
+    // the in-RAM bubble regardless.
+    void (async () => {
+      try {
+        if (this.history) {
+          const entry = (await this.store.pendingOutbox()).find((e) => e.id === ref)
+          if (entry) await this.store.historyMarkFailed(entry.to, 'out', ref)
+        }
+      } catch {
+        /* best-effort */
+      }
+      await this.store.removeOutbox(ref).catch(() => {})
+    })()
     // Mark the exact message failed (envelope id == UI message id) so it never
     // reads as delivered; onError is only a fallback if the UI does not correlate.
     this.cb.onSendFailed?.(ref, `${code}: ${msg}`)
@@ -363,32 +406,60 @@ export class NightjarClient {
     return this.contacts.markVerified(peerId, Date.now())
   }
 
-  /** Send text to a peer. Uses the current session, or opens a new one (X3DH) if
-   *  none exists. Runs under the per-peer lock. Returns the envelope id, which
-   *  the caller uses as its UI message id so a later async send-failure (carrying
-   *  the same id as `ref`) can be attributed to the exact message. `msgId`, if
-   *  given, becomes the envelope id (so the optimistic bubble already matches). */
-  async sendText(to: string, text: string, msgId?: string): Promise<string> {
+  /**
+   * Send text to a peer. Uses the current session, or opens a new one (X3DH) if
+   * none exists. Runs under the per-peer lock. Returns the CONTENT msgId (hex),
+   * which the caller uses as its UI message id.
+   *
+   * Two ids (P10b, DESIGN two-id rule): a 16-byte CONTENT msgId lives inside the
+   * ratchet plaintext (the NJM1 record) and is the history key + future delete
+   * target; the TRANSPORT envelope id is what the relay dedups/acks/outboxes on.
+   * For a first-send TEXT message the content id is brand-new, so it is SAFE to
+   * use it as the transport id too (no existing envelope to clobber, no delete
+   * reusing an existing id) - and doing so keeps one stable id across the
+   * optimistic bubble, the outbox, the history row, and a later send-failure
+   * `ref`, which survives a reload (a fresh-UUID transport id would not map back
+   * to the hydrated content-keyed bubble). A DELETE control (P10d) will instead
+   * get its OWN fresh transport id, since it targets an EXISTING content id.
+   *
+   * `msgId`, if given, is that content id (the UI pre-generated it for the
+   * optimistic bubble); otherwise a fresh one is minted. `uiTs`, if given, is the
+   * timestamp the optimistic bubble was stamped with, so the persisted history row
+   * carries the SAME ts and a reload cannot reorder this message relative to an
+   * interleaved inbound one (whose live and stored ts already match).
+   */
+  async sendText(to: string, text: string, msgId?: string, uiTs?: number): Promise<string> {
+    const contentIdHex = msgId ?? bytesToHex(newMsgId())
+    // The ratchet plaintext is the structured NJM1 record (not raw utf8): it
+    // carries the content id + kind + ephemeral flag both sides need. P10b always
+    // sends non-ephemeral text; the ephemeral toggle is P10e.
+    const plaintext = encodeTextMessage(hexToBytes(contentIdHex), text, false)
     const entry = await this.lock.withLock(sessionLock(to), async () => {
       const now = Date.now()
-      const id = msgId ?? crypto.randomUUID()
+      const ts = uiTs ?? now
       const book = await this.store.loadBook(to)
       const current = currentSession(book)
+      // Seal the sent message for history (skipped when history is not wired).
+      // Done inside the lock, before the commit, so a seal failure aborts the send
+      // with nothing queued; the history row rides the same tx as the ratchet
+      // advance + outbox (commit before release). Stamped with the UI ts so live
+      // and hydrated ordering agree.
+      const historyRow = this.history ? await this.history.seal(contentIdHex, to, 'out', ts, text) : undefined
 
       if (current) {
         // Established (or pending) session: a normal ratchet message. `now` as
         // legacyTs stamps any pre-P8 skipped entries so the re-serialized
         // snapshot below cannot mark them instantly expired.
-        const { state, header, ciphertext } = ratchetEncrypt(deserializeRatchet(current.snapshot, now), utf8(text))
+        const { state, header, ciphertext } = ratchetEncrypt(deserializeRatchet(current.snapshot, now), plaintext)
         const env: WireEnvelope = {
-          id,
+          id: contentIdHex,
           kind: 'normal',
           header: encodeMessageHeaderWire(header),
           ciphertext: b64encode(ciphertext),
         }
         const advanced = updateSession(book!, current.id, serializeRatchet(state), now)
-        const e: OutboxEntry = { id, to, env, createdAt: now }
-        await this.store.saveBookWithOutbox(to, advanced, e) // commit before release
+        const e: OutboxEntry = { id: contentIdHex, to, env, createdAt: now }
+        await this.store.saveBookWithOutbox(to, advanced, e, historyRow) // commit before release
         return e
       }
 
@@ -423,21 +494,48 @@ export class NightjarClient {
 
       const ini = x3dhInitiate(this.identity, bundle, now)
       const state0 = initRatchetInitiator(ini.sk, ini.ad, bundle.spk.pub)
-      const { state, header, ciphertext } = ratchetEncrypt(state0, utf8(text))
+      const { state, header, ciphertext } = ratchetEncrypt(state0, plaintext)
       const env: WireEnvelope = {
-        id,
+        id: contentIdHex,
         kind: 'initial',
         header: encodeMessageHeaderWire(header),
         ciphertext: b64encode(ciphertext),
         initialHeader: encodeInitialHeader(ini.header),
       }
       const promoted = promoteSession(book, serializeRatchet(state), now)
-      const e: OutboxEntry = { id, to, env, createdAt: now }
-      await this.store.saveBookWithOutbox(to, promoted, e)
+      const e: OutboxEntry = { id: contentIdHex, to, env, createdAt: now }
+      await this.store.saveBookWithOutbox(to, promoted, e, historyRow)
       return e
     })
     this.fire(entry)
     return entry.id
+  }
+
+  /** All persisted conversations, decrypted and grouped by peer, each sorted
+   *  oldest-first (P10b boot hydration). Rows that do not authenticate under the
+   *  current key are skipped rather than throwing, so one corrupt row cannot block
+   *  loading the rest. */
+  async loadAllHistory(): Promise<Record<string, StoredMessage[]>> {
+    if (!this.history) return {}
+    const rows = await this.store.historyLoadAll()
+    const out: Record<string, StoredMessage[]> = {}
+    for (const row of rows) {
+      try {
+        const m = await this.history.open(row)
+        const msg: StoredMessage = { id: m.id, dir: m.dir, text: m.text, ts: m.ts }
+        if (row.failed) msg.failed = true
+        ;(out[row.peerId] ??= []).push(msg)
+      } catch {
+        /* unreadable row (corruption / wrong key): skip it */
+      }
+    }
+    for (const peer of Object.keys(out)) out[peer].sort((a, b) => a.ts - b.ts)
+    return out
+  }
+
+  /** Remove one persisted message (P10d delete / P10e ephemeral cleanup). */
+  async removeHistory(peerId: string, dir: 'in' | 'out', id: string): Promise<void> {
+    await this.store.historyRemove(peerId, dir, id)
   }
 
   // Fire a queued envelope at the socket and arrange for its outbox entry to be
@@ -456,7 +554,12 @@ export class NightjarClient {
     const now = Date.now()
     for (const e of await this.store.pendingOutbox()) {
       if (now - e.createdAt > OUTBOX_RETRY_HORIZON_MS) {
-        await this.store.removeOutbox(e.id) // past the retry horizon: give up (DESIGN 7.2)
+        // Past the retry horizon: give up (DESIGN 7.2). Flag the persisted row
+        // failed and notify, so this never-delivered message is not shown as
+        // delivered after a reload (P10b), then drop the outbox entry.
+        if (this.history) await this.store.historyMarkFailed(e.to, 'out', e.id).catch(() => {})
+        await this.store.removeOutbox(e.id)
+        this.cb.onSendFailed?.(e.id, 'delivery timed out (undelivered for too long)')
         continue
       }
       this.fire(e)
@@ -471,6 +574,7 @@ export class NightjarClient {
       this.cb.onError?.('dropped a malformed envelope')
       return
     }
+    const now = Date.now()
     let res
     try {
       res = await processInbound(env, from, {
@@ -479,7 +583,10 @@ export class NightjarClient {
         store: this.store,
         contacts: this.contacts,
         lock: this.lock,
-        now: Date.now(),
+        now,
+        // Only include the key when set: exactOptionalPropertyTypes forbids an
+        // explicit `undefined` for the optional `history` dep.
+        ...(this.history ? { history: this.history } : {}),
       })
     } catch (e) {
       // Transient (retry on redelivery) or a surfaced security event: do NOT ack.
@@ -497,7 +604,19 @@ export class NightjarClient {
     // only causes an idempotent redelivery (hasSeen -> duplicate). `duplicate` and
     // `dropped` are just acked (the latter stops a poison redelivery).
     if (res.kind === 'delivered') {
-      this.cb.onMessage(from, decode(res.plaintext))
+      // Classify the plaintext for RENDERING (the persist decision already ran,
+      // atomically, inside processInbound). decodeMessage is total; this runs
+      // strictly after the commit, so a malformed/delete record only changes what
+      // the UI shows, never protocol state. Route: text/legacy -> render; delete
+      // (P10d) -> apply a removal; malformed -> render nothing (forward-compat).
+      const decoded = decodeMessage(res.plaintext)
+      if (decoded.kind === 'text') {
+        this.cb.onMessage(from, { id: bytesToHex(decoded.id), text: decoded.body, ts: now, ephemeral: decoded.ephemeral })
+      } else if (decoded.kind === 'legacy') {
+        this.cb.onMessage(from, { id: env.id, text: decoded.body, ts: now })
+      }
+      // decoded.kind 'delete' | 'malformed': no UI render in P10b (delete handling
+      // arrives in P10d; a malformed record is clean-ignored).
       if (res.consumedOpk) {
         // Mirror the server-side vend so the tracked Directory count trends down
         // between connects and replenishment fires before the Directory depletes.
