@@ -96,6 +96,15 @@ export async function runP4SelfTest(bootstrapInvite: string): Promise<P4SelfTest
     await bob.addInviteContact(alice.userId)
     log.push('bob pinned alice via the invite')
 
+    // Mutual invite (6.3): BEFORE Bob sends anything, Alice does not yet know him.
+    // Her redemption sync learns him from the relay's server-verified used_by stamp
+    // and records him as an 'unverified' (TOFU) contact, WITHOUT a first message.
+    const aliceKnewBobBefore = (await alice.trustOf(bob.userId)) !== null
+    const mutualAdded = await alice.syncInviteContacts()
+    const aliceLearnedBob = await alice.trustOf(bob.userId)
+    const mutualOk = !aliceKnewBobBefore && mutualAdded >= 1 && aliceLearnedBob === 'unverified'
+    log.push(`mutual invite: alice auto-learned bob as ${aliceLearnedBob} without a message: ${mutualOk ? 'PASS' : 'FAIL'}`)
+
     await alice.sendText(bob.userId, 'hello from alice')
     await waitUntil(() => bRecv.length > 0)
     log.push(`bob received: "${bRecv[0]}"`)
@@ -168,6 +177,7 @@ export async function runP4SelfTest(bootstrapInvite: string): Promise<P4SelfTest
       bRecv[1] === 'and a second one' &&
       bobToAlice === 'invite' &&
       aliceToBob === 'unverified' &&
+      mutualOk &&
       historyOk &&
       deleteOk &&
       ephemeralOk &&

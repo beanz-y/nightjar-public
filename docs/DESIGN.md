@@ -462,10 +462,30 @@ it lets the joiner pin the inviter's real key on join; the joiner's client uses 
 as a full-width equality check against the `IK_sig_pub` the directory returns.
 This authenticates **inviter -> joiner only**; the inviter still learns the
 joiner's key via TOFU and shows the contact "unverified, scan to verify" until
-the mutual check. Optional closing step: on redemption, the joiner's client
-surfaces the joiner's fingerprint for the inviter to confirm. Caveat: the embedded
-fingerprint is only as honest as the operator-served client that generates and
-displays it (section 6.1).
+the mutual check. The inviter learns the joiner **automatically** (the *mutual
+invite*): on its next connection the inviter's client asks the Directory for the
+server-verified `used_by` ids of the invites it minted (the Directory already
+stamps them at redemption, 7.1) and records each as an **`unverified` (TOFU)**
+contact, so the inviter can compare a safety number without waiting for the joiner
+to send a first message. Two honesty points, both load-bearing:
+
+- The joiner id here is a **relay assertion**, not a cryptographic binding. The
+  invite only authenticated inviter -> joiner, so a lying or compelled operator can
+  report a `used_by` that is an attacker-controlled identity (or the true bearer of
+  a passed-on bearer code) rather than the intended invitee; the inviter's client
+  will pin whatever id the relay names. This grants no *new* trust the relay lacked
+  (an unsolicited first message already produces an `unverified` contact today), and
+  it is caught by the same control as every other relay-served key: the out-of-band
+  safety number (6.2). So the contact stays **`unverified`** (never `invite`) and the
+  UI never presents it as authenticated.
+- It is **best-effort and bounded by the 30-day invite retention** (7.1): if the
+  inviter does not reconnect within that window, the used invite is purged and it
+  instead learns the joiner when they first message (today's behaviour). While the
+  invite is on screen the client also polls briefly (visible-tab only) so an
+  in-person join appears promptly.
+
+Caveat: the embedded fingerprint is only as honest as the operator-served client
+that generates and displays it (section 6.1).
 
 ### 6.4 Key-change policy (TOFU with teeth)
 
@@ -805,7 +825,12 @@ An operator who chooses to log, or anyone who can compel us, can learn:
 - **The directed sender -> recipient edge** (sends ride the sender's
   authenticated WebSocket, and the X3DH initial header carries `IK_sig_a_pub` in
   cleartext).
-- **Contact intent** (who fetches whose bundle).
+- **Contact intent** (who fetches whose bundle). Note: with the mutual invite
+  (6.3) an inviter's client also fetches a *joiner's* bundle automatically on
+  connect (vending one of that joiner's OPKs), so a bundle fetch no longer implies
+  the fetcher intends to message the target. This reveals nothing the operator did
+  not already hold: the invite redemption it is reading is the operator's own
+  record of an edge it already saw when it gated the registration.
 - **Timing, volume, message counts** (via cleartext ratchet counters `n`/`pn`).
 - **Presence** (persistent WebSocket).
 - **Message length** (no padding in v1; ciphertext length leaks plaintext length).
@@ -1163,6 +1188,7 @@ Native (Tauri) is **not** on the critical path; it is a demand-gated v2 (10.5).
 | OPK batch / policy | 100 per batch; <= 1 outstanding per (fetcher,target); replenish under 20 | 4.1, 4.3 |
 | User id | `base32(SHA-256(IK_sig_pub))`, full 256-bit, untruncated | 3 |
 | Invite-embedded fingerprint | inviter `IK_sig` at full 256-bit width; joiner does a full-width equality check vs the directory-returned key | 6.3 |
+| Mutual invite (inviter learns joiner) | on connect the inviter fetches the server-verified `used_by` ids of its invites (`MAX_INVITE_REDEMPTIONS` = 200 most recent, `invites(inviter)` indexed) and records each as an **`unverified`** TOFU contact; a relay assertion (no binding), caught by the safety number; throttled (60 s reconnect backstop) + a visible-tab poll while an invite is on screen; bounded by the 30-day invite retention | 6.3 |
 | Safety number | iterated SHA-512, `N_iter` = 5200, displayed width >= 120 bits, tag `"Nightjar-SN-v1"` | 6.2 |
 | Argon2id (backup) | m = 64 MiB, t = 3, p = 1 (measured ~2.3 s desktop via `@noble/hashes`; 256 MiB was ~9 s and risks OOM in an iOS Safari worker; RFC 9106 constrained-env recommendation); 16-B salt; XChaCha20-Poly1305 body with the header as AAD; key+nonce via HKDF-SHA256 info `"Nightjar_Backup_v1"`; restore bounds m to [8 MiB, 256 MiB], t <= 6, p == 1 before running the KDF | 8.3 |
 | Passphrase floor | typed passphrases >= 12 chars (after NFC-trim); the offered generated passphrase is 20 base32 chars (~100 bits) | 8.3 |

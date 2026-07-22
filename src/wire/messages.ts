@@ -56,6 +56,11 @@ export interface MintInviteMsg {
   reqId: string
 }
 
+export interface InviteRedemptionsMsg {
+  t: 'inviteRedemptions'
+  reqId: string
+}
+
 export interface SendMsg {
   t: 'send'
   to: string
@@ -105,6 +110,7 @@ export type ClientMessage =
   | PublishBundleMsg
   | FetchBundleMsg
   | MintInviteMsg
+  | InviteRedemptionsMsg
   | SendMsg
   | AckMsg
   | DrainMsg
@@ -156,6 +162,14 @@ export interface InviteMsg {
   inviterFingerprint: string // base32 user id of the inviter (DESIGN 6.3)
 }
 
+export interface RedemptionsMsg {
+  t: 'redemptions'
+  reqId: string
+  /** Server-verified user ids that redeemed the caller's invites (mutual invite,
+   *  DESIGN 6.3). A relay assertion, TOFU: the inviter records each at 'unverified'. */
+  joiners: string[]
+}
+
 export interface DeliverMsg {
   t: 'deliver'
   from: string
@@ -184,6 +198,7 @@ export type ServerMessage =
   | PublishedMsg
   | BundleMsg
   | InviteMsg
+  | RedemptionsMsg
   | DeliverMsg
   | SentMsg
   | ErrorMsg

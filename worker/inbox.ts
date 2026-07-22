@@ -214,6 +214,8 @@ export class Inbox {
         return this.doFetch(ws, userId, msg)
       case 'mintInvite':
         return this.doMintInvite(ws, userId, msg.reqId)
+      case 'inviteRedemptions':
+        return this.doInviteRedemptions(ws, userId, msg.reqId)
       case 'send':
         return this.doSend(ws, userId, msg)
       case 'ack':
@@ -294,6 +296,26 @@ export class Inbox {
         now: Date.now(),
       })
       this.sendTo(ws, { t: 'invite', reqId, code: r.code, inviterFingerprint: userId })
+    } catch (e) {
+      this.replyError(ws, e, reqId)
+    }
+  }
+
+  // Report who redeemed this user's invites (mutual invite, DESIGN 6.3), so the
+  // inviter auto-learns each joiner as a TOFU contact without waiting for a message.
+  // The `inviter` forwarded to the Directory is the challenge-verified userId, NEVER
+  // a client-supplied value, so a user can only ever list their own joiners. Gated on
+  // `registered` for consistency with the rest of the authed Directory surface (an
+  // unregistered id owns no invites, so this is defense-in-depth, not the sole guard).
+  private async doInviteRedemptions(ws: WebSocket, userId: string, reqId: string): Promise<void> {
+    const att = ws.deserializeAttachment() as Attachment | null
+    if (!att?.registered) {
+      this.sendTo(ws, { t: 'redemptions', reqId, joiners: [] })
+      return
+    }
+    try {
+      const r = await callDO<{ joiners: string[] }>(directoryStub(this.env), '/inviteRedemptions', { inviter: userId })
+      this.sendTo(ws, { t: 'redemptions', reqId, joiners: r.joiners })
     } catch (e) {
       this.replyError(ws, e, reqId)
     }

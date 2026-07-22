@@ -158,13 +158,21 @@ export function useNightjar() {
   const pushKeyRef = useRef<string | null>(null)
   const teardownRef = useRef<(() => void) | null>(null)
   const lockNowRef = useRef<() => void>(() => {})
+  const contactsGenRef = useRef(0)
 
   const refreshNotify = useCallback(() => setNotify(computeNotify(pushKeyRef.current)), [])
 
+  // Refresh the contact list, guarded so a slower earlier read can never clobber a
+  // fresher later one: several async refreshes race at connect (onConnection, the
+  // initial activate load, and the mutual-invite onContactsChanged), and a stale
+  // snapshot landing last would briefly hide a just-added joiner. The newest read
+  // (highest generation) always wins.
   const listContacts = useCallback(async () => {
     const live = liveRef.current
     if (!live) return
-    setContacts(await live.client.listContacts())
+    const gen = ++contactsGenRef.current
+    const list = await live.client.listContacts()
+    if (mountedRef.current && gen === contactsGenRef.current) setContacts(list)
   }, [])
 
   const appendMessage = useCallback((peer: string, m: Message) => {
@@ -218,7 +226,7 @@ export function useNightjar() {
         {
           onMessage: (from, msg) => {
             appendMessage(from, { id: msg.id, dir: 'in', text: msg.text, ts: msg.ts, ...(msg.ephemeral ? { ephemeral: true } : {}) })
-            void client.listContacts().then(setContacts).catch(() => {})
+            void listContacts().catch(() => {})
           },
           onDelete: (from, id) => {
             // Delete-for-everyone from a peer (P10d): drop the bubble. The stored
@@ -237,6 +245,11 @@ export function useNightjar() {
             })
             setNotice(`a message could not be delivered (${reason})`)
           },
+          onContactsChanged: () => {
+            // A mutual-invite joiner was auto-learned (or deferred trust work landed)
+            // after the connect-time refresh already ran; re-read so it appears now.
+            if (mountedRef.current) void listContacts().catch(() => {})
+          },
           onConnection: (up) => {
             if (!mountedRef.current) return
             setConnected(up)
@@ -249,7 +262,7 @@ export function useNightjar() {
             }
             void completeRestoreIfPending(client, stores.keys)
             setRegistered(client.isRegistered)
-            void client.listContacts().then(setContacts).catch(() => {})
+            void listContacts().catch(() => {})
             setPhase((prev) => (prev === 'error' ? (client.isRegistered ? 'ready' : 'onboarding') : prev))
           },
         },
@@ -264,7 +277,7 @@ export function useNightjar() {
       setRegistered(authed.registered)
       if (authed.registered) await completeRestoreIfPending(client, stores.keys)
       if (!mountedRef.current) return
-      setContacts(await client.listContacts())
+      await listContacts()
       setAliases(await client.listAliases())
       try {
         const hist = await client.loadAllHistory()
@@ -655,6 +668,20 @@ export function useNightjar() {
     }
   }, [])
 
+  // Pull who has redeemed our invites and record each new joiner as a TOFU contact
+  // (mutual invite, DESIGN 6.3). Returns the count of newly-added contacts so the
+  // InvitePanel can confirm a join while a user watches for it. Best-effort; the
+  // client fires onContactsChanged, so the contact list refreshes on its own.
+  const syncInviteContacts = useCallback(async (): Promise<number> => {
+    const live = liveRef.current
+    if (!live) return 0
+    try {
+      return await live.client.syncInviteContacts()
+    } catch {
+      return 0
+    }
+  }, [])
+
   const markVerified = useCallback(async (peer: string) => {
     const live = liveRef.current
     if (!live) return
@@ -809,6 +836,7 @@ export function useNightjar() {
       openFromCode,
       renameChat,
       mintInvite,
+      syncInviteContacts,
       markVerified,
       ensureContact,
       dismissNotice,

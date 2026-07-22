@@ -33,6 +33,7 @@ interface Props {
     openFromCode: (input: string) => Promise<string | null>
     renameChat: (peer: string, name: string) => void
     mintInvite: () => Promise<MintedInvite | null>
+    syncInviteContacts: () => Promise<number>
     markVerified: (peer: string) => void
     ensureContact: (peer: string) => Promise<boolean>
     enableNotifications: () => void
@@ -135,6 +136,7 @@ export function Messenger({ identity, contacts, aliases, conversations, notify, 
         <NewChat
           minted={minted}
           onMint={() => void actions.mintInvite().then(setMinted)}
+          onSync={actions.syncInviteContacts}
           onCode={actions.openFromCode}
           onOpened={openChat}
           onClose={() => setOverlay('none')}

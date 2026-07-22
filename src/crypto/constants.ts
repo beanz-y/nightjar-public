@@ -104,6 +104,10 @@ export const MAX_OPKS_PER_REQUEST = 2 * OPK_BATCH
 export const MAX_AVAILABLE_OPKS = 3 * OPK_BATCH
 /** Max outstanding (unused, unexpired) invites a single inviter may hold. */
 export const MAX_OUTSTANDING_INVITES = 50
+/** Max joiner ids returned by a single inviteRedemptions lookup (mutual invite):
+ *  bounds the wire response AND the inviter's per-connect bundle-fetch fan-out, since
+ *  the redeemed-invite set is capped only by the 30-day retention, not MAX_OUTSTANDING_INVITES. */
+export const MAX_INVITE_REDEMPTIONS = 200
 /** An unredeemed invite expires after this and is purged. */
 export const INVITE_TTL_MS = 30 * 24 * 60 * 60 * 1000
 /** Max queued (undelivered) envelopes an Inbox will hold. */

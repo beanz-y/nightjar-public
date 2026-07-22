@@ -231,6 +231,48 @@ describe('registration + invites', () => {
   })
 })
 
+describe('mutual invite (inviteRedemptions)', () => {
+  async function inviteRedemptions(conn: Conn): Promise<string[]> {
+    const reqId = nextReq()
+    conn.send({ t: 'inviteRedemptions', reqId })
+    const m = await conn.waitPred((x) => x.t === 'redemptions' && (x as { reqId?: string }).reqId === reqId)
+    return (m as { joiners: string[] }).joiners
+  }
+
+  it('reports the server-verified joiner, scoped to the inviter’s own invites', async () => {
+    const inviter = generateIdentity()
+    const iConn = await connectAndAuth(inviter)
+    await register(iConn, ownBundleFor(inviter), await adminInvite())
+
+    // Before anyone redeems, the inviter has no joiners.
+    expect(await inviteRedemptions(iConn)).toEqual([])
+
+    const reqId = nextReq()
+    iConn.send({ t: 'mintInvite', reqId })
+    const inviteMsg = await iConn.waitFor('invite')
+
+    const joiner = generateIdentity()
+    const jConn = await connectAndAuth(joiner)
+    expect((await register(jConn, ownBundleFor(joiner), inviteMsg.code)).t).toBe('registered')
+
+    // Now the inviter learns the joiner from the server-verified used_by stamp.
+    expect(await inviteRedemptions(iConn)).toEqual([joiner.userId])
+
+    // A different registered user cannot read the inviter’s joiners: the query is
+    // scoped to the caller’s challenge-verified id, never a client claim.
+    const other = generateIdentity()
+    const oConn = await connectAndAuth(other)
+    await register(oConn, ownBundleFor(other), await adminInvite())
+    expect(await inviteRedemptions(oConn)).toEqual([])
+  })
+
+  it('returns an empty list for an authenticated-but-unregistered user', async () => {
+    const id = generateIdentity()
+    const conn = await connectAndAuth(id)
+    expect(await inviteRedemptions(conn)).toEqual([])
+  })
+})
+
 describe('OPK vending', () => {
   it('returns the SAME OPK to a repeated fetch by one fetcher (anti-depletion)', async () => {
     const bob = generateIdentity()

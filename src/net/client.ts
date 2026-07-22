@@ -51,6 +51,14 @@ const REPLENISH_LOCK = 'nightjar-opk-replenish'
 const RECONNECT_MIN_MS = 1000
 const RECONNECT_MAX_MS = 60 * 1000
 
+/** userId = 52-char lowercase base32 (SHA-256(IK_sig)). Used to reject a malformed
+ *  joiner id from an untrusted relay before wasting a bundle fetch on it. */
+const USER_ID_RE = /^[a-z2-7]{52}$/
+/** Throttle the on-reconnect redemption backstop so a flapping socket cannot hammer
+ *  the shared Directory (the InvitePanel's active poll calls syncInviteContacts()
+ *  directly for immediate freshness while a user watches someone join). */
+const REDEMPTION_SYNC_MIN_INTERVAL_MS = 60 * 1000
+
 /** A message as the UI/history layer sees it: keyed by the content msgId (P10b)
  *  for a structured message, or the transport envelope id for a legacy one. The
  *  same id is used for the optimistic bubble, the history row, and (P10d) a
@@ -96,6 +104,11 @@ export interface ClientCallbacks {
   /** Optional: the authenticated connection came up (true) or dropped (false).
    *  Fires on every transition, including automatic reconnects. */
   onConnection?: (connected: boolean) => void
+  /** Optional: the contact set changed OUTSIDE a user action (a mutual-invite joiner
+   *  was auto-learned, or deferred trust work landed) after the UI's own connect-time
+   *  refresh already ran. The UI re-reads listContacts() so the new contact appears
+   *  without waiting for the next reconnect. */
+  onContactsChanged?: () => void
 }
 
 export class NightjarClient {
@@ -106,6 +119,8 @@ export class NightjarClient {
   private connecting = false
   private reconnectAttempt = 0
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null
+  /** When the mutual-invite redemption sync last ran (throttles the reconnect backstop). */
+  private lastRedemptionSyncAt = 0
 
   constructor(
     private readonly identity: Identity,
@@ -202,6 +217,10 @@ export class NightjarClient {
     void this.store.pruneExpired(Date.now()).catch(() => {})
     // Retry trust work that failed transiently on an earlier connect (P8).
     void this.flushPendingTrust().catch(() => {})
+    // Learn anyone who redeemed our invites while we were away (mutual invite,
+    // DESIGN 6.3), so they can be verified without waiting for a first message.
+    // Throttled; best-effort.
+    void this.flushInviteRedemptions().catch(() => {})
   }
 
   /** Land pending trust work: the inviter pin (DESIGN 6.3) and inbound
@@ -210,9 +229,11 @@ export class NightjarClient {
    *  proven conflicting, which is surfaced as a security event). */
   private async flushPendingTrust(): Promise<void> {
     const pending = await this.contacts.getPendingTrust()
+    let changed = false
     for (const r of pending.records) {
       try {
         await this.contacts.recordFirstContact(r.peerId, b64decode(r.ikSig, 32), Date.now())
+        changed = true
         await this.contacts.mutatePendingTrust((p) => {
           p.records = p.records.filter((x) => x.peerId !== r.peerId)
         })
@@ -229,6 +250,7 @@ export class NightjarClient {
     if (pending.inviterPin) {
       try {
         await this.addInviteContact(pending.inviterPin)
+        changed = true
         await this.contacts.mutatePendingTrust((p) => {
           delete p.inviterPin
         })
@@ -236,6 +258,61 @@ export class NightjarClient {
         // Keep it; retried next connect.
       }
     }
+    // Surface any landed record/pin now: flushPendingTrust runs AFTER onConnection
+    // already triggered the UI's connect-time contact refresh, so without this the
+    // pinned inviter / recovered contact would not appear until the next reconnect.
+    if (changed) this.cb.onContactsChanged?.()
+  }
+
+  /** On-reconnect backstop for the mutual-invite sync, throttled so a flapping
+   *  socket cannot repeatedly poll the shared Directory. The InvitePanel calls
+   *  syncInviteContacts() directly (unthrottled) while a user actively watches a
+   *  join, so responsiveness there does not depend on this interval. */
+  private async flushInviteRedemptions(): Promise<void> {
+    if (!this.authed?.registered) return
+    if (Date.now() - this.lastRedemptionSyncAt < REDEMPTION_SYNC_MIN_INTERVAL_MS) return
+    await this.syncInviteContacts()
+  }
+
+  /** Learn everyone who redeemed our invites and record each unknown joiner as a
+   *  TOFU ('unverified') contact (mutual invite, DESIGN 6.3), so the inviter can
+   *  verify them WITHOUT waiting for a first message. Returns the count of newly
+   *  recorded contacts (the InvitePanel uses it to confirm a join landed).
+   *
+   *  The joiner id comes from the relay's redemption report (`used_by`), a relay
+   *  ASSERTION with no cryptographic binding to the intended invitee: a lying or
+   *  compelled relay could name an attacker-controlled id (or the real bearer of a
+   *  passed-on code), caught only by the out-of-band safety number. So these land at
+   *  'unverified' exactly like any TOFU contact (addContact's default), never at
+   *  'invite'. Idempotent, never rejects; a conflicting key surfaces via onSecurity
+   *  like every other trust path, everything else is retried on the next connect. */
+  async syncInviteContacts(): Promise<number> {
+    if (!this.authed?.registered) return 0
+    this.lastRedemptionSyncAt = Date.now()
+    let added = 0
+    try {
+      const joiners = await this.directory.inviteRedemptions()
+      const known = new Set((await this.contacts.list()).map((c) => c.peerId))
+      for (const joiner of new Set(joiners)) {
+        if (joiner === this.userId || known.has(joiner) || !USER_ID_RE.test(joiner)) continue
+        try {
+          await this.addContact(joiner)
+          known.add(joiner)
+          added++
+        } catch (e) {
+          if (e instanceof KeyConflictError) {
+            this.cb.onSecurity?.(
+              `stored key for ${joiner.slice(0, 12)}… conflicts with the one presented earlier; verify safety numbers`,
+            )
+          }
+          // else transient (relay unreachable, bundle not yet propagated): retried next connect.
+        }
+      }
+    } catch {
+      // Directory unreachable or contacts unavailable: best-effort, retried next connect.
+    }
+    if (added > 0) this.cb.onContactsChanged?.()
+    return added
   }
 
   private scheduleReconnect(): void {

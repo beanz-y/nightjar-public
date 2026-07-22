@@ -40,4 +40,14 @@ export class DirectoryClient {
     if (r.t !== 'invite') throw new Error(`mintInvite: unexpected ${r.t}`)
     return { code: r.code, inviterFingerprint: r.inviterFingerprint }
   }
+
+  /** The server-verified user ids that redeemed our invites (mutual invite, 6.3).
+   *  The relay is untrusted, so the array shape is defended here: a missing/garbage
+   *  `joiners` degrades to an empty list instead of throwing at the caller. */
+  async inviteRedemptions(): Promise<string[]> {
+    const id = reqId()
+    const r = await this.transport.request(id, { t: 'inviteRedemptions', reqId: id })
+    if (r.t !== 'redemptions') throw new Error(`inviteRedemptions: unexpected ${r.t}`)
+    return Array.isArray(r.joiners) ? r.joiners : []
+  }
 }

@@ -17,13 +17,15 @@ type Mode = 'menu' | 'scan' | 'enter' | 'invite'
 interface Props {
   minted: MintedInvite | null
   onMint: () => void
+  /** Poll for who redeemed our invites while the invite is on screen (mutual invite). */
+  onSync?: (() => Promise<number>) | undefined
   /** Resolve a scanned/entered code to a peer id and open the chat, or null. */
   onCode: (input: string) => Promise<string | null>
   onOpened: (peer: string) => void
   onClose: () => void
 }
 
-export function NewChat({ minted, onMint, onCode, onOpened, onClose }: Props) {
+export function NewChat({ minted, onMint, onSync, onCode, onOpened, onClose }: Props) {
   const [mode, setMode] = useState<Mode>('menu')
   const [entry, setEntry] = useState('')
   const [busy, setBusy] = useState(false)
@@ -81,7 +83,7 @@ export function NewChat({ minted, onMint, onCode, onOpened, onClose }: Props) {
   if (mode === 'invite') {
     return (
       <section className="sheet">
-        <InvitePanel minted={minted} onMint={onMint} onClose={() => setMode('menu')} />
+        <InvitePanel minted={minted} onMint={onMint} onSync={onSync} onClose={() => setMode('menu')} />
       </section>
     )
   }

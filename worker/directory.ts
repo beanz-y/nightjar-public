@@ -13,6 +13,7 @@ import {
   CLOCK_SKEW_MS,
   INVITE_TTL_MS,
   MAX_AVAILABLE_OPKS,
+  MAX_INVITE_REDEMPTIONS,
   MAX_OPKS_PER_REQUEST,
   MAX_OUTSTANDING_INVITES,
   OPK_VEND_TTL_MS,
@@ -116,6 +117,7 @@ export class Directory {
         used_by TEXT,
         used_at INTEGER
       );
+      CREATE INDEX IF NOT EXISTS idx_invites_inviter ON invites(inviter);
     `)
   }
 
@@ -139,6 +141,8 @@ export class Directory {
           return json(this.fetchBundle((await req.json()) as FetchBody))
         case '/isRegistered':
           return json(this.isRegistered((await req.json()) as { userId: string }))
+        case '/inviteRedemptions':
+          return json(this.inviteRedemptions((await req.json()) as { inviter: string }))
         default:
           return json({ code: 'not_found', msg: 'unknown directory op' }, 404)
       }
@@ -195,6 +199,23 @@ export class Directory {
       code,
     )
     if (cursor.rowsWritten !== 1) throw new DirectoryError('invite_used', 'invite already used')
+  }
+
+  // Who redeemed the invites this inviter minted (mutual invite, DESIGN 6.3): the
+  // server-verified user ids stamped into `used_by` at redemption. `inviter` is the
+  // caller's challenge-verified id (the Inbox forwards it, never a client claim), so
+  // a user can only ever read THEIR OWN joiners, not enumerate anyone else's graph.
+  // Bounded to the most recent MAX_INVITE_REDEMPTIONS so a prolific inviter cannot
+  // return an unbounded array (the redeemed set is capped only by the 30-day purge).
+  private inviteRedemptions(body: { inviter: string }): { joiners: string[] } {
+    const rows = this.sql
+      .exec(
+        'SELECT used_by FROM invites WHERE inviter = ? AND used = 1 AND used_by IS NOT NULL ORDER BY used_at DESC LIMIT ?',
+        body.inviter,
+        MAX_INVITE_REDEMPTIONS,
+      )
+      .toArray() as Array<{ used_by: string }>
+    return { joiners: rows.map((r) => r.used_by) }
   }
 
   // --- registration ------------------------------------------------------
