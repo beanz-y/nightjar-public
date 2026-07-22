@@ -10,6 +10,7 @@ import { PRESENCE_HEARTBEAT_MS } from '../crypto/constants'
 import { AppLockAuthError } from '../crypto/appLock'
 import type { Identity } from '../crypto/identity'
 import { NightjarClient, type StoredMessage } from '../net/client'
+import { type CrossTab, type CrossTabEvent, createCrossTab } from '../net/crossTab'
 import { getRelayOrigin } from '../platform'
 import {
   clearNotifications,
@@ -159,6 +160,7 @@ export function useNightjar() {
   const teardownRef = useRef<(() => void) | null>(null)
   const lockNowRef = useRef<() => void>(() => {})
   const contactsGenRef = useRef(0)
+  const crossTabRef = useRef<CrossTab | null>(null)
 
   const refreshNotify = useCallback(() => setNotify(computeNotify(pushKeyRef.current)), [])
 
@@ -183,6 +185,26 @@ export function useNightjar() {
     })
   }, [])
 
+  // Remove a bubble from a conversation (delete-for-everyone, either direction).
+  const removeBubble = useCallback((peer: string, id: string) => {
+    setConversations((prev) => ({ ...prev, [peer]: (prev[peer] ?? []).filter((m) => m.id !== id) }))
+  }, [])
+
+  // Mark a bubble failed by id, matched across conversations (a send-failure id is
+  // unique, so scanning all peers is equivalent to knowing the peer).
+  const markFailed = useCallback((id: string) => {
+    setConversations((prev) => {
+      const next: Record<string, Message[]> = {}
+      for (const [p, msgs] of Object.entries(prev)) next[p] = msgs.map((m) => (m.id === id ? { ...m, failed: true } : m))
+      return next
+    })
+  }, [])
+
+  // Broadcast a RENDER-ONLY event to sibling tabs (no-op until a channel is open in
+  // activate()). Receivers apply it to their in-RAM view only; the crypto/storage
+  // write already happened once, in the tab that produced the event.
+  const broadcast = useCallback((ev: CrossTabEvent) => crossTabRef.current?.post(ev), [])
+
   const completeRestoreIfPending = useCallback((client: NightjarClient, keys: KeyStore): Promise<void> => {
     if (restoreFixupRef.current) return restoreFixupRef.current
     restoreFixupRef.current = (async () => {
@@ -205,6 +227,10 @@ export function useNightjar() {
   const teardownLive = useCallback(() => {
     teardownRef.current?.()
     teardownRef.current = null
+    // Close the cross-tab channel BEFORE clearing the client: a locked/torn-down tab
+    // must hold no plaintext and must stop receiving sibling render events.
+    crossTabRef.current?.close()
+    crossTabRef.current = null
     liveRef.current?.client.close()
     liveRef.current = null
   }, [])
@@ -225,24 +251,22 @@ export function useNightjar() {
         stores.lock,
         {
           onMessage: (from, msg) => {
-            appendMessage(from, { id: msg.id, dir: 'in', text: msg.text, ts: msg.ts, ...(msg.ephemeral ? { ephemeral: true } : {}) })
+            const m: Message = { id: msg.id, dir: 'in', text: msg.text, ts: msg.ts, ...(msg.ephemeral ? { ephemeral: true } : {}) }
+            appendMessage(from, m)
+            broadcast({ kind: 'append', peer: from, msg: m })
             void listContacts().catch(() => {})
           },
           onDelete: (from, id) => {
             // Delete-for-everyone from a peer (P10d): drop the bubble. The stored
             // row was already removed atomically inside the client.
-            setConversations((prev) => ({ ...prev, [from]: (prev[from] ?? []).filter((m) => m.id !== id) }))
+            removeBubble(from, id)
+            broadcast({ kind: 'delete', peer: from, id })
           },
           onError: (detail) => setNotice(detail),
           onSecurity: (detail) => setSecurityNotices((prev) => (prev.includes(detail) ? prev : [...prev, detail])),
           onSendFailed: (envId, reason) => {
-            setConversations((prev) => {
-              const next: Record<string, Message[]> = {}
-              for (const [p, msgs] of Object.entries(prev)) {
-                next[p] = msgs.map((m) => (m.id === envId ? { ...m, failed: true } : m))
-              }
-              return next
-            })
+            markFailed(envId)
+            broadcast({ kind: 'failed', id: envId })
             setNotice(`a message could not be delivered (${reason})`)
           },
           onContactsChanged: () => {
@@ -270,6 +294,18 @@ export function useNightjar() {
       )
       liveRef.current = { client, identity: id }
       setIdentity(id)
+
+      // Open the cross-tab render channel now that we are unlocked. Sibling tabs of
+      // this same user apply appends/deletes/failures to their in-RAM view ONLY (no
+      // re-decrypt/persist/ack). Receivers call the bare mutators, never a *broadcast*
+      // path, so a received event is never re-broadcast (no ping-pong).
+      crossTabRef.current?.close()
+      crossTabRef.current = createCrossTab((ev) => {
+        if (!mountedRef.current) return
+        if (ev.kind === 'append') appendMessage(ev.peer, ev.msg)
+        else if (ev.kind === 'delete') removeBubble(ev.peer, ev.id)
+        else markFailed(ev.id)
+      })
 
       const authed = await client.connect()
       if (!mountedRef.current) return
@@ -330,7 +366,7 @@ export function useNightjar() {
       setError(String(e instanceof Error ? e.message : e))
       setPhase('error')
     }
-  }, [appendMessage, completeRestoreIfPending, refreshNotify])
+  }, [appendMessage, removeBubble, markFailed, broadcast, completeRestoreIfPending, refreshNotify])
 
   // Lock now: clear the LDK + decrypted history from RAM and tear down the socket.
   const lockNow = useCallback(() => {
@@ -544,16 +580,17 @@ export function useNightjar() {
       const ts = Date.now()
       // The optimistic bubble carries the ephemeral flag so it renders with the
       // session-only marker immediately (the backstop that makes a wrong-mode send
-      // visible), even before delivery resolves.
-      appendMessage(peer, { id: msgId, dir: 'out', text, ts, ...(ephemeral ? { ephemeral: true } : {}) })
+      // visible), even before delivery resolves. Mirror it to sibling tabs so the
+      // sent message appears there live too.
+      const m: Message = { id: msgId, dir: 'out', text, ts, ...(ephemeral ? { ephemeral: true } : {}) }
+      appendMessage(peer, m)
+      broadcast({ kind: 'append', peer, msg: m })
       try {
         await live.client.sendText(peer, text, msgId, ts, ephemeral)
         setContacts(await live.client.listContacts())
       } catch (e) {
-        setConversations((prev) => ({
-          ...prev,
-          [peer]: (prev[peer] ?? []).map((mm) => (mm.id === msgId ? { ...mm, failed: true } : mm)),
-        }))
+        markFailed(msgId)
+        broadcast({ kind: 'failed', id: msgId })
         const isConflict = e instanceof Error && e.name === 'KeyConflictError'
         if (isConflict) {
           setSecurityNotices((prev) => {
@@ -565,7 +602,7 @@ export function useNightjar() {
         }
       }
     },
-    [appendMessage],
+    [appendMessage, broadcast, markFailed],
   )
 
   // Delete-for-everyone a message YOU sent (P10d). Optimistically removes the
@@ -574,7 +611,8 @@ export function useNightjar() {
   const deleteMessage = useCallback(async (peer: string, id: string, failed?: boolean) => {
     const live = liveRef.current
     if (!live) return
-    setConversations((prev) => ({ ...prev, [peer]: (prev[peer] ?? []).filter((m) => m.id !== id) }))
+    removeBubble(peer, id)
+    broadcast({ kind: 'delete', peer, id })
     try {
       if (failed) {
         // Never delivered (send failed/timed out): a local-only removal. No point
@@ -588,7 +626,7 @@ export function useNightjar() {
     } catch (e) {
       setNotice(`could not delete: ${String(e instanceof Error ? e.message : e)}`)
     }
-  }, [])
+  }, [removeBubble, broadcast])
 
   const startChat = useCallback((peer: string) => {
     setConversations((prev) => (prev[peer] ? prev : { ...prev, [peer]: [] }))

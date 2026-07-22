@@ -811,10 +811,25 @@ Honest posture, stated plainly:
   out-of-order session-only message's key can sit in the in-flight skipped-key map
   until it arrives. Against a device forensic image, session-only removes the history
   row only; it does not add confidentiality beyond the normal ratchet.
-- **It can be missed entirely.** Because nothing is persisted, a session-only message
-  is shown in the one open tab/window that receives it (a second open tab will not
-  show it and cannot recover it on reload), and if your app locks or reloads before you
-  read it, it is gone with no way to retrieve it.
+- **It can still be missed, but multi-tab is now covered.** Every OTHER open, unlocked
+  tab of the same user renders a session-only message live too, over a same-origin
+  cross-tab render channel (next bullet), so a second open tab no longer misses it. The
+  remaining miss is narrow: because nothing is persisted, a tab that is closed, locked,
+  or backgrounded-then-reloaded at the instant the message arrives keeps no copy, so if
+  every open tab locks or reloads before you read it, it is gone with no way to retrieve
+  it. Holding the delivery ack to defer this is infeasible (the ratchet has already
+  advanced and the message is marked seen before the relay ack), and never clearing it
+  on lock would defeat the app-lock, so this residual is disclosed, not engineered away.
+- **Cross-tab sync moves decrypted text between same-origin tabs, and only there.** To
+  render live in every open tab, the tab that receives (or sends) a message fans it to
+  its siblings over a same-origin `BroadcastChannel`. This is **render-only**: siblings
+  update their in-RAM view and never re-decrypt, re-persist, or re-ack, so the ratchet
+  stays single-writer and no storage or security invariant changes. It never leaves the
+  browser, so the relay-visible metadata of section 9 is unchanged. The channel is
+  closed whenever a tab is locked, so a locked tab holds and receives nothing. An XSS
+  that already owns the page (8.4) could read this channel, but that is within what such
+  an attacker can already do (it already holds the Local Data Key, the React state, and
+  IndexedDB).
 
 ---
 
@@ -1196,7 +1211,7 @@ Native (Tauri) is **not** on the critical path; it is a demand-gated v2 (10.5).
 | Message payload format | magic `"NJM1"`, format version `0x01`, kind (`0x01` text / `0x02` delete), 16-B content msgId, then (text) a flags byte (bit0 = ephemeral, other bits reserved) + utf8 body; the ratchet plaintext. A payload with no magic is legacy plain text; a magic-but-invalid/unknown-version/unknown-kind payload is clean-ignored (never thrown or rendered) | 8.5 |
 | Content vs transport id | the 16-B content msgId lives inside the ratchet plaintext (history key / delete target); the relay-visible transport envelope id is separate (dedup/ack/outbox). A first-send text may reuse its content id as the transport id (brand-new, safe); a delete gets its own fresh transport id | 8.5 |
 | Delete-for-everyone | `delete{targetContentId}` (kind `0x02`) sent on the current session with its OWN fresh transport id; receiver removes only the compound (this peer, dir=in, target id), records a **tombstone** (opaque history key, TTL = envelope TTL 30 d) so a target arriving after its delete is suppressed; removal + tombstone ride the same tx as the ratchet advance. A still-outboxed target is cancelled, not chased. Best-effort, honest-client-dependent; UI says "delete sent" | 8.6 |
-| Session-only (ephemeral) | NJM1 text with flags bit0 set; **never** sealed to history on either device (send-side seal skipped, receive-side persist gate fails closed). RAM-only, cleared on reload/lock. Delivered EXACTLY like any message (same outbox + ack + retransmit, so a session-establishing initial is reliable); it removes only the persistent history row and leaves no EXTRA at-rest trace (the unencrypted session state any message updates still keys on the peer + stamps the send time). Encrypted identically in transit; does not hide relay metadata or the push nudge; off-the-record courtesy, not a guarantee; delete-for-everyone hidden on ephemeral bubbles | 8.7 |
+| Session-only (ephemeral) | NJM1 text with flags bit0 set; **never** sealed to history on either device (send-side seal skipped, receive-side persist gate fails closed). RAM-only, cleared on reload/lock. Delivered EXACTLY like any message (same outbox + ack + retransmit, so a session-establishing initial is reliable); it removes only the persistent history row and leaves no EXTRA at-rest trace (the unencrypted session state any message updates still keys on the peer + stamps the send time). Encrypted identically in transit; does not hide relay metadata or the push nudge; off-the-record courtesy, not a guarantee; delete-for-everyone hidden on ephemeral bubbles; rendered live in other open **unlocked** tabs via a same-origin render `BroadcastChannel` (render-only, never leaves the browser, closed while locked), so the remaining miss is only a tab closed/locked/reloaded at arrival | 8.7 |
 | App-lock + at-rest data | random 32-B **LDK** wraps all local at-rest data; the LDK is never stored unwrapped, only wrapped per method: passphrase/PIN via `HKDF(Argon2id(secret, 64 MiB/t3/p1, 16-B salt), 16-B salt, "Nightjar_LockWrap_v1")`, biometric via `HKDF(prfSecret, 16-B salt, same info)`, each `XChaCha20-Poly1305(kek, LDK)` with the method kind bound in the AAD. Mandatory; >=1 knowledge factor; PIN min 6 digits (disclosed weak). Sub-keys `HKDF(LDK, "Nightjar_HistBody_v1" / "Nightjar_HistIndex_v1" / "Nightjar_Contacts_v1")` | 8.5 |
 | History at rest | per-message record in the sessions IndexedDB; the **whole message** (content id, peer, direction, ts, text) sealed with XChaCha20-Poly1305 under key+nonce = HKDF(history-body sub-key, **fresh 16-B per-record salt**, info `"Nightjar_History_v1"`); IndexedDB key = `hex(HMAC(history-index sub-key, peer‖dir‖id))` (opaque: the DB reveals no peer/ts/count); AAD binds that storage key + a history-format version; written in the same tx as the ratchet advance + dedup marker. Contacts/pending/aliases sealed under the contacts sub-key with a fresh 16-B salt | 8.5 |
 | Version octet | starts at `0x01` (classical X25519) | 4.4 |
