@@ -66,8 +66,12 @@ export class Transport {
    */
   connect(): Promise<AuthedInfo> {
     return new Promise<AuthedInfo>((resolve, reject) => {
-      const url = `${wsOrigin()}/connect?u=${this.identity.userId}`
-      const ws = new WebSocket(url)
+      // The userId rides the WebSocket subprotocol, NOT the URL. A query param lands
+      // in edge/request logs (identity + IP + geo + TLS fingerprint in one row), so
+      // the id is kept out of the URL entirely. It is only a routing hint here; the
+      // socket is still authenticated by the challenge-response below.
+      const url = `${wsOrigin()}/connect`
+      const ws = new WebSocket(url, [this.identity.userId])
       this.ws = ws
       let settled = false
       const timer = setTimeout(() => {

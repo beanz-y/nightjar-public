@@ -31,7 +31,13 @@
     { "tag": "v1", "new_sqlite_classes": ["Directory", "Inbox"] }
   ],
 
-  "observability": { "enabled": true },
+  // Workers Logs invocation logging is OFF by design. The auto-generated invocation
+  // log records the request URL, client IP, geo, and TLS fingerprint for every
+  // connection: metadata a privacy-first messenger deliberately does not retain.
+  // (keep_vars does NOT cover observability, so a dashboard toggle would be undone
+  // on the next deploy; this file is the authority. The userId is additionally kept
+  // out of the /connect URL so it can never reach a log even if this is re-enabled.)
+  "observability": { "enabled": false },
   // Dashboard-managed secrets (ADMIN_TOKEN, later VAPID) survive git deploys.
   "keep_vars": true
 }

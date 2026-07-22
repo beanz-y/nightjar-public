@@ -108,7 +108,12 @@ export class Inbox {
     if ((req.headers.get('Upgrade') || '').toLowerCase() !== 'websocket') {
       return new Response('expected a websocket', { status: 426 })
     }
-    const u = new URL(req.url).searchParams.get('u') ?? ''
+    // The routing key rides the subprotocol (kept out of the URL/logs); a legacy
+    // ?u= query param is still honoured during rollout. Only a routing hint: the
+    // challenge-response below proves identity and closes on a mismatch.
+    const proto = (req.headers.get('Sec-WebSocket-Protocol') || '').split(',')[0].trim()
+    const offered = USER_ID_RE.test(proto)
+    const u = offered ? proto : (new URL(req.url).searchParams.get('u') ?? '')
     if (!USER_ID_RE.test(u)) return new Response('bad user id', { status: 400 })
 
     const pair = new WebSocketPair()
@@ -119,7 +124,14 @@ export class Inbox {
     const att: Attachment = { claimedUserId: u, authed: false, challenge }
     server.serializeAttachment(att)
     this.sendTo(server, { t: 'challenge', challenge })
-    return new Response(null, { status: 101, webSocket: pair[0] })
+    // RFC 6455: when the client offered a subprotocol, the 101 MUST echo exactly one
+    // of the offered values or strict browsers abort the connection (close 1006).
+    // Legacy ?u= clients offer none, so we echo nothing for them.
+    return new Response(null, {
+      status: 101,
+      webSocket: pair[0],
+      ...(offered ? { headers: { 'Sec-WebSocket-Protocol': proto } } : {}),
+    })
   }
 
   async webSocketMessage(ws: WebSocket, raw: string | ArrayBuffer): Promise<void> {

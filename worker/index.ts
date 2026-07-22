@@ -1,6 +1,9 @@
 // Nightjar relay Worker (DESIGN 7). A thin router in front of two Durable Object
 // classes; it serves the static PWA for everything else. Public surface:
-//   GET  /connect?u=<userId>   upgrade to the user's authenticated Inbox socket
+//   GET  /connect              upgrade to the user's authenticated Inbox socket
+//                              (userId travels in the Sec-WebSocket-Protocol
+//                               subprotocol, kept out of the URL/logs; a legacy
+//                               ?u=<userId> is still accepted during rollout)
 //   POST /admin/invite         mint the bootstrap invite (ADMIN_TOKEN gated)
 //   GET  /health               liveness probe
 // Everything a client does after connecting rides the WebSocket (see inbox.ts);
@@ -23,10 +26,16 @@ export default {
       if ((req.headers.get('Upgrade') || '').toLowerCase() !== 'websocket') {
         return new Response('expected a websocket', { status: 426 })
       }
-      const u = url.searchParams.get('u') ?? ''
+      // Routing key: prefer the WebSocket subprotocol (keeps the userId out of the
+      // URL, so it never reaches request logs); fall back to the legacy ?u= query
+      // param so a client loaded before this change still connects on reconnect.
+      // Either way it is only an unverified routing hint (the DO's challenge-response
+      // proves identity and closes 1008 on a mismatch).
+      const proto = (req.headers.get('Sec-WebSocket-Protocol') || '').split(',')[0].trim()
+      const u = USER_ID_RE.test(proto) ? proto : (url.searchParams.get('u') ?? '')
       if (!USER_ID_RE.test(u)) return new Response('bad user id', { status: 400 })
-      // Route to this user's Inbox; forward the request verbatim so the Upgrade
-      // handshake completes inside the DO.
+      // Forward the request verbatim so the Upgrade handshake AND the subprotocol
+      // header reach the DO, which completes the 101.
       return inboxStub(env, u).fetch(new Request(url.toString(), req))
     }
 

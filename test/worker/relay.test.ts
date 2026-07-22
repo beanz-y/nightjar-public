@@ -66,7 +66,20 @@ class Conn {
   }
 }
 
+// Connect the way the client now does: userId in the Sec-WebSocket-Protocol
+// subprotocol, NOT the URL (keeps it out of request logs).
 async function connect(userId: string): Promise<Conn> {
+  const res = await SELF.fetch(`${BASE}/connect`, {
+    headers: { Upgrade: 'websocket', 'Sec-WebSocket-Protocol': userId },
+  })
+  const ws = res.webSocket
+  if (!ws) throw new Error(`no webSocket in response (status ${res.status})`)
+  return new Conn(ws)
+}
+
+// The legacy query-param path, still accepted during rollout for a client loaded
+// before the subprotocol change.
+async function connectLegacy(userId: string): Promise<Conn> {
   const res = await SELF.fetch(`${BASE}/connect?u=${userId}`, { headers: { Upgrade: 'websocket' } })
   const ws = res.webSocket
   if (!ws) throw new Error(`no webSocket in response (status ${res.status})`)
@@ -136,6 +149,33 @@ describe('auth handshake', () => {
   it('rejects a connect with a malformed user id', async () => {
     const res = await SELF.fetch(`${BASE}/connect?u=not-a-user-id`, { headers: { Upgrade: 'websocket' } })
     expect(res.status).toBe(400)
+  })
+
+  it('routes by the subprotocol and echoes it on the 101', async () => {
+    const id = generateIdentity()
+    const res = await SELF.fetch(`${BASE}/connect`, {
+      headers: { Upgrade: 'websocket', 'Sec-WebSocket-Protocol': id.userId },
+    })
+    const ws = res.webSocket
+    if (!ws) throw new Error(`no webSocket (status ${res.status})`)
+    // The 101 must echo the negotiated subprotocol or strict browsers abort (1006).
+    expect(res.headers.get('Sec-WebSocket-Protocol')).toBe(id.userId)
+    const conn = new Conn(ws)
+    const ch = await conn.waitFor('challenge')
+    const sig = verifyAndSignChallenge(ch.challenge, ORIGIN, id.ikSig.privateKey, Date.now())
+    conn.send({ t: 'auth', ikSigPub: b64encode(id.ikSig.publicKey), sig: b64encode(sig) })
+    await conn.waitFor('authed')
+    conn.close()
+  })
+
+  it('still accepts the legacy ?u= query param during rollout', async () => {
+    const id = generateIdentity()
+    const conn = await connectLegacy(id.userId)
+    const ch = await conn.waitFor('challenge')
+    const sig = verifyAndSignChallenge(ch.challenge, ORIGIN, id.ikSig.privateKey, Date.now())
+    conn.send({ t: 'auth', ikSigPub: b64encode(id.ikSig.publicKey), sig: b64encode(sig) })
+    await conn.waitFor('authed')
+    conn.close()
   })
 
   it('rejects a forged signature and closes', async () => {

@@ -62,14 +62,6 @@ the shape of that residual gap is kept as a documented, demand-gated v2; see
 `docs/DESIGN.md` section 10. The single most important defense is not packaging,
 it is verifying your contacts' safety numbers in person.
 
-## Reused from our other projects
-
-Web Push (RFC 8291 + VAPID) and the per-room Durable Object come from
-**Mirkwood**; invite-gated registration and the PWA/chat UI from **Not the
-End**; the client-side crypto plumbing idea (but not its trust model) from
-**Fireworks**. The genuinely new surface is the crypto core (identity, X3DH,
-Double Ratchet) and the verifiability hardening.
-
 ## License
 
 Licensed under the [Apache License, Version 2.0](LICENSE). The crypto core is a
