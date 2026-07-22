@@ -1,0 +1,7 @@
+{
+  // The VERSION file has no extension, so VS Code's C/C++ IntelliSense tries to
+  // parse "v1.2.0" as C++ and reports bogus errors. Treat it as plain text instead.
+  "files.associations": {
+    "VERSION": "plaintext"
+  }
+}

@@ -87,6 +87,12 @@ jobs:
   release:
     needs: gate
     runs-on: ubuntu-latest
+    # Job-level permissions (these REPLACE the workflow-level block, so id-token
+    # must be repeated for cosign): contents:write lets the final step create the
+    # version tag + GitHub Release. The gate job keeps the read-only default.
+    permissions:
+      contents: write
+      id-token: write
     steps:
       - name: Checkout (LF via .gitattributes)
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
@@ -178,3 +184,26 @@ jobs:
             manifest.txt
             release.json
             manifest.cosign.bundle
+
+      # Cut a GitHub Release for a NEW version, so the Releases page tracks what is
+      # actually live. Idempotent: a push that did NOT bump VERSION (its release
+      # already exists) just skips - the redeploy is byte-identical so the canary
+      # stays valid. This runs AFTER a successful deploy and uses the built-in
+      # GITHUB_TOKEN (no personal CLI/PAT). It does NOT reintroduce the dropped
+      # signed-tag DEPLOY trigger: deploys still fire on push-to-main; the tag +
+      # Release are created here as a human-readable record pointing at the Rekor
+      # entry (the real transparency anchor). The manifest + cosign bundle are
+      # attached so an auditor can rebuild from this exact commit and diff the hash.
+      - name: Cut a GitHub Release for a new version (idempotent)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_HASH: ${{ steps.hash.outputs.release_hash }}
+        run: |
+          TAG="${NIGHTJAR_VERSION}"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG already exists (unchanged-version redeploy); skipping."
+            exit 0
+          fi
+          gh release create "$TAG" --target "$GITHUB_SHA" --title "$TAG" \
+            --notes "Deployed build ${TAG}. Reproducible-build hash (sha256 of manifest.txt): ${RELEASE_HASH}. Rebuild from this commit and confirm the hash plus the Sigstore/Rekor transparency entry (see docs/VERIFYING.md); the manifest and cosign bundle are attached." \
+            manifest.txt release.json manifest.cosign.bundle
