@@ -11,7 +11,28 @@ release tags cut by the deploy pipeline. Dates are the tag dates.
 
 ## [Unreleased]
 
-## [1.4.0] - 2026-07-22
+## [1.5.0] - 2026-07-22
+
+### Added
+- **Choose your time format.** A per-device Auto / 12-hour / 24-hour setting for
+  message timestamps, in Settings. Auto follows the device locale (the previous
+  behavior); the choice applies live and is local to each device.
+- **Add biometric unlock after setup.** Fingerprint or face unlock can now be turned
+  on, or off, any time from Settings, not only during initial enrollment. It never
+  becomes your only lock; your passphrase or PIN always stays as a fallback. This also
+  gives a fast unlock on devices where the passphrase hashing is slow (for example a
+  browser running with its JavaScript optimizer disabled).
+
+### Changed
+- **The message composer grows with your text.** It expands from one line up to a few
+  lines as you type a longer message, then scrolls inside, instead of a single fixed
+  line. On a physical keyboard, Enter sends and Shift+Enter starts a new line; on a
+  touch keyboard, Enter starts a new line and you send with the button.
+
+### Fixed
+- **The on-screen keyboard no longer hides your latest messages.** The conversation
+  keeps the newest messages in view when the mobile keyboard opens and as the composer
+  grows.
 
 ### Added
 - **Cross-tab live message sync across open, unlocked tabs of the same account.** A

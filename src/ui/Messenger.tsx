@@ -26,6 +26,8 @@ interface Props {
   notify: NotifyState
   storagePersisted: boolean | null
   canary: CanaryResult | null
+  bioAvailable: boolean
+  lockMethods: Array<'pass' | 'pin' | 'bio'>
   actions: {
     send: (peer: string, text: string, ephemeral?: boolean) => void
     deleteMessage: (peer: string, id: string, failed?: boolean) => void
@@ -39,6 +41,8 @@ interface Props {
     enableNotifications: () => void
     disableNotifications: () => void
     exportBackup: (passphrase: string) => Promise<boolean>
+    addBiometric: () => void
+    removeBiometric: () => void
   }
 }
 
@@ -46,7 +50,7 @@ function shortId(id: string): string {
   return `${id.slice(0, 6)}…${id.slice(-4)}`
 }
 
-export function Messenger({ identity, contacts, aliases, conversations, notify, storagePersisted, canary, actions }: Props) {
+export function Messenger({ identity, contacts, aliases, conversations, notify, storagePersisted, canary, bioAvailable, lockMethods, actions }: Props) {
   const displayName = (peer: string): string => aliases[peer]?.trim() || shortId(peer)
   const [selected, setSelected] = useState<string | null>(null)
   const [chatView, setChatView] = useState<'chat' | 'verify'>('chat')
@@ -152,9 +156,13 @@ export function Messenger({ identity, contacts, aliases, conversations, notify, 
           notify={notify}
           storagePersisted={storagePersisted}
           canary={canary}
+          bioAvailable={bioAvailable}
+          lockMethods={lockMethods}
           onExportBackup={actions.exportBackup}
           onEnableNotifications={actions.enableNotifications}
           onDisableNotifications={actions.disableNotifications}
+          onAddBiometric={actions.addBiometric}
+          onRemoveBiometric={actions.removeBiometric}
           onClose={() => setOverlay('none')}
         />
       </div>

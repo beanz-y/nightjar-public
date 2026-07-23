@@ -10,6 +10,7 @@ import { About } from './About'
 import { BackupPanel } from './BackupPanel'
 import { NotifySettings } from './NotifySettings'
 import { QrCode } from './QrCode'
+import { type TimeFormat, setTimeFormat, useTimeFormat } from './timePref'
 import type { NotifyState } from './useNightjar'
 
 type Mode = 'menu' | 'mycode' | 'backup' | 'about'
@@ -19,9 +20,13 @@ interface Props {
   notify: NotifyState
   storagePersisted: boolean | null
   canary: CanaryResult | null
+  bioAvailable: boolean
+  lockMethods: Array<'pass' | 'pin' | 'bio'>
   onExportBackup: (passphrase: string) => Promise<boolean>
   onEnableNotifications: () => void
   onDisableNotifications: () => void
+  onAddBiometric: () => void
+  onRemoveBiometric: () => void
   onClose: () => void
 }
 
@@ -30,13 +35,18 @@ export function Settings({
   notify,
   storagePersisted,
   canary,
+  bioAvailable,
+  lockMethods,
   onExportBackup,
   onEnableNotifications,
   onDisableNotifications,
+  onAddBiometric,
+  onRemoveBiometric,
   onClose,
 }: Props) {
   const [mode, setMode] = useState<Mode>('menu')
   const [copied, setCopied] = useState(false)
+  const timeFmt = useTimeFormat()
 
   async function copyId() {
     try {
@@ -95,6 +105,39 @@ export function Settings({
         <button className="ghost small" onClick={() => setMode('mycode')}>
           show my code (QR)
         </button>
+      </div>
+
+      {bioAvailable && (
+        <div className="applock">
+          <div className="field-label small muted">app lock</div>
+          {lockMethods.includes('bio') ? (
+            <button className="ghost small" onClick={onRemoveBiometric}>
+              Remove fingerprint / face unlock
+            </button>
+          ) : (
+            <button className="ghost small" onClick={onAddBiometric}>
+              Add fingerprint / face unlock
+            </button>
+          )}
+          <p className="muted tiny">
+            Unlock this device with your fingerprint or face instead of typing your passphrase. It can never be your
+            only lock; your passphrase or PIN always stays as a fallback.
+          </p>
+        </div>
+      )}
+
+      <div className="field-label small muted">time format</div>
+      <div className="row seg">
+        {(['auto', '12', '24'] as TimeFormat[]).map((v) => (
+          <button
+            key={v}
+            className={`ghost small${timeFmt === v ? ' seg-on' : ''}`}
+            aria-pressed={timeFmt === v}
+            onClick={() => setTimeFormat(v)}
+          >
+            {v === 'auto' ? 'Auto' : v === '12' ? '12-hour' : '24-hour'}
+          </button>
+        ))}
       </div>
 
       <button className="tile" onClick={() => setMode('backup')}>

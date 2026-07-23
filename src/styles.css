@@ -356,6 +356,18 @@ input {
   display: block;
   margin-top: 0.1rem;
 }
+.applock {
+  margin: 0.7rem 0;
+}
+.seg {
+  gap: 0.4rem;
+}
+.seg-on {
+  border-color: var(--accent);
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
+  font-weight: 600;
+}
 textarea {
   width: 100%;
   padding: 0.5rem 0.65rem;
@@ -652,7 +664,7 @@ textarea.mono {
 .compose {
   display: flex;
   gap: 0.5rem;
-  align-items: center;
+  align-items: flex-end;
   padding: 0.55rem 0.5rem;
   /* Lift the bar off the very bottom edge so it reads as a natural bar (and clear
      the iPhone home indicator so it is never behind it). */
@@ -661,10 +673,14 @@ textarea.mono {
   background: var(--panel);
   flex-shrink: 0; /* the message list scrolls; the compose bar stays put */
 }
-.compose input {
+.compose .compose-input {
   flex: 1;
-  border-radius: 1.3rem;
+  border-radius: 1.15rem;
   padding: 0.55rem 0.95rem;
+  resize: none;
+  max-height: 40vh;
+  overflow-y: auto;
+  font: inherit;
 }
 .compose .primary {
   border-radius: 1.3rem;
@@ -696,7 +712,7 @@ textarea.mono {
   background: color-mix(in srgb, var(--warn) 8%, var(--panel));
   border-top: 2px solid var(--warn);
 }
-.compose-ephemeral input {
+.compose-ephemeral .compose-input {
   border: 1px solid var(--warn);
 }
 .compose-ephemeral .primary {

@@ -148,6 +148,8 @@ export function App() {
                 notify={notify}
                 storagePersisted={storagePersisted}
                 canary={canary}
+                bioAvailable={bioAvailable}
+                lockMethods={lockMethods}
                 actions={actions}
               />
             )}

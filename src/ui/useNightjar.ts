@@ -484,6 +484,37 @@ export function useNightjar() {
     }
   }, [])
 
+  // Add biometric unlock AFTER initial setup (from Settings): enroll a WebAuthn
+  // credential, wrap the Local Data Key under its PRF secret, and refresh the method
+  // list. We are unlocked here (the messenger is showing), which addBiometric requires.
+  const addBiometric = useCallback(async (): Promise<void> => {
+    const stores = storesRef.current
+    if (!stores) return
+    const method = await makeBiometricMethod()
+    if (!method || method.kind !== 'bio') return // makeBiometricMethod already surfaced any error
+    try {
+      await stores.appLock.addBiometric(method.credentialId, method.prfSecret)
+      setLockMethods(await stores.appLock.methods())
+      setNotice('fingerprint / face unlock is on for this device')
+    } catch (e) {
+      setNotice(`could not add biometric unlock: ${String(e instanceof Error ? e.message : e)}`)
+    }
+  }, [makeBiometricMethod])
+
+  // Remove biometric unlock (a knowledge factor always remains, so this can never
+  // orphan the data; the store enforces it).
+  const removeBiometric = useCallback(async (): Promise<void> => {
+    const stores = storesRef.current
+    if (!stores) return
+    try {
+      await stores.appLock.removeBiometric()
+      setLockMethods(await stores.appLock.methods())
+      setNotice('fingerprint / face unlock removed for this device')
+    } catch (e) {
+      setNotice(`could not remove biometric unlock: ${String(e instanceof Error ? e.message : e)}`)
+    }
+  }, [])
+
   const unlock = useCallback(
     async (secret: string): Promise<boolean> => {
       const stores = storesRef.current
@@ -867,6 +898,8 @@ export function useNightjar() {
       unlockWithBiometric,
       lockNow,
       resetLock,
+      addBiometric,
+      removeBiometric,
       join,
       send,
       deleteMessage,

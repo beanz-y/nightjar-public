@@ -4,6 +4,7 @@
 import { Fragment, useEffect, useRef, useState } from 'react'
 import type { TrustLevel } from '../trust/contactStore'
 import { TrustBadge } from './SafetyNumber'
+import { type TimeFormat, hour12For, useTimeFormat } from './timePref'
 import type { Message } from './useNightjar'
 
 // Date/time helpers for the message log, mirroring common messengers: a centered
@@ -31,9 +32,32 @@ export function formatDaySeparator(ts: number, now: number): string {
   const sameYear = new Date(now).getFullYear() === d.getFullYear()
   return d.toLocaleDateString(undefined, { month: 'long', day: 'numeric', ...(sameYear ? {} : { year: 'numeric' }) })
 }
-function formatTime(ts: number): string {
-  return new Date(ts).toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' })
+function formatTime(ts: number, fmt: TimeFormat): string {
+  const h12 = hour12For(fmt)
+  return new Date(ts).toLocaleTimeString(undefined, {
+    hour: 'numeric',
+    minute: '2-digit',
+    ...(h12 !== undefined ? { hour12: h12 } : {}),
+  })
 }
+// The full date+time shown on hover/long-press, honoring the same 12/24h choice.
+function formatFull(ts: number, fmt: TimeFormat): string {
+  const h12 = hour12For(fmt)
+  return new Date(ts).toLocaleString(undefined, h12 !== undefined ? { hour12: h12 } : undefined)
+}
+// On touch devices the on-screen keyboard's Enter inserts a newline (sending is an
+// explicit Send tap); with a physical keyboard, Enter sends and Shift+Enter makes a
+// newline. Keyed off the PRIMARY pointer, so a touchscreen laptop with a trackpad
+// still behaves like a desktop.
+function isTouchDevice(): boolean {
+  try {
+    return window.matchMedia('(pointer: coarse)').matches
+  } catch {
+    return typeof navigator !== 'undefined' && navigator.maxTouchPoints > 0
+  }
+}
+// Max composer height before it scrolls internally (about five lines).
+const COMPOSE_MAX_PX = 140
 
 interface Props {
   peer: string
@@ -63,11 +87,51 @@ export function Conversation({ peer, name, messages, trust, onSend, onVerify, on
   // switch, reload, and lock - a forgotten armed toggle can never silently follow
   // you to another chat or survive a restart.
   const [sessionOnly, setSessionOnly] = useState(false)
+  const timeFmt = useTimeFormat()
   const endRef = useRef<HTMLDivElement>(null)
+  const msgsRef = useRef<HTMLDivElement>(null)
+  const composerRef = useRef<HTMLTextAreaElement>(null)
 
+  const scrollToBottom = () => endRef.current?.scrollIntoView({ block: 'end' })
+
+  // Keep the newest message in view on a new message.
   useEffect(() => {
-    endRef.current?.scrollIntoView({ block: 'end' })
+    scrollToBottom()
   }, [messages.length])
+
+  // The mobile keyboard shrinks the visual viewport and can hide the latest
+  // messages; when it opens or resizes while the composer is focused, re-pin to the
+  // bottom so what you just typed and the newest messages stay visible.
+  useEffect(() => {
+    const vv = window.visualViewport
+    if (!vv) return
+    const onResize = () => {
+      if (document.activeElement === composerRef.current) scrollToBottom()
+    }
+    vv.addEventListener('resize', onResize)
+    return () => vv.removeEventListener('resize', onResize)
+  }, [])
+
+  // Auto-grow the composer with its content, up to a cap (then it scrolls inside).
+  // Growing the box shrinks the message pane, so if we were pinned to the bottom,
+  // re-pin after resizing to keep the newest message visible. Measure BEFORE the
+  // resize so a user scrolled up reading history while typing is not yanked down.
+  useEffect(() => {
+    const el = composerRef.current
+    if (!el) return
+    const pane = msgsRef.current
+    const wasNearBottom = pane ? pane.scrollHeight - pane.scrollTop - pane.clientHeight < 80 : true
+    // The composer is a flex item, and a flex item's explicit `height` is overridden
+    // by the container's cross-axis sizing; `min-height` IS honored. So reset the
+    // floor, let the box collapse to one row, measure the content, then set both the
+    // height (for non-flex fallbacks) and the load-bearing min-height to it.
+    el.style.minHeight = '0px'
+    el.style.height = 'auto'
+    const h = Math.min(el.scrollHeight, COMPOSE_MAX_PX)
+    el.style.height = `${h}px`
+    el.style.minHeight = `${h}px`
+    if (wasNearBottom) scrollToBottom()
+  }, [draft])
 
   // Close the delete menu on any outside click / Escape.
   useEffect(() => {
@@ -153,7 +217,7 @@ export function Conversation({ peer, name, messages, trust, onSend, onVerify, on
         </button>
       </header>
 
-      <div className="msgs">
+      <div className="msgs" ref={msgsRef}>
         {messages.length === 0 && <p className="muted small">No messages yet. Say hello.</p>}
         {messages.map((m, i) => {
           const prev = messages[i - 1]
@@ -210,8 +274,8 @@ export function Conversation({ peer, name, messages, trust, onSend, onVerify, on
                   )}
                 </div>
                 {(showTime || m.ephemeral || m.failed) && (
-                  <span className="msg-meta tiny muted" title={new Date(m.ts).toLocaleString()}>
-                    {showTime && formatTime(m.ts)}
+                  <span className="msg-meta tiny muted" title={formatFull(m.ts, timeFmt)}>
+                    {showTime && formatTime(m.ts, timeFmt)}
                     {m.ephemeral && <span className="ephemeral-mark">{showTime ? ' · ' : ''}session-only, not saved</span>}
                     {m.failed && <span className="error">{showTime || m.ephemeral ? ' · ' : ''}not sent</span>}
                   </span>
@@ -237,12 +301,21 @@ export function Conversation({ peer, name, messages, trust, onSend, onVerify, on
         >
           session-only{sessionOnly ? ' ✓' : ''}
         </button>
-        <input
+        <textarea
+          ref={composerRef}
+          className="compose-input"
           value={draft}
+          rows={1}
           placeholder={sessionOnly ? 'session-only message' : 'message'}
           onChange={(e) => setDraft(e.target.value)}
+          onFocus={() => window.setTimeout(scrollToBottom, 300)}
           onKeyDown={(e) => {
-            if (e.key === 'Enter') submit()
+            // Physical keyboard: Enter sends, Shift+Enter is a newline. Touch: Enter
+            // is a newline and sending is an explicit Send tap.
+            if (e.key === 'Enter' && !e.shiftKey && !isTouchDevice()) {
+              e.preventDefault()
+              submit()
+            }
           }}
         />
         <button className="primary" disabled={!draft.trim()} onClick={submit}>
