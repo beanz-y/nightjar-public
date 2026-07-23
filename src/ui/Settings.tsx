@@ -11,7 +11,6 @@ import { BackupPanel } from './BackupPanel'
 import { NotifySettings } from './NotifySettings'
 import { QrCode } from './QrCode'
 import { type TimeFormat, setTimeFormat, useTimeFormat } from './timePref'
-import { type OrientationLock, setOrientationLock, useOrientationLock } from './orientationPref'
 import type { NotifyState } from './useNightjar'
 
 type Mode = 'menu' | 'mycode' | 'backup' | 'about'
@@ -48,7 +47,6 @@ export function Settings({
   const [mode, setMode] = useState<Mode>('menu')
   const [copied, setCopied] = useState(false)
   const timeFmt = useTimeFormat()
-  const orientLock = useOrientationLock()
 
   async function copyId() {
     try {
@@ -138,33 +136,6 @@ export function Settings({
             onClick={() => setTimeFormat(v)}
           >
             {v === 'auto' ? 'Auto' : v === '12' ? '12-hour' : '24-hour'}
-          </button>
-        ))}
-      </div>
-
-      <div className="field-label small muted">orientation</div>
-      <div className="row seg">
-        {(['any', 'portrait'] as OrientationLock[]).map((v) => (
-          <button
-            key={v}
-            className={`ghost small${orientLock === v ? ' seg-on' : ''}`}
-            aria-pressed={orientLock === v}
-            onClick={async () => {
-              setOrientationLock(v)
-              if (screen?.orientation) {
-                try {
-                  if (v === 'portrait') {
-                    await screen.orientation.lock('portrait')
-                  } else {
-                    await screen.orientation.unlock()
-                  }
-                } catch (e) {
-                  console.error('Orientation lock failed:', e)
-                }
-              }
-            }}
-          >
-            {v === 'any' ? 'Any' : 'Portrait'}
           </button>
         ))}
       </div>
