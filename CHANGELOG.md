@@ -11,6 +11,9 @@ release tags cut by the deploy pipeline. Dates are the tag dates.
 
 ## [Unreleased]
 
+## [1.5.1] - 2026-07-22
+- **Orientation lock for PWA** For mobile devices, prevents rotation from portrait mode.
+
 ## [1.5.0] - 2026-07-22
 
 ### Added
