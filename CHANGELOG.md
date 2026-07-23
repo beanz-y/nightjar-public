@@ -11,6 +11,9 @@ release tags cut by the deploy pipeline. Dates are the tag dates.
 
 ## [Unreleased]
 
+## [1.5.2] - 2026-07-22
+- **Orientation locked on PWA mobile**
+
 ## [1.5.0] - 2026-07-22
 
 ### Added
