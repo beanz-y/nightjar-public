@@ -11,6 +11,18 @@ release tags cut by the deploy pipeline. Dates are the tag dates.
 
 ## [Unreleased]
 
+## [1.5.3] - 2026-07-22
+
+### Fixed
+- **Portrait lock now holds on installed Android PWAs, including de-Googled ones.**
+  The manifest `orientation` field (1.5.2) only binds when the install creates a
+  WebAPK, which needs Google Play Services; on de-Googled Android (for example
+  GrapheneOS with Vanadium) an install is a home-screen shortcut with no WebAPK, so
+  the OS never applied it. The app now also locks portrait at runtime via the Screen
+  Orientation API in standalone mode, which does not depend on a WebAPK. Honest scope:
+  this affects only the installed home-screen app, never a browser tab, and iOS is not
+  covered because Apple exposes no web orientation lock at all.
+
 ## [1.5.2] - 2026-07-22
 - **Orientation locked on PWA mobile**
 
