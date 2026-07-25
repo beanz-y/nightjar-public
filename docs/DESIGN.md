@@ -102,17 +102,17 @@ cryptographic code was written; the roadmap in section 12 tracks what has shippe
 4. **Post-quantum.** Classical X25519 in v1, downgrade-protected (section 4.4) so
    a v2 PQXDH upgrade cannot be silently stripped.
 5. **Anonymity / sealed sender / cover traffic.**
-5a. **Read receipts.** Deliberately not built, not merely unbuilt. They are the one
+6. **Read receipts.** Deliberately not built, not merely unbuilt. They are the one
    delivery signal that would need a new metadata class (a reverse envelope sent at
    the moment a human looks at something) and a new durable record of a person's
    attention, and they buy little here: because the app receives nothing while
    locked (8.5), "delivered" already implies their app was open and running. The
    indicator we do ship reports on devices, not people (8.8).
-6. **Forward-secret synced history and cloud backup.** History is persisted on
+7. **Forward-secret synced history and cloud backup.** History is persisted on
    your device (section 8.5) but is per-device: it is not synced, and the identity
    backup (section 8.3) does not carry it, so it does not transfer to a new device.
-7. **Endpoint security.** A compromised device is outside the guarantees.
-8. **A trustless web client.** A PWA cannot prove to the user that the code it
+8. **Endpoint security.** A compromised device is outside the guarantees.
+9. **A trustless web client.** A PWA cannot prove to the user that the code it
    runs is honest (section 1.4). We do not pretend otherwise; we harden it,
    disclose it, and make a non-selective broad attack publicly falsifiable
    (section 10).
@@ -468,11 +468,21 @@ is a versioned envelope, `NJSN1:<digits>:<tag>` (section 14), where the digits a
 byte-identical to what the eye compares and the tag is a short hash over the pair
 digest and the `IK_sig` of the device **displaying** it. The scanner knows both
 keys, so it computes what the tag must be for its peer and what it would be for
-itself, and refuses anything that is not unambiguously the peer's. The tag is
-public, derived from values already on screen, and grants no new capability.
+itself, and refuses anything that is not unambiguously the peer's.
 
-Scanning is **fail-closed**: only an exact digit match displayed by this contact's
-device is a match. A different safety number is reported loudly, a self-scan is
+Be precise about what that tag is worth. It is a hash of **public** values, so
+anyone holding both identity public keys (which includes the operator, and includes
+a MITM who chose the substituted key) can compute either side's tag and mint a
+code that matches. It is therefore **not** proof of authorship or provenance: it
+rules out the accidental cases (scanning your own screen, a mirror, a picture of
+your own code handed back to you) and nothing more. What the scan proves is exactly
+what reading the digits aloud proves, no less and no more: that the code in front of
+you encodes the same safety number this device computed. The security of that
+comparison rests entirely on the CHANNEL it happened over, which is why the
+confirmation asks about the channel and not about the digits.
+
+Scanning is **fail-closed**: only an exact digit match whose tag names this
+contact's device as the displayer counts as a match. A different safety number is reported loudly, a self-scan is
 named as one, a code whose displayer is neither party is refused rather than
 guessed at, and an invite code or user id (the app's other two QR codes) is
 identified as such instead of reported as a mismatch. Two rules bound what a scan
@@ -927,6 +937,10 @@ Honest posture, stated plainly:
   *recipient's* app is locked or closed. The indicator reflects devices and network
   state, not intent.
 
+---
+
+## 9. Metadata: the complete leak list and our honest posture
+
 An operator who chooses to log, or anyone who can compel us, can learn:
 
 - **The directed sender -> recipient edge** (sends ride the sender's
@@ -1309,7 +1323,7 @@ Native (Tauri) is **not** on the critical path; it is a demand-gated v2 (10.5).
 | Safety number | iterated SHA-512, `N_iter` = 5200, displayed width >= 120 bits, tag `"Nightjar-SN-v1"` | 6.2 |
 | Safety-number QR payload | `NJSN1:<40 digits>:<13-char base32 tag>`. Digits are the rendered safety number with spaces stripped (byte-identical to what the eye compares). Tag = `base32(SHA-256(domainSep("Nightjar-SNQR-v1", pairDigest, displayerIkSigPub))[0..8])`, which identifies the DISPLAYING device so a self-scan cannot pass as a peer scan (the safety number is symmetric, so digits alone cannot). Parser is total and fail-closed; a bare-digit payload from an older build is refused, not accepted. A match unlocks the confirmation but never verifies on its own; a mismatch writes nothing | 6.2 |
 | Verification withdrawal | user-initiated only, behind its own confirmation, never automatic and never scan-triggered; drops to `unverified` (never back to `invite`) and clears the verification timestamp, keeping the contact, their key, and the messages | 6.2 |
-| Delivery indicator | states: sending / sent / delivered / not sent. Both positive states are RELAY assertions (no peer signature). Stamped only on a positive signal, never inferred from a missing failure marker; monotonic (never downgrades). Sealed INSIDE the history record so at rest it reveals no direction or count. Live report is fire-and-forget to a connected sender (never stored, never queued); an offline sender catches up by asking which of its own ids the recipient's existing seen-id set holds, `MAX_DELIVERED_CHECK_IDS` = 64 per request, and only for messages newer than the seen-id TTL. No read receipts (1.2#5a) | 8.8, 7.5 |
+| Delivery indicator | states: sending / sent / delivered / not sent. Both positive states are RELAY assertions (no peer signature). Stamped only on a positive signal, never inferred from a missing failure marker; monotonic (never downgrades). Sealed INSIDE the history record so at rest it reveals no direction or count. Live report is fire-and-forget to a connected sender (never stored, never queued); an offline sender catches up by asking which of its own ids the recipient's existing seen-id set holds, `MAX_DELIVERED_CHECK_IDS` = 64 per request, and only for messages newer than the seen-id TTL. No read receipts (non-goal 6 in 1.2) | 8.8, 7.5 |
 | Argon2id (backup) | m = 64 MiB, t = 3, p = 1 (measured ~2.3 s desktop via `@noble/hashes`; 256 MiB was ~9 s and risks OOM in an iOS Safari worker; RFC 9106 constrained-env recommendation); 16-B salt; XChaCha20-Poly1305 body with the header as AAD; key+nonce via HKDF-SHA256 info `"Nightjar_Backup_v1"`; restore bounds m to [8 MiB, 256 MiB], t <= 6, p == 1 before running the KDF | 8.3 |
 | Passphrase floor | typed passphrases >= 12 chars (after NFC-trim); the offered generated passphrase is 20 base32 chars (~100 bits) | 8.3 |
 | Backup blob format | magic `"NJBK"`, format version `0x01`, then m/t/p/salt header, then AEAD body; download-only in v1 | 8.3 |

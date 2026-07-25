@@ -3,6 +3,7 @@
 
 import { Fragment, useEffect, useRef, useState } from 'react'
 import type { TrustLevel } from '../trust/contactStore'
+import { EphemeralIcon } from './icons'
 import { TrustBadge } from './SafetyNumber'
 import { type TimeFormat, hour12For, useTimeFormat } from './timePref'
 import type { Message } from './useNightjar'
@@ -73,23 +74,32 @@ function DeliveryMark({ status, failed }: { status: 'sent' | 'delivered' | undef
   if (failed) return null // "not sent" already says it, louder
   if (status === 'delivered') {
     return (
-      <span className="delivery delivered" title="Their device picked this up. It does not mean they have read it.">
+      <span
+        className="delivery delivered"
+        title="The relay says their device picked this up. That is the relay's word, not theirs, and it does not mean anyone has read it."
+      >
         ✓✓
       </span>
     )
   }
   if (status === 'sent') {
     return (
-      <span className="delivery sent" title="Stored for them by the relay. Their device has not picked it up yet.">
+      <span
+        className="delivery sent"
+        title="The relay says it stored this for them. It has not reported that their device picked it up, which is not the same as knowing it has not."
+      >
         ✓
       </span>
     )
   }
-  return (
-    <span className="delivery pending" title="Still on this device, waiting to be sent.">
-      ·
-    </span>
-  )
+  // Unknown: render NOTHING. An absent status is not evidence of anything, and it
+  // covers cases that were plainly delivered: every message stored before this
+  // feature existed (nothing back-fills those rows) and every session-only message
+  // (which has no row to stamp at all). A "still waiting to be sent" dot on those
+  // would be an affirmative claim the app cannot support, which DESIGN 8.8 forbids
+  // in as many words. A genuinely queued message simply carries no mark until the
+  // relay acks it.
+  return null
 }
 
 interface Props {
@@ -104,11 +114,15 @@ interface Props {
   /** Delete-for-everyone a message you sent (P10d). `failed` is true for a
    *  never-delivered message (removed locally only). */
   onDelete: (id: string, failed?: boolean) => void
+  /** Relay connection state. Shown here only when it is BAD: on a phone the global
+   *  topbar steps aside for the chat, and "we are not connected" is the state worth
+   *  interrupting for. A permanent green dot would just be decoration. */
+  connected: boolean
   /** Narrow-screen navigation: return to the conversation list. */
   onBack?: () => void
 }
 
-export function Conversation({ peer, name, messages, trust, onSend, onVerify, onRename, onDelete, onBack }: Props) {
+export function Conversation({ peer, name, messages, trust, connected, onSend, onVerify, onRename, onDelete, onBack }: Props) {
   const [draft, setDraft] = useState('')
   const [renaming, setRenaming] = useState(false)
   const [nameDraft, setNameDraft] = useState(name)
@@ -120,6 +134,8 @@ export function Conversation({ peer, name, messages, trust, onSend, onVerify, on
   // switch, reload, and lock - a forgotten armed toggle can never silently follow
   // you to another chat or survive a restart.
   const [sessionOnly, setSessionOnly] = useState(false)
+  // Whether the header shows the peer's full user id or a truncated one.
+  const [idOpen, setIdOpen] = useState(false)
   const timeFmt = useTimeFormat()
   const endRef = useRef<HTMLDivElement>(null)
   const msgsRef = useRef<HTMLDivElement>(null)
@@ -160,9 +176,15 @@ export function Conversation({ peer, name, messages, trust, onSend, onVerify, on
     // height (for non-flex fallbacks) and the load-bearing min-height to it.
     el.style.minHeight = '0px'
     el.style.height = 'auto'
-    const h = Math.min(el.scrollHeight, COMPOSE_MAX_PX)
+    const full = el.scrollHeight
+    const h = Math.min(full, COMPOSE_MAX_PX)
     el.style.height = `${h}px`
     el.style.minHeight = `${h}px`
+    // Only scroll once the box has actually hit its cap. Leaving overflow on at
+    // every height renders a permanent scrollbar (with arrows on Windows) inside a
+    // one-line field, which is the sort of stray chrome that makes an app look
+    // unfinished.
+    el.style.overflowY = full > COMPOSE_MAX_PX ? 'auto' : 'hidden'
     if (wasNearBottom) scrollToBottom()
   }, [draft])
 
@@ -239,15 +261,34 @@ export function Conversation({ peer, name, messages, trust, onSend, onVerify, on
                 </button>
               </div>
             )}
-            {/* The real device id stays visible so verification is always by
-                identity, never by the (cosmetic, self-set) name. */}
-            <div className="mono break tiny muted">{peer}</div>
-            {trust && <TrustBadge trust={trust} />}
+            {/* The real device id stays REACHABLE so verification is always by
+                identity, never by the (cosmetic, self-set) name. It used to wrap to
+                two monospace lines and dominate the header; it is now one truncated
+                line that expands in place on tap. Shortened for reading, never for
+                comparing: the full value is one tap away and the verify screen shows
+                it in full alongside the safety number. */}
+            <button
+              type="button"
+              className="convo-id"
+              aria-expanded={idOpen}
+              title={idOpen ? 'hide the full user id' : 'show the full user id'}
+              onClick={() => setIdOpen((v) => !v)}
+            >
+              <span className={`mono tiny muted${idOpen ? ' break' : ' convo-id-short'}`}>{peer}</span>
+            </button>
           </div>
         </div>
-        <button className="ghost small" onClick={onVerify}>
-          {trust === 'verified' ? 'verified ✓' : 'verify'}
-        </button>
+        <div className="convo-head-right">
+          {!connected && (
+            <span className="offline-chip" title="Not connected to the relay. Messages you send stay queued on this device and go out when the connection returns.">
+              offline
+            </span>
+          )}
+          {trust && <TrustBadge trust={trust} />}
+          <button className="ghost small" onClick={onVerify}>
+            {trust === 'verified' ? 'verified ✓' : 'verify'}
+          </button>
+        </div>
       </header>
 
       <div className="msgs" ref={msgsRef}>
@@ -323,19 +364,35 @@ export function Conversation({ peer, name, messages, trust, onSend, onVerify, on
         <div ref={endRef} />
       </div>
 
-      {/* Compose. When session-only is armed the whole bar restyles, the placeholder
-          and send label change, and every sent bubble carries a "session-only" mark -
-          four redundant signals so the armed mode is unmissable (a wrong-mode send is
-          the sharp footgun, DESIGN 8.7). */}
+      {/* Compose. When session-only is armed the whole bar restyles, a labelled strip
+          appears above it, the placeholder and send label change, and every sent
+          bubble carries a "session-only" mark: redundant signals so the armed mode is
+          unmissable (a wrong-mode send is the sharp footgun, DESIGN 8.7).
+
+          The toggle is a compact control rather than a wide text chip because the chip
+          was taking about a third of the compose row on a phone, squeezing the message
+          field. The signal that chip carried is not lost, it moved into the strip
+          below, which is bigger and states the consequence in words rather than
+          leaving the reader to infer it from a label. */}
+      {sessionOnly && (
+        <div className="ephemeral-strip" role="status">
+          <span className="ephemeral-strip-dot" aria-hidden="true" />
+          <span>
+            <strong>Session-only.</strong> This message is not saved on either device, and it is gone when you reload
+            or lock. They can still screenshot it.
+          </span>
+        </div>
+      )}
       <div className={`compose${sessionOnly ? ' compose-ephemeral' : ''}`}>
         <button
           type="button"
           className={`session-toggle${sessionOnly ? ' on' : ''}`}
           aria-pressed={sessionOnly}
+          aria-label={sessionOnly ? 'Session-only is on. Turn it off.' : 'Send session-only (not saved)'}
           title="Session-only: shown live but not saved to history on either device, and cleared when you reload or lock. The other person can still screenshot or copy it, and a modified app could keep it. Off-the-record courtesy, not a guarantee."
           onClick={() => setSessionOnly((v) => !v)}
         >
-          session-only{sessionOnly ? ' ✓' : ''}
+          <EphemeralIcon />
         </button>
         <textarea
           ref={composerRef}

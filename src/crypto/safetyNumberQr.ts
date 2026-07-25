@@ -20,6 +20,14 @@
 // non-secret, and derived from the same values already on screen: it grants no new
 // capability and adds no identifier a photograph of the code did not already imply.
 //
+// What that buys, precisely: it defeats the ACCIDENTAL self-scan. It does NOT prove
+// provenance. Because the inputs are public, an adversary holding both identity
+// public keys (the operator, or a MITM who chose the substituted key) can mint a
+// code that matches perfectly. A scan therefore proves exactly what reading the
+// digits aloud proves: that the code in front of you encodes the same safety number
+// this device computed. The security lives in the CHANNEL, which is why the human
+// still attests to it.
+//
 // Payload:  NJSN1:<digits>:<tag>
 //   NJSN1   4-char namespace + envelope version, matching the NJM1 / NJBK house
 //           style. The namespace is what stops an invite code or a user id being
@@ -40,9 +48,12 @@ import { base32lower, domainSeparate, hash256 } from './primitives'
 export const SN_QR_MAGIC = 'NJSN1'
 /** Domain-separation tag: this hash use must never collide with another. */
 export const SN_QR_TAG = 'Nightjar-SNQR-v1'
-/** Truncation of the direction tag. Nothing adversarial rests on its collision
- *  resistance (an attacker who could forge it would still have to match all
- *  digits, which requires the real key), so 64 bits is ample. */
+/** Truncation of the direction tag. Nothing rests on its collision resistance,
+ *  because nothing rests on it being unforgeable in the first place: every input is
+ *  public, so anyone holding both identity public keys can compute either side's
+ *  tag AND the matching digits. The tag rules out the ACCIDENTAL cases (a self-scan,
+ *  a mirror, your own code handed back); it is not an authenticity proof, and the UI
+ *  must not present it as one. 64 bits is ample for that job. */
 const SN_QR_TAG_BYTES = 8
 
 const SN_DIGIT_COUNT = SN_GROUPS * SN_DIGITS_PER_GROUP
@@ -72,7 +83,7 @@ export function encodeSafetyNumberQr(digits: string, digest: Uint8Array, myIkSig
  *  message: telling someone "that did not match" when they actually scanned an
  *  invite code would send them hunting for an attack that is not there. */
 export type ScanRejection =
-  | 'unsupported-version' // a Nightjar safety-number code this build cannot read
+  | 'unreadable-nightjar-code' // shaped like one of ours, but this build cannot read it
   | 'legacy-digits' // bare digits: a peer on an older build
   | 'other-nightjar-code' // an invite code or a user id, both also QRs in this app
   | 'unreadable' // not a Nightjar code at all
@@ -100,9 +111,11 @@ export function parseSafetyNumberQr(text: string): { digits: string; tag: string
   if (raw.length === 0 || raw.length > MAX_SCAN_CHARS) return { rejected: 'unreadable' }
   const m = PAYLOAD_RE.exec(raw)
   if (m) return { digits: m[1], tag: m[2] }
-  // A Nightjar safety-number code from a build we cannot read. Checked before the
-  // generic cases so it never degrades to "that is not a Nightjar code".
-  if (/^NJSN\d*:/.test(raw)) return { rejected: 'unsupported-version' }
+  // Shaped like one of our safety-number codes but not readable by this build:
+  // either a newer format, or a current-format payload whose body is malformed.
+  // Deliberately ONE reason, because we cannot tell those apart, and blaming the
+  // peer's app version for a corrupt code would be a guess presented as a fact.
+  if (/^NJSN\d*:/.test(raw)) return { rejected: 'unreadable-nightjar-code' }
   // The payload this app itself generated before scanning existed.
   if (new RegExp(`^\\d{${SN_DIGIT_COUNT}}$`).test(raw)) return { rejected: 'legacy-digits' }
   // The two other QR codes in this app, so the user gets "that is your invite

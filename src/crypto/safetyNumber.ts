@@ -22,9 +22,11 @@ export function safetyNumberDigest(ikSigPubA: Uint8Array, ikSigPubB: Uint8Array)
   return digest
 }
 
-/** The human-facing safety number, e.g. "01234 56789 ...". */
-export function safetyNumber(ikSigPubA: Uint8Array, ikSigPubB: Uint8Array): string {
-  const digest = safetyNumberDigest(ikSigPubA, ikSigPubB)
+/** Render an already-computed digest as the human-facing digit groups. Split out so
+ *  a caller that needs BOTH the digest and the digits (the verify screen, which
+ *  needs the digest for the QR direction tag) pays for the 5200 iterated hashes
+ *  once instead of twice. */
+export function renderSafetyNumber(digest: Uint8Array): string {
   const groups: string[] = []
   for (let g = 0; g < SN_GROUPS; g++) {
     // 5 big-endian bytes -> a value mod 100000, zero-padded to 5 digits.
@@ -33,4 +35,9 @@ export function safetyNumber(ikSigPubA: Uint8Array, ikSigPubB: Uint8Array): stri
     groups.push(String(value).padStart(SN_DIGITS_PER_GROUP, '0'))
   }
   return groups.join(' ')
+}
+
+/** The human-facing safety number, e.g. "01234 56789 ...". */
+export function safetyNumber(ikSigPubA: Uint8Array, ikSigPubB: Uint8Array): string {
+  return renderSafetyNumber(safetyNumberDigest(ikSigPubA, ikSigPubB))
 }

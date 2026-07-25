@@ -344,8 +344,11 @@ export class MemorySessionStore implements SessionStore {
   }
 
   async historyUpdate(rec: HistoryRecord): Promise<void> {
-    if (!this.history.has(rec.key)) return
-    this.history.set(rec.key, clone(rec))
+    const current = this.history.get(rec.key)
+    if (!current) return
+    // Preserve a `failed` flag set since the caller read the row (see the IndexedDB
+    // implementation for why).
+    this.history.set(rec.key, clone(current.failed ? { ...rec, failed: true } : rec))
   }
 
   async historyRemove(key: string): Promise<void> {
@@ -668,6 +671,13 @@ export class IdbSessionStore implements SessionStore {
   // Existence is re-checked inside the SAME transaction as the put, so a row
   // deleted in between (delete-for-everyone, an ephemeral cleanup) is not
   // resurrected by a status update that was already in flight.
+  //
+  // The `failed` flag is carried over from whatever is on disk NOW rather than from
+  // the caller's snapshot. A status update is a read-modify-write across two
+  // transactions, and historyMarkFailed writes the same row from outside the
+  // per-peer lock, so a caller that read before that write would otherwise put back
+  // a record with the flag cleared and a permanently rejected message would start
+  // reading as delivered.
   async historyUpdate(rec: HistoryRecord): Promise<void> {
     const db = await this.open()
     await new Promise<void>((resolve, reject) => {
@@ -675,7 +685,8 @@ export class IdbSessionStore implements SessionStore {
       const store = t.objectStore(HISTORY)
       const get = store.get(rec.key)
       get.onsuccess = () => {
-        if (get.result !== undefined) store.put(rec, rec.key)
+        const current = get.result as HistoryRecord | undefined
+        if (current !== undefined) store.put(current.failed ? { ...rec, failed: true } : rec, rec.key)
       }
       get.onerror = () => reject(get.error)
       t.oncomplete = () => resolve()

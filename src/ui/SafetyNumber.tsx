@@ -23,8 +23,8 @@
 //     downgrade would let anyone who can hold a QR up to a camera strip a real
 //     verification. Withdrawing is a separate, deliberate action.
 
-import { useState } from 'react'
-import { safetyNumber, safetyNumberDigest } from '../crypto/safetyNumber'
+import { useMemo, useState } from 'react'
+import { renderSafetyNumber, safetyNumberDigest } from '../crypto/safetyNumber'
 import { compareScannedSafetyNumber, encodeSafetyNumberQr, type ScanVerdict } from '../crypto/safetyNumberQr'
 import type { Contact, TrustLevel } from '../trust/contactStore'
 import { b64decode } from '../wire/codec'
@@ -47,7 +47,8 @@ export function TrustBadge({ trust }: { trust: TrustLevel }) {
  *  someone "that did not match" when they actually scanned their invite code sends
  *  them hunting for an attack that is not there. */
 const REJECTION_TEXT: Record<string, string> = {
-  'unsupported-version': 'Their app is a newer version than this one, so this device cannot read their code. Update, or compare the digits by eye.',
+  'unreadable-nightjar-code':
+    'That looks like a Nightjar safety-number code, but this device cannot read it. Their app may be a newer version, or the code may be damaged. Compare the digits by eye instead.',
   'legacy-digits': 'Their app is an older version whose code cannot be checked for who displayed it. Ask them to update, or compare the digits by eye.',
   'other-nightjar-code': 'That is an invite code or a user id, not a safety-number code. Ask them to open this contact and show the code on their verify screen.',
   unreadable: 'That is not a Nightjar safety-number code.',
@@ -69,20 +70,25 @@ export function SafetyNumberView({ myIkSigPub, contact, name, onVerify, onUnveri
   const [scanning, setScanning] = useState(false)
   const [verdict, setVerdict] = useState<ScanVerdict | null>(null)
 
-  let number = ''
-  let digest: Uint8Array | null = null
-  try {
-    const peerKey = b64decode(contact.ikSig)
-    number = safetyNumber(myIkSigPub, peerKey)
-    digest = safetyNumberDigest(myIkSigPub, peerKey)
-  } catch {
-    number = ''
-  }
+  // Memoized on the two keys: the safety number is 5200 iterated SHA-512 rounds and
+  // computing the digest separately doubles that, so doing it in the render body
+  // put roughly 20ms of synchronous main-thread work (several times that on a
+  // phone) into every single re-render of this screen, including every keystroke in
+  // the rename box. It depends on nothing but the pair, so it is computed once.
+  const { number, digest, qrPayload } = useMemo(() => {
+    try {
+      const peerKey = b64decode(contact.ikSig)
+      const d = safetyNumberDigest(myIkSigPub, peerKey)
+      const n = renderSafetyNumber(d)
+      // The QR carries the same digits the eye compares, plus a tag identifying THIS
+      // device as the one displaying it, so the other side can tell a real scan of
+      // our screen from a scan of their own. Derived entirely from public keys.
+      return { number: n, digest: d, qrPayload: encodeSafetyNumberQr(n, d, myIkSigPub) }
+    } catch {
+      return { number: '', digest: null as Uint8Array | null, qrPayload: '' }
+    }
+  }, [contact.ikSig, myIkSigPub])
   const groups = number.split(' ')
-  // The QR carries the same digits the eye compares, plus a tag identifying THIS
-  // device as the one displaying it, so the other side can tell a real scan of our
-  // screen from a scan of their own. Derived entirely from public keys.
-  const qrPayload = digest ? encodeSafetyNumberQr(number, digest, myIkSigPub) : ''
 
   const who = name?.trim() || `${contact.peerId.slice(0, 8)}…`
 
@@ -144,11 +150,13 @@ export function SafetyNumberView({ myIkSigPub, contact, name, onVerify, onUnveri
                 is who you think it is.
               </p>
 
-              {contact.trust !== 'verified' && (
-                <button className="ghost" onClick={() => { setVerdict(null); setScanning(true) }}>
-                  scan their code
-                </button>
-              )}
+              {/* Offered whatever the current trust is. Re-checking an ALREADY
+                  verified contact is a thing people do after a scare, and it is
+                  exactly what DESIGN 6.4 wants them to do, so the instruction above
+                  must not point at a button that is not there. */}
+              <button className="ghost" onClick={() => { setVerdict(null); setScanning(true) }}>
+                scan their code
+              </button>
             </>
           )}
 
@@ -195,8 +203,19 @@ export function SafetyNumberView({ myIkSigPub, contact, name, onVerify, onUnveri
               </p>
               <p className="tiny muted">
                 A code someone sent you as an image or a screenshot proves nothing: anyone can forward a picture of a
-                real code.
+                real code, and anyone holding both public keys can make one that matches.
               </p>
+              {/* A scan that did NOT match stays on screen while this block is open,
+                  so the button must never ask the user to attest to a match the app
+                  just contradicted. Verifying by eye after a failed scan is still
+                  allowed (a mismatch must not lock anyone out, and it writes no
+                  state), but the words have to describe what they actually did. */}
+              {verdict && verdict.kind !== 'match' && (
+                <p className="tiny scan-contradiction">
+                  Note: the code you scanned did not check out. Only confirm if you have since compared the digits
+                  yourself.
+                </p>
+              )}
               <div className="row">
                 <button
                   className="danger"
@@ -205,7 +224,7 @@ export function SafetyNumberView({ myIkSigPub, contact, name, onVerify, onUnveri
                     setConfirming(false)
                   }}
                 >
-                  {verdict?.kind === 'match' ? 'yes, I scanned their device' : 'yes, every digit matched'}
+                  {verdict?.kind === 'match' ? 'yes, I scanned their device' : 'yes, I compared the digits'}
                 </button>
                 <button className="ghost" onClick={() => setConfirming(false)}>
                   cancel
@@ -232,11 +251,12 @@ function ScanResult({ verdict, who }: { verdict: ScanVerdict; who: string }) {
     return (
       <div className="scan-result scan-ok">
         <p className="small">
-          <strong>The codes match.</strong> That code carries the same safety number this device computed, and it was
-          displayed by {who}&apos;s device.
+          <strong>The codes match.</strong> That code carries the same safety number this device computed, and it names{' '}
+          {who}&apos;s device as the one displaying it rather than this one.
         </p>
         <p className="tiny muted">
-          This confirms the two devices agree. It cannot tell where the image came from, so the last step is yours.
+          That is all a code can show. It is built from public keys, so it cannot prove the image came from {who}
+          &apos;s screen just now, or that it was made by their device at all. The last step is yours.
         </p>
       </div>
     )

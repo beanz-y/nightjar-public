@@ -142,6 +142,7 @@ export function App() {
             {isReady && identity && (
               <Messenger
                 identity={identity}
+                connected={connected}
                 contacts={contacts}
                 aliases={aliases}
                 conversations={conversations}

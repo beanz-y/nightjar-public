@@ -23,6 +23,9 @@ interface Props {
   contacts: Contact[]
   aliases: Record<string, string>
   conversations: Record<string, Message[]>
+  /** Relay connection state. Surfaced inside a conversation because on a phone the
+   *  global topbar (which carries the dot) steps aside for the chat. */
+  connected: boolean
   notify: NotifyState
   storagePersisted: boolean | null
   canary: CanaryResult | null
@@ -51,7 +54,7 @@ function shortId(id: string): string {
   return `${id.slice(0, 6)}…${id.slice(-4)}`
 }
 
-export function Messenger({ identity, contacts, aliases, conversations, notify, storagePersisted, canary, bioAvailable, lockMethods, actions }: Props) {
+export function Messenger({ identity, connected, contacts, aliases, conversations, notify, storagePersisted, canary, bioAvailable, lockMethods, actions }: Props) {
   const displayName = (peer: string): string => aliases[peer]?.trim() || shortId(peer)
   const [selected, setSelected] = useState<string | null>(null)
   const [chatView, setChatView] = useState<'chat' | 'verify'>('chat')
@@ -248,6 +251,7 @@ export function Messenger({ identity, contacts, aliases, conversations, notify, 
             // toggle must never silently follow you from one chat to another).
             key={selected}
             peer={selected}
+            connected={connected}
             name={aliases[selected]?.trim() || ''}
             messages={conversations[selected] ?? []}
             trust={selectedContact?.trust ?? null}

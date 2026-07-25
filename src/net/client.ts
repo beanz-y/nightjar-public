@@ -65,6 +65,10 @@ const USER_ID_RE = /^[a-z2-7]{52}$/
  *  the shared Directory (the InvitePanel's active poll calls syncInviteContacts()
  *  directly for immediate freshness while a user watches someone join). */
 const REDEMPTION_SYNC_MIN_INTERVAL_MS = 60 * 1000
+/** Throttle for the delivery catch-up. It is a whole-history scan, and missing one
+ *  round costs nothing: the live report covers everything that happens while
+ *  connected, and the next connect picks up the rest. */
+const DELIVERED_CHECK_MIN_INTERVAL_MS = 60 * 1000
 
 /** A message as the UI/history layer sees it: keyed by the content msgId (P10b)
  *  for a structured message, or the transport envelope id for a legacy one. The
@@ -139,6 +143,11 @@ export class NightjarClient {
   private readonly warnedSendCodes = new Set<string>()
   /** When the mutual-invite redemption sync last ran (throttles the reconnect backstop). */
   private lastRedemptionSyncAt = 0
+  /** When the delivery catch-up last ran. It scans and decrypts every stored
+   *  message, which is O(all history) on the main thread, and afterConnect runs on
+   *  every reconnect (a waking phone re-enters it on visibility and network
+   *  events). Throttled for the same reason the redemption sync is. */
+  private lastDeliveredCheckAt = 0
 
   constructor(
     private readonly identity: Identity,
@@ -705,8 +714,18 @@ export class NightjarClient {
    */
   private async flushDeliveredChecks(): Promise<void> {
     if (!this.history) return
+    const now = Date.now()
+    if (now - this.lastDeliveredCheckAt < DELIVERED_CHECK_MIN_INTERVAL_MS) return
+    this.lastDeliveredCheckAt = now
     const rows = await this.store.historyLoadAll()
-    const byPeer = new Map<string, string[]>()
+    const cutoff = now - SEEN_ID_TTL_MS
+    // Collect candidates with their timestamps FIRST, then take the newest per
+    // peer. Truncating during the scan would keep whichever ids happened to come
+    // first out of `getAll()`, and the history key is an opaque HMAC, so that order
+    // is uncorrelated with time: past the cap, a fixed arbitrary subset would be
+    // asked about on every single connect and the rest could never be confirmed.
+    // This is the same trap the outbox flush had, so it gets the same answer.
+    const byPeer = new Map<string, Array<{ id: string; ts: number }>>()
     for (const row of rows) {
       if (row.failed) continue
       let msg
@@ -718,13 +737,17 @@ export class NightjarClient {
       if (msg.dir !== 'out' || msg.status !== 'sent') continue
       // The relay's seen-id set is pruned on its own TTL, so an older message
       // would answer "not delivered" forever. Do not ask about those at all.
-      if (Date.now() - msg.ts > SEEN_ID_TTL_MS) continue
+      if (msg.ts < cutoff) continue
       const list = byPeer.get(msg.peerId) ?? []
-      if (list.length < MAX_DELIVERED_CHECK_IDS) list.push(msg.id)
+      list.push({ id: msg.id, ts: msg.ts })
       byPeer.set(msg.peerId, list)
     }
-    for (const [peer, ids] of byPeer) {
-      if (ids.length === 0) continue
+    for (const [peer, candidates] of byPeer) {
+      if (candidates.length === 0) continue
+      const ids = candidates
+        .sort((a, b) => b.ts - a.ts) // newest first
+        .slice(0, MAX_DELIVERED_CHECK_IDS)
+        .map((c) => c.id)
       try {
         const delivered = await this.directory.deliveredCheck(peer, ids)
         for (const id of delivered) await this.markDelivery(peer, id, 'delivered')

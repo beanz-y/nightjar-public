@@ -11,6 +11,64 @@ release tags cut by the deploy pipeline. Dates are the tag dates.
 
 ## [Unreleased]
 
+## [1.6.1] - 2026-07-25
+
+### Fixed
+- **Corrected two claims the app was making that it could not support.** An
+  adversarial review of the 1.6.0 release found them, and both were on the parts
+  that matter most. First, a message with no delivery information was showing a dot
+  reading "still on this device, waiting to be sent". That was false for every
+  message sent before the feature existed and for every session-only message, both
+  of which had in fact gone out. An unknown state now shows nothing, which is what
+  the design said all along. Second, a successful code scan on the verify screen
+  said the code "was displayed by their device". It cannot know that: the code is
+  built from public keys, so a forwarded photo, or anyone holding both public keys,
+  produces the same result. It now says what the check actually shows, and the
+  documentation says the same.
+- **The delivery tooltips now name the relay** as the source of both states, and no
+  longer claim "their device has not picked it up yet" when the truth is only that
+  the relay has not said so.
+- **The scan option is offered for already-verified contacts**, which the screen was
+  telling people to do while hiding the button. After a scan that did not check out,
+  the confirmation no longer asks you to agree that "every digit matched".
+- **Restored the "Metadata" heading in DESIGN.md**, which the 1.6.0 edit removed by
+  accident, leaving the whole leak list buried inside the delivery-indicator section
+  and five cross-references pointing at nothing. Also fixed the non-goals list,
+  where a "5a." entry silently collapsed four items into one paragraph.
+- **The delivery catch-up no longer rescans all history on every reconnect**, and
+  picks the most recent messages to ask about rather than an arbitrary hash-ordered
+  subset, so past the first 64 a message could previously never be confirmed.
+- **A delivery update can no longer erase a "not sent" marker** written concurrently.
+- **The verify screen no longer recomputes the safety number on every keystroke**
+  (it is thousands of hash rounds, and it was running twice per render).
+
+### Changed
+- **The app now reaches the edges of your screen.** Everything sat inside a fixed
+  inset, so on a phone the compose bar, the header rules and the message list all
+  stopped short of the edge and the app read as a page floating in a box. The shell
+  is full width now, and each bar places its own content; the centred column
+  remains only on a wide desktop window, where it is actually wanted.
+- **The message field got its width back.** The session-only control was a wide
+  text chip taking about a third of the compose row. It is now a compact toggle,
+  and when it is armed a labelled strip appears above the bar saying, in words,
+  that the message will not be saved and can still be screenshotted. That is a
+  stronger warning than the chip it replaced, not a quieter one.
+- **A conversation gets the whole screen on a phone.** The app title bar is list
+  chrome, so it steps aside when you open a chat. The connection state it carried
+  is not lost: a conversation now says "offline" in its header when the relay
+  connection is down, which is the part worth interrupting for.
+- **The conversation header reads as a person, not a key.** The full user id used
+  to wrap onto two monospace lines and dominate the header. It is now one quiet
+  line that expands in place when tapped, with the name, trust badge and verify
+  button on one aligned row. The id stays visible and one tap from full, because
+  verification is always by identity and never by the nickname you set.
+- **Messages sit at the bottom** of the conversation like every other messenger,
+  instead of floating at the top, and a bubble now stops at about three quarters of
+  the row so who said what reads instantly from shape alone.
+- **Smaller things**: the canary warning is a compact row instead of three lines
+  (it stays visible, it is a security notice), and the message box no longer shows
+  a permanent scrollbar when it holds a single line.
+
 ## [1.6.0] - 2026-07-24
 
 ### Added

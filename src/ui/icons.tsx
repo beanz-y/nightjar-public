@@ -81,6 +81,20 @@ export function KeyboardIcon(props: IconProps) {
   )
 }
 
+/** Session-only (ephemeral): an eye with a slash, i.e. seen but not kept. Paired
+ *  with a written strip above the compose bar when armed, never on its own: an
+ *  icon alone would be a weaker signal than the text chip it replaced, and DESIGN
+ *  8.7 requires the armed state to be unmissable. */
+export function EphemeralIcon(props: IconProps) {
+  return (
+    <Svg size={props.size ?? 18}>
+      <path d="M2.5 12s3.5-6 9.5-6 9.5 6 9.5 6-3.5 6-9.5 6-9.5-6-9.5-6Z" />
+      <circle cx="12" cy="12" r="2.6" />
+      <path d="M3.5 3.5l17 17" />
+    </Svg>
+  )
+}
+
 /** Invite someone new: a plus. */
 export function PlusIcon(props: IconProps) {
   return (

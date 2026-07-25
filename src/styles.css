@@ -125,6 +125,13 @@ input {
 }
 
 /* --- shell -------------------------------------------------------------- */
+/* The app shell is FULL BLEED. It used to carry `padding: 0 1rem`, which inset
+   everything inside it, so on a phone nothing reached the screen edge: not the
+   compose bar, not the header rules, not the message list, and the app read as a
+   page floating in a box rather than as an app. Horizontal padding now belongs to
+   the individual bars and panes, so each one can span the full width and place its
+   own content, and the centred column survives only where it is actually wanted
+   (a wide desktop window). */
 .root {
   max-width: 62rem;
   margin: 0 auto;
@@ -135,13 +142,17 @@ input {
   overflow: hidden; /* inner panes scroll, not the page */
   display: flex;
   flex-direction: column;
-  padding: 0 1rem;
+}
+/* The one place the shell's own inset is still wanted: the pre-messenger screens
+   and every full-width bar draw their own gutter from this. */
+:root {
+  --gutter: 1rem;
 }
 .topbar {
   display: flex;
   align-items: center;
   gap: 0.6rem;
-  padding: 1rem 0.25rem 0.75rem;
+  padding: 0.9rem var(--gutter) 0.75rem;
   border-bottom: 1px solid var(--border);
   flex-shrink: 0;
 }
@@ -165,17 +176,40 @@ input {
 .dot-off {
   background: var(--muted);
 }
+/* Banners stay visible (a canary warning MUST be, DESIGN 10.3) but are compact:
+   the old layout let the action links wrap into a vertical stack, so a single
+   sentence occupied roughly a sixth of a phone screen above the chat. Actions now
+   sit on their own row under the text and stay on one line. */
 .banner {
   display: flex;
+  flex-wrap: wrap;
   justify-content: space-between;
-  align-items: center;
-  gap: 1rem;
+  align-items: baseline;
+  gap: 0.25rem 0.9rem;
   background: #1a1420;
   border: 1px solid #3a2740;
   color: var(--warn);
   border-radius: 0.4rem;
-  padding: 0.5rem 0.75rem;
-  margin: 0.6rem 0;
+  padding: 0.45rem 0.7rem;
+  line-height: 1.35;
+  /* The shell is flush now, so a rounded banner needs its own side margin or it
+     would sit hard against the screen edge. */
+  margin: 0.5rem var(--gutter);
+}
+.banner > .small {
+  flex: 1 1 14rem;
+  min-width: 0;
+  font-size: 0.8rem;
+}
+.banner .row {
+  margin: 0;
+  gap: 0.9rem;
+  flex-wrap: nowrap;
+  flex-shrink: 0;
+}
+.banner .link {
+  font-size: 0.8rem;
+  white-space: nowrap;
 }
 .banner-alert {
   background: #201014;
@@ -190,7 +224,7 @@ input {
   flex: 1;
   min-height: 0;
   overflow-y: auto;
-  padding: 1rem 0.25rem;
+  padding: 1rem var(--gutter);
 }
 /* When the messenger is up it owns the whole area and manages its own scroll. */
 .content-app {
@@ -203,7 +237,7 @@ input {
   justify-content: space-between;
   align-items: center;
   border-top: 1px solid var(--border);
-  padding: 0.9rem 0.25rem;
+  padding: 0.9rem var(--gutter);
   margin-top: 1rem;
 }
 
@@ -237,7 +271,7 @@ input {
   display: flex;
   justify-content: space-between;
   align-items: center;
-  padding: 0.6rem 0.5rem 0.7rem;
+  padding: 0.6rem var(--gutter) 0.7rem;
   border-bottom: 1px solid var(--border);
   flex-shrink: 0;
 }
@@ -263,7 +297,7 @@ input {
   flex: 1;
   min-height: 0;
   overflow-y: auto;
-  padding: 0.5rem 0.35rem;
+  padding: 0.5rem 0.6rem;
   display: flex;
   flex-direction: column;
   gap: 0.35rem;
@@ -315,7 +349,7 @@ input {
   max-width: 34rem;
   width: 100%;
   margin: 0 auto;
-  padding: 0.75rem 0.35rem 2rem;
+  padding: 0.75rem var(--gutter) 2rem;
   overflow-y: auto;
   min-height: 0;
 }
@@ -418,6 +452,15 @@ textarea.mono {
 
 /* single-pane on narrow screens: list <-> conversation */
 @media (max-width: 44rem) {
+  /* On a phone an open conversation gets the whole screen: the app wordmark is
+     list-screen chrome, and repeating it above every chat costs about 60px of a
+     small viewport for no information. The connection state it carried is not
+     lost, the conversation header shows it when it is BAD (Conversation.tsx).
+     `:has()` keeps this in CSS rather than threading layout state through React;
+     where it is unsupported the bar simply stays, which is the old behaviour. */
+  .root:has(.msgr.has-selection) .topbar {
+    display: none;
+  }
   .msgr-list {
     width: 100%;
     border-right: 0;
@@ -503,6 +546,16 @@ textarea.mono {
   color: var(--ok);
   border-color: var(--ok);
 }
+/* Shown in a conversation only while the relay connection is down. */
+.offline-chip {
+  font-size: 0.7rem;
+  font-weight: 600;
+  padding: 0.1rem 0.4rem;
+  border-radius: 0.3rem;
+  border: 1px solid var(--warn);
+  color: var(--warn);
+  white-space: nowrap;
+}
 
 /* --- pane / conversation ------------------------------------------------ */
 .pane {
@@ -522,8 +575,8 @@ textarea.mono {
   display: flex;
   justify-content: space-between;
   align-items: center;
-  gap: 1rem;
-  padding: 0.6rem 0.25rem;
+  gap: 0.75rem;
+  padding: 0.6rem var(--gutter);
   border-bottom: 1px solid var(--border);
   flex-shrink: 0;
 }
@@ -537,7 +590,32 @@ textarea.mono {
   min-width: 0;
   display: flex;
   flex-direction: column;
-  gap: 0.15rem;
+  gap: 0.1rem;
+}
+.convo-head-right {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  flex-shrink: 0;
+}
+/* The peer id: one quiet line under the name, expandable in place. It is a real
+   button so it is keyboard reachable, but it must not look like one. */
+.convo-id {
+  background: none;
+  border: 0;
+  padding: 0;
+  text-align: left;
+  min-width: 0;
+  display: block;
+}
+.convo-id-short {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.convo-id:hover .mono {
+  color: var(--fg);
 }
 .convo-title {
   display: flex;
@@ -563,10 +641,19 @@ textarea.mono {
 .msgs {
   flex: 1;
   overflow-y: auto;
-  padding: 0.75rem 0.5rem;
+  padding: 0.75rem var(--gutter);
   display: flex;
   flex-direction: column;
   gap: 0.4rem;
+}
+/* Bottom-anchor the log: a short conversation sits ON the compose bar the way a
+   messenger does, instead of floating at the top above a void. An auto margin on
+   a leading pseudo-element is the safe way to do it, because
+   `justify-content: flex-end` on a scroll container makes overflowing content
+   unreachable at the top in some engines. */
+.msgs::before {
+  content: '';
+  margin-top: auto;
 }
 .msg {
   display: flex;
@@ -612,10 +699,11 @@ textarea.mono {
   padding: 0.15rem 0.7rem;
 }
 .bubble {
-  /* Span the full width of the row when the content needs it; short messages still
-     shrink-wrap and sit on their sender's side. min-width:0 + overflow-wrap let the
+  /* Capped so a message never spans the whole row: direction then reads instantly
+     from shape alone, and a long paragraph keeps a comfortable measure instead of
+     running the full width of a desktop window. min-width:0 + overflow-wrap let the
      flex item shrink and wrap normally instead of forcing one word per line. */
-  max-width: 100%;
+  max-width: 75%;
   min-width: 0;
   padding: 0.45rem 0.7rem;
   border-radius: 0.7rem;
@@ -682,7 +770,7 @@ textarea.mono {
   display: flex;
   gap: 0.5rem;
   align-items: flex-end;
-  padding: 0.55rem 0.5rem;
+  padding: 0.55rem var(--gutter);
   /* Lift the bar off the very bottom edge so it reads as a natural bar (and clear
      the iPhone home indicator so it is never behind it). */
   padding-bottom: calc(0.7rem + env(safe-area-inset-bottom, 0));
@@ -692,12 +780,19 @@ textarea.mono {
 }
 .compose .compose-input {
   flex: 1;
+  min-width: 0;
   border-radius: 1.15rem;
   padding: 0.55rem 0.95rem;
   resize: none;
   max-height: 40vh;
-  overflow-y: auto;
+  /* overflow-y is set by the auto-grow effect: hidden until the box hits its cap,
+     so a one-line field never shows a scrollbar. */
+  overflow-y: hidden;
   font: inherit;
+}
+.compose .compose-input:focus-visible {
+  outline: none;
+  border-color: var(--accent);
 }
 .compose .primary {
   border-radius: 1.3rem;
@@ -709,21 +804,56 @@ textarea.mono {
    throughout (distinct from the blue accent and the red danger) so it is
    unmistakable at a glance: the toggle chip, the whole compose bar, the send
    button, and every ephemeral bubble all pick it up. */
+/* A compact square control rather than a wide text chip: the chip was eating about
+   a third of the compose row on a phone. The armed state is carried by the strip
+   above the bar, the bar restyle, the placeholder and the send label, so the signal
+   is stronger than before, not weaker (DESIGN 8.7). */
 .session-toggle {
   flex-shrink: 0;
-  border-radius: 1.3rem;
+  width: 2.3rem;
+  height: 2.3rem;
+  border-radius: 50%;
   border: 1px solid var(--border);
   background: transparent;
   color: var(--muted);
-  padding: 0.4rem 0.7rem;
-  font-size: 0.8rem;
-  white-space: nowrap;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+}
+.session-toggle:hover {
+  color: var(--fg);
+  border-color: var(--accent);
 }
 .session-toggle.on {
   border-color: var(--warn);
   color: var(--warn);
-  background: color-mix(in srgb, var(--warn) 14%, transparent);
-  font-weight: 600;
+  background: color-mix(in srgb, var(--warn) 16%, transparent);
+}
+/* The written half of the armed signal: says what will happen, in words, right
+   where the message is about to be typed. */
+.ephemeral-strip {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.5rem;
+  flex-shrink: 0;
+  padding: 0.5rem var(--gutter);
+  background: color-mix(in srgb, var(--warn) 12%, var(--panel));
+  border-top: 1px solid color-mix(in srgb, var(--warn) 45%, var(--border));
+  color: var(--warn);
+  font-size: 0.78rem;
+  line-height: 1.35;
+}
+.ephemeral-strip strong {
+  font-weight: 700;
+}
+.ephemeral-strip-dot {
+  width: 0.5rem;
+  height: 0.5rem;
+  border-radius: 50%;
+  background: var(--warn);
+  flex-shrink: 0;
+  margin-top: 0.35rem;
 }
 .compose-ephemeral {
   background: color-mix(in srgb, var(--warn) 8%, var(--panel));
