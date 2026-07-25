@@ -110,6 +110,11 @@ export const MAX_OUTSTANDING_INVITES = 50
 export const MAX_INVITE_REDEMPTIONS = 200
 /** An unredeemed invite expires after this and is purged. */
 export const INVITE_TTL_MS = 30 * 24 * 60 * 60 * 1000
+/** Max envelope ids one delivery-status catch-up may ask about (delivery
+ *  indicator). Bounds both the wire request and the work a single query makes a
+ *  peer's Inbox DO do. The client asks only about its own recent unconfirmed
+ *  sends, so this is far above normal use. */
+export const MAX_DELIVERED_CHECK_IDS = 64
 /** Max queued (undelivered) envelopes an Inbox will hold. */
 export const MAX_QUEUED_ENVELOPES = 5000
 /** Max total queued ciphertext bytes an Inbox will hold. */

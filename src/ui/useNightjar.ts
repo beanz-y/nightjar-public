@@ -10,6 +10,7 @@ import { PRESENCE_HEARTBEAT_MS } from '../crypto/constants'
 import { AppLockAuthError } from '../crypto/appLock'
 import type { Identity } from '../crypto/identity'
 import { NightjarClient, type StoredMessage } from '../net/client'
+import type { DeliveryStatus } from '../storage/historyStore'
 import { type CrossTab, type CrossTabEvent, createCrossTab } from '../net/crossTab'
 import { getRelayOrigin } from '../platform'
 import {
@@ -68,6 +69,10 @@ export interface Message {
   /** Session-only (P10e): shown live but never written to history on either
    *  device; rendered distinctly and cleared on reload/lock. */
   ephemeral?: boolean
+  /** Outbound only: how far it got, as far as the RELAY has told us. Absent means
+   *  unknown (still queued, or a marker that never landed), which renders as
+   *  nothing rather than as a claim. */
+  status?: DeliveryStatus
 }
 
 export interface MintedInvite {
@@ -99,9 +104,12 @@ function mergeHistory(
 ): Record<string, Message[]> {
   const out: Record<string, Message[]> = {}
   for (const [peer, msgs] of Object.entries(hist)) {
-    out[peer] = msgs.map((m) =>
-      m.failed ? { id: m.id, dir: m.dir, text: m.text, ts: m.ts, failed: true } : { id: m.id, dir: m.dir, text: m.text, ts: m.ts },
-    )
+    out[peer] = msgs.map((m) => {
+      const base: Message = { id: m.id, dir: m.dir, text: m.text, ts: m.ts }
+      if (m.failed) base.failed = true
+      if (m.status) base.status = m.status
+      return base
+    })
   }
   for (const [peer, msgs] of Object.entries(prev)) {
     if (!out[peer]) {
@@ -200,6 +208,24 @@ export function useNightjar() {
     })
   }, [])
 
+  // Move a bubble's delivery status forward. Monotonic here too, mirroring the
+  // client: a late 'sent' must never walk a 'delivered' bubble backwards, and a
+  // failed bubble is never relabelled (the failure is the more important fact).
+  const markStatus = useCallback((peer: string, id: string, status: DeliveryStatus) => {
+    setConversations((prev) => {
+      const cur = prev[peer]
+      if (!cur) return prev
+      let changed = false
+      const next = cur.map((m) => {
+        if (m.id !== id || m.failed) return m
+        if (m.status === status || m.status === 'delivered') return m
+        changed = true
+        return { ...m, status }
+      })
+      return changed ? { ...prev, [peer]: next } : prev
+    })
+  }, [])
+
   // Broadcast a RENDER-ONLY event to sibling tabs (no-op until a channel is open in
   // activate()). Receivers apply it to their in-RAM view only; the crypto/storage
   // write already happened once, in the tab that produced the event.
@@ -269,6 +295,10 @@ export function useNightjar() {
             broadcast({ kind: 'failed', id: envId })
             setNotice(`a message could not be delivered (${reason})`)
           },
+          onDelivery: (peer, id, status) => {
+            markStatus(peer, id, status)
+            broadcast({ kind: 'status', peer, id, status })
+          },
           onContactsChanged: () => {
             // A mutual-invite joiner was auto-learned (or deferred trust work landed)
             // after the connect-time refresh already ran; re-read so it appears now.
@@ -304,6 +334,7 @@ export function useNightjar() {
         if (!mountedRef.current) return
         if (ev.kind === 'append') appendMessage(ev.peer, ev.msg)
         else if (ev.kind === 'delete') removeBubble(ev.peer, ev.id)
+        else if (ev.kind === 'status') markStatus(ev.peer, ev.id, ev.status)
         else markFailed(ev.id)
       })
 
@@ -762,6 +793,20 @@ export function useNightjar() {
     }
   }, [])
 
+  // Withdraw a verification. Only ever called from an explicit, confirmed user
+  // action on the verify screen: a scan result must never reach this, or anyone
+  // able to put a QR code in front of a camera could strip a real verification.
+  const unverify = useCallback(async (peer: string) => {
+    const live = liveRef.current
+    if (!live) return
+    try {
+      await live.client.unverify(peer)
+      setContacts(await live.client.listContacts())
+    } catch (e) {
+      setNotice(`could not remove the verification: ${String(e instanceof Error ? e.message : e)}`)
+    }
+  }, [])
+
   // Make sure we hold a contact (with their key) for `peer` so the verify screen can
   // render a safety number. Fetches + records a TOFU contact if we do not have one
   // yet (e.g. right after adding them by code/QR, before any message). Returns
@@ -909,6 +954,7 @@ export function useNightjar() {
       mintInvite,
       syncInviteContacts,
       markVerified,
+      unverify,
       ensureContact,
       dismissNotice,
       dismissSecurityNotice,

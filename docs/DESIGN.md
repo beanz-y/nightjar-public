@@ -102,6 +102,12 @@ cryptographic code was written; the roadmap in section 12 tracks what has shippe
 4. **Post-quantum.** Classical X25519 in v1, downgrade-protected (section 4.4) so
    a v2 PQXDH upgrade cannot be silently stripped.
 5. **Anonymity / sealed sender / cover traffic.**
+5a. **Read receipts.** Deliberately not built, not merely unbuilt. They are the one
+   delivery signal that would need a new metadata class (a reverse envelope sent at
+   the moment a human looks at something) and a new durable record of a person's
+   attention, and they buy little here: because the app receives nothing while
+   locked (8.5), "delivered" already implies their app was open and running. The
+   indicator we do ship reports on devices, not people (8.8).
 6. **Forward-secret synced history and cloud backup.** History is persisted on
    your device (section 8.5) but is per-device: it is not synced, and the identity
    backup (section 8.3) does not carry it, so it does not transfer to a new device.
@@ -449,6 +455,50 @@ collision). SN covers `IK_sig` **only**, so the `idkbind` and `spk` signatures
 (section 4) must be verified on every bundle. Rendered as digit groups and a QR
 code for in-person comparison.
 
+**Comparing by scan, and why the QR is not just the digits.** The digits can be
+compared by eye, or the other person's code can be scanned with the camera, which
+removes the step people actually get wrong (skimming 40 digits and seeing what they
+expect). One property of the safety number dictates the payload format: it is
+**symmetric**, so both parties compute the identical value, and a QR carrying only
+the digits is byte-identical on both devices. A scanner reading bare digits
+therefore cannot distinguish a genuine scan of the peer's screen from the victim
+being handed back a picture of their **own** verify screen, which would make the
+cheapest possible false verification look exactly like a real one. So the payload
+is a versioned envelope, `NJSN1:<digits>:<tag>` (section 14), where the digits are
+byte-identical to what the eye compares and the tag is a short hash over the pair
+digest and the `IK_sig` of the device **displaying** it. The scanner knows both
+keys, so it computes what the tag must be for its peer and what it would be for
+itself, and refuses anything that is not unambiguously the peer's. The tag is
+public, derived from values already on screen, and grants no new capability.
+
+Scanning is **fail-closed**: only an exact digit match displayed by this contact's
+device is a match. A different safety number is reported loudly, a self-scan is
+named as one, a code whose displayer is neither party is refused rather than
+guessed at, and an invite code or user id (the app's other two QR codes) is
+identified as such instead of reported as a mismatch. Two rules bound what a scan
+may do:
+
+- **A match never verifies on its own.** The camera proves the two codes agree; it
+  cannot prove where the image came from, and a photograph of a genuine code
+  forwarded over any channel produces the identical green result. So a match
+  unlocks the confirmation and the human still attests to the channel (in person,
+  or a live call where they recognise the person, and looking at their device). The
+  scan replaces the digit comparison, not the judgement.
+- **A mismatch never changes stored trust.** The scanned bytes are attacker-chosen,
+  so an automatic downgrade would hand anyone who can hold a QR code in front of a
+  camera a way to strip a real verification. A mismatch is displayed and written
+  nowhere.
+
+**Withdrawing a verification.** Verification can be removed, by an explicit
+confirmed action on the verify screen only. It drops the contact to `unverified`
+and keeps the contact, their key, and the messages. This exists because verified
+is otherwise a one-way door: without it, someone who learns they confirmed the
+wrong person has nowhere to go, and adding a faster route into an irreversible
+state would be the wrong trade. It never happens automatically, and never as a
+result of a scan. It drops to `unverified` rather than restoring a previous
+`invite` level, because `invite` asserts that an invite authenticated this
+direction (6.3), which is exactly the claim the user is disputing.
+
 ### 6.3 Invite carries trust in one direction
 
 A one-time code (single-use, unguessable, serialized in a Durable Object, 7.1, so
@@ -603,6 +653,19 @@ TTL); per-Inbox seen-id sets; a few push subscriptions per user; invite records;
 and, **only if the user opts in**, a passphrase-wrapped identity backup blob
 (8.3). No message content at rest, no delivery logs, no server-side read
 receipts, no address book. User ids are opaque full-width key hashes.
+
+The **delivery indicator** (8.8) adds no storage class and no log. When a
+recipient's device acks an envelope, the relay already deletes it and records its
+id in that inbox's existing seen-id set; it now also forwards a one-line "picked
+up" note to the sender **if the sender happens to be connected**, and drops it
+otherwise. Nothing is stored for it and nothing is queued behind it. A sender who
+was offline asks later, and the answer is read from the same seen-id set that
+already existed for deduplication. We deliberately did **not** build an
+end-to-end-encrypted delivery receipt: it would double the envelope count and,
+whenever the sender was offline, would park a real timestamped envelope in their
+inbox for up to the 30-day TTL whose entire meaning is "your contact read your
+messages at 02:14", which is precisely the delivery log this section promises does
+not exist.
 
 ---
 
@@ -831,9 +894,38 @@ Honest posture, stated plainly:
   an attacker can already do (it already holds the Local Data Key, the React state, and
   IndexedDB).
 
----
+### 8.8 The delivery indicator (the relay's word, and only about devices)
 
-## 9. Metadata: the complete leak list and our honest posture
+A message you sent shows how far it got: **sending** (still on your device),
+**sent** (the recipient's inbox stored it), **delivered** (their device picked it
+up and acked), or **not sent** (permanently rejected or past the retry horizon).
+
+Honest posture, stated plainly:
+
+- **Both positive states are the RELAY'S word, not the other person's.** Nothing
+  here is signed by the peer's device. A dishonest or compelled relay can withhold
+  a report, delay it, or assert one for an envelope it actually dropped. This is a
+  usability hint, never a security property, and it lives inside what section 13
+  already concedes: a malicious relay can suppress, delay, or reorder delivery.
+- **It says nothing about a human.** "Delivered" means a device accepted the
+  bytes. It does not mean anyone opened the app, read the message, or is ignoring
+  you. We do not build read receipts (1.2), so there is deliberately no state here
+  that reports on a person's attention.
+- **Nothing is claimed from an absence.** A status is written only on a positive
+  signal. Marking a failed send is best-effort and can be lost, so "no marker" is
+  rendered as no indicator rather than as "sent": the app never converts a lost
+  negative into an affirmative claim. Likewise, an id the relay does not confirm
+  stays at "sent" forever rather than being downgraded, because the seen-id set has
+  its own retention and absence is not evidence.
+- **It is stored under the app-lock like the message itself.** The status is sealed
+  *inside* the history record rather than kept beside it, so a forensic image does
+  not learn which rows are outbound or how many reached the peer, which is what 8.5
+  promises. The cost is one extra small write per state change, under the same
+  per-peer lock, with a fresh salt.
+- **While you are locked, nothing arrives and nothing is confirmed.** The app opens
+  no socket while locked (8.5), so a message can sit at "sent" purely because the
+  *recipient's* app is locked or closed. The indicator reflects devices and network
+  state, not intent.
 
 An operator who chooses to log, or anyone who can compel us, can learn:
 
@@ -847,6 +939,13 @@ An operator who chooses to log, or anyone who can compel us, can learn:
   not already hold: the invite redemption it is reading is the operator's own
   record of an edge it already saw when it gated the registration.
 - **Timing, volume, message counts** (via cleartext ratchet counters `n`/`pn`).
+- **Delivery timing**, which the relay already had: it routes every envelope and
+  sees the recipient's ack. The delivery indicator (8.8) reports that fact back to
+  the sender instead of keeping it to ourselves; it creates no new observation, and
+  because the report is fire-and-forget with no stored state, it adds no retained
+  artifact either. The one addition is the catch-up query a returning sender makes,
+  which tells the relay which of that sender's own recent envelope ids it is asking
+  about, bounded per request (section 14).
 - **Presence** (persistent WebSocket).
 - **Message length** (no padding in v1; ciphertext length leaks plaintext length).
 - **Source IP** (unless VPN/Tor).
@@ -1164,6 +1263,9 @@ Native (Tauri) is **not** on the critical path; it is a demand-gated v2 (10.5).
     passphrase strength (8.3); download-only avoids this.
 11. A malicious relay can suppress, delay, or reorder delivery; it cannot forge a
     verified contact's content without also shipping modified client code (1.4).
+    The **delivery indicator** (8.8) inherits this exactly: "sent" and "delivered"
+    are the relay's assertions, so their presence can be faked and their absence
+    means nothing about whether a person saw anything.
 12. Endpoint compromise (malware, stolen unlocked device, XSS) is outside the
     guarantees; we harden but cannot solve it.
 13. **This is a hand-built protocol composition.** Every piece is from a
@@ -1205,6 +1307,9 @@ Native (Tauri) is **not** on the critical path; it is a demand-gated v2 (10.5).
 | Invite-embedded fingerprint | inviter `IK_sig` at full 256-bit width; joiner does a full-width equality check vs the directory-returned key | 6.3 |
 | Mutual invite (inviter learns joiner) | on connect the inviter fetches the server-verified `used_by` ids of its invites (`MAX_INVITE_REDEMPTIONS` = 200 most recent, `invites(inviter)` indexed) and records each as an **`unverified`** TOFU contact; a relay assertion (no binding), caught by the safety number; throttled (60 s reconnect backstop) + a visible-tab poll while an invite is on screen; bounded by the 30-day invite retention | 6.3 |
 | Safety number | iterated SHA-512, `N_iter` = 5200, displayed width >= 120 bits, tag `"Nightjar-SN-v1"` | 6.2 |
+| Safety-number QR payload | `NJSN1:<40 digits>:<13-char base32 tag>`. Digits are the rendered safety number with spaces stripped (byte-identical to what the eye compares). Tag = `base32(SHA-256(domainSep("Nightjar-SNQR-v1", pairDigest, displayerIkSigPub))[0..8])`, which identifies the DISPLAYING device so a self-scan cannot pass as a peer scan (the safety number is symmetric, so digits alone cannot). Parser is total and fail-closed; a bare-digit payload from an older build is refused, not accepted. A match unlocks the confirmation but never verifies on its own; a mismatch writes nothing | 6.2 |
+| Verification withdrawal | user-initiated only, behind its own confirmation, never automatic and never scan-triggered; drops to `unverified` (never back to `invite`) and clears the verification timestamp, keeping the contact, their key, and the messages | 6.2 |
+| Delivery indicator | states: sending / sent / delivered / not sent. Both positive states are RELAY assertions (no peer signature). Stamped only on a positive signal, never inferred from a missing failure marker; monotonic (never downgrades). Sealed INSIDE the history record so at rest it reveals no direction or count. Live report is fire-and-forget to a connected sender (never stored, never queued); an offline sender catches up by asking which of its own ids the recipient's existing seen-id set holds, `MAX_DELIVERED_CHECK_IDS` = 64 per request, and only for messages newer than the seen-id TTL. No read receipts (1.2#5a) | 8.8, 7.5 |
 | Argon2id (backup) | m = 64 MiB, t = 3, p = 1 (measured ~2.3 s desktop via `@noble/hashes`; 256 MiB was ~9 s and risks OOM in an iOS Safari worker; RFC 9106 constrained-env recommendation); 16-B salt; XChaCha20-Poly1305 body with the header as AAD; key+nonce via HKDF-SHA256 info `"Nightjar_Backup_v1"`; restore bounds m to [8 MiB, 256 MiB], t <= 6, p == 1 before running the KDF | 8.3 |
 | Passphrase floor | typed passphrases >= 12 chars (after NFC-trim); the offered generated passphrase is 20 base32 chars (~100 bits) | 8.3 |
 | Backup blob format | magic `"NJBK"`, format version `0x01`, then m/t/p/salt header, then AEAD body; download-only in v1 | 8.3 |

@@ -219,6 +219,34 @@ function historySuite(name: string, make: () => SessionStore) {
       await s.wipeAll()
       expect(await s.tombstoneKeys()).toEqual([])
     })
+
+    it('historyClear erases tombstones as well as messages (the forgot-secret reset)', async () => {
+      const s = make()
+      await s.saveBookWithSeen(PEER_A, singleSessionBook(snap), 'e1', hrec('kept'))
+      await s.saveBookWithSeen(PEER_A, singleSessionBook(snap), 'e-del', undefined, { key: 'victim' })
+      expect(await s.tombstoneKeys()).toEqual(['victim'])
+      await s.historyClear()
+      // Both row classes are saved history. Leaving tombstones behind left a count
+      // of applied deletes that the reset was supposed to erase, and (since the
+      // reset discards the LDK) rows nothing could ever open or attribute again.
+      expect(await s.historyLoadAll()).toEqual([])
+      expect(await s.tombstoneKeys()).toEqual([])
+      // Still surgical: sessions and dedup survive so live messaging keeps working.
+      expect(await s.hasSeen('e1')).toBe(true)
+      expect(await s.load(PEER_A)).toEqual(snap)
+    })
+
+    it('pendingOutbox returns entries oldest-first, not in key order', async () => {
+      const s = make()
+      // Ids are random hex in production and the IndexedDB key IS the id, so raw
+      // getAll order is uncorrelated with creation order. These ids are chosen so
+      // key order ('aaa' < 'zzz') is the REVERSE of creation order: an unsorted
+      // implementation returns the delete before the message it targets, and the
+      // relay drains in the order it receives them.
+      await s.saveBookWithOutbox(PEER_A, singleSessionBook(snap), { id: 'zzz-text', to: PEER_A, env: {}, createdAt: 1000 })
+      await s.saveBookWithOutbox(PEER_A, singleSessionBook(snap), { id: 'aaa-delete', to: PEER_A, env: {}, createdAt: 2000 })
+      expect((await s.pendingOutbox()).map((e) => e.id)).toEqual(['zzz-text', 'aaa-delete'])
+    })
   })
 }
 

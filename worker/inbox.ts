@@ -15,6 +15,7 @@ import {
   MAX_QUEUED_ENVELOPES,
   PRESENCE_FRESH_MS,
   PUSH_SUB_TTL_MS,
+  MAX_DELIVERED_CHECK_IDS,
   PUSH_TTL_SEC,
   SEEN_ID_TTL_MS,
 } from '../src/crypto/constants'
@@ -24,6 +25,7 @@ import { buildChallenge } from '../src/wire/auth'
 import type {
   AckMsg,
   ClientMessage,
+  DeliveredCheckMsg,
   FetchBundleMsg,
   PresenceMsg,
   PublishBundleMsg,
@@ -99,6 +101,8 @@ export class Inbox {
     const path = new URL(req.url).pathname
     if (path === '/connect') return this.handleConnect(req)
     if (path === '/deliver') return this.handleDeliver(req)
+    if (path === '/delivered') return this.handleDelivered(req)
+    if (path === '/seenCheck') return this.handleSeenCheck(req)
     return new Response('not found', { status: 404 })
   }
 
@@ -231,7 +235,9 @@ export class Inbox {
       case 'send':
         return this.doSend(ws, userId, msg)
       case 'ack':
-        return this.doAck(msg)
+        return this.doAck(userId, msg)
+      case 'deliveredCheck':
+        return this.doDeliveredCheck(ws, msg)
       case 'drain':
         this.drainQueue(ws)
         return
@@ -376,16 +382,87 @@ export class Inbox {
 
   // Recipient acked durable consumption: drop the queued envelope and remember
   // the id so a redelivery is ack-and-dropped, not reprocessed (DESIGN 5.3, 7.1).
-  private async doAck(msg: AckMsg): Promise<void> {
+  private async doAck(userId: string, msg: AckMsg): Promise<void> {
     // Validate the id exactly as the deliver path does, so a spammed ack cannot
     // insert oversized/arbitrary rows into the seen table (P4 review).
     if (typeof msg.id !== 'string' || msg.id.length === 0 || msg.id.length > 128) return
     const now = Date.now()
+    // Read the sender BEFORE the delete, so the delivery indicator can be told.
+    // Nothing new is recorded for this: `sender` is already stored on the queued
+    // envelope, and is dropped with it here as always.
+    const row = this.sql.exec('SELECT sender FROM envelopes WHERE id = ?', msg.id).toArray()[0] as
+      | { sender: string }
+      | undefined
     this.ctx.storage.transactionSync(() => {
       this.sql.exec('DELETE FROM envelopes WHERE id = ?', msg.id)
       this.sql.exec('INSERT OR IGNORE INTO seen (id, seen_at) VALUES (?, ?)', msg.id, now)
     })
     await this.ensureAlarm(now)
+    // Tell the sender, if they happen to be connected. Deliberately fire-and-
+    // forget in the background: nothing is stored and nothing is queued, so this
+    // creates no delivery log (DESIGN 7.5). A sender who is offline right now
+    // learns nothing here and catches up with a `deliveredCheck` on reconnect.
+    if (row?.sender && USER_ID_RE.test(row.sender)) {
+      const sender = row.sender
+      this.ctx.waitUntil(
+        callDO(inboxStub(this.env, sender), '/delivered', { id: msg.id, by: userId }).catch(() => {
+          /* best-effort: a delivery indicator must never affect message handling */
+        }),
+      )
+    }
+  }
+
+  // A peer inbox reporting that one of OUR sent envelopes was picked up. Forwarded
+  // to any live socket and otherwise dropped: never stored, never queued.
+  private async handleDelivered(req: Request): Promise<Response> {
+    const body = (await req.json()) as { id?: unknown; by?: unknown }
+    const id = body.id
+    const by = body.by
+    if (typeof id !== 'string' || id.length === 0 || id.length > 128) {
+      return json({ code: 'bad_id', msg: 'bad envelope id' }, 400)
+    }
+    if (typeof by !== 'string' || !USER_ID_RE.test(by)) {
+      return json({ code: 'bad_from', msg: 'bad reporter user id' }, 400)
+    }
+    for (const ws of this.authedSockets()) this.sendTo(ws, { t: 'delivered', id, from: by })
+    return json({ ok: true })
+  }
+
+  // "Which of these envelope ids has this inbox already consumed?" Answers from
+  // the EXISTING seen table (no new storage class, no new retention). The asker
+  // can only learn about ids it generated itself: an envelope id is 16 random
+  // bytes minted by the sender, so this is not an enumeration surface. Bounded per
+  // request so it cannot become a cheap way to make a DO do work.
+  private async handleSeenCheck(req: Request): Promise<Response> {
+    const body = (await req.json()) as { ids?: unknown }
+    const ids = Array.isArray(body.ids) ? body.ids : []
+    const wanted = ids
+      .filter((v): v is string => typeof v === 'string' && v.length > 0 && v.length <= 128)
+      .slice(0, MAX_DELIVERED_CHECK_IDS)
+    const found: string[] = []
+    for (const id of wanted) {
+      if (this.sql.exec('SELECT id FROM seen WHERE id = ?', id).toArray()[0]) found.push(id)
+    }
+    return json({ ids: found })
+  }
+
+  // Forward the caller's delivery question to the recipient's inbox. Rides the
+  // authenticated socket like every other relay op; the recipient is a plain
+  // routing argument, and the answer is only ever about the caller's own ids.
+  private async doDeliveredCheck(ws: WebSocket, msg: DeliveredCheckMsg): Promise<void> {
+    const reqId = msg.reqId
+    if (!USER_ID_RE.test(msg.to)) {
+      this.sendTo(ws, { t: 'error', code: 'bad_to', msg: 'bad recipient user id', reqId })
+      return
+    }
+    try {
+      const r = await callDO<{ ids: string[] }>(inboxStub(this.env, msg.to), '/seenCheck', {
+        ids: Array.isArray(msg.ids) ? msg.ids.slice(0, MAX_DELIVERED_CHECK_IDS) : [],
+      })
+      this.sendTo(ws, { t: 'deliveredList', reqId, ids: Array.isArray(r.ids) ? r.ids : [] })
+    } catch (e) {
+      this.replyError(ws, e, reqId)
+    }
   }
 
   // --- Web Push subscriptions + presence (P6, DESIGN 7.4) ---------------

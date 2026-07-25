@@ -17,14 +17,21 @@ import { bytesToHex, hexToBytes } from '@noble/hashes/utils'
 import { type Identity, deriveUserId } from '../crypto/identity'
 import type { PushSubscriptionInfo } from '../platform'
 import { decodeMessage, encodeDeleteMessage, encodeTextMessage, newMsgId } from '../crypto/message'
-import { OPK_BATCH, OPK_REPLENISH_THRESHOLD, OUTBOX_RETRY_HORIZON_MS, SPK_ROTATION_MS } from '../crypto/constants'
+import {
+  MAX_DELIVERED_CHECK_IDS,
+  OPK_BATCH,
+  OPK_REPLENISH_THRESHOLD,
+  OUTBOX_RETRY_HORIZON_MS,
+  SEEN_ID_TTL_MS,
+  SPK_ROTATION_MS,
+} from '../crypto/constants'
 import { OWN_BUNDLE_VERSION, buildOwnBundle, generateOneTimePrekeys, generateSignedPrekey } from '../crypto/prekeys'
 import { deserializeRatchet, initRatchetInitiator, ratchetEncrypt, serializeRatchet } from '../crypto/ratchet'
 import { x3dhInitiate } from '../crypto/x3dh'
 import { type Contact, type ContactStore, type TrustLevel, KeyConflictError } from '../trust/contactStore'
 import type { InviteArtifact } from '../trust/inviteArtifact'
 import { currentSession, promoteSession, updateSession } from '../session/sessionBook'
-import type { HistoryStore } from '../storage/historyStore'
+import type { DeliveryStatus, HistoryStore } from '../storage/historyStore'
 import type { Lock } from '../storage/lock'
 import type { PrekeyStore } from '../storage/prekeyStore'
 import type { OutboxEntry, SessionStore } from '../storage/sessionStore'
@@ -81,6 +88,10 @@ export interface StoredMessage {
   /** An outbound message whose delivery permanently failed/timed out; kept so the
    *  reloaded bubble still reads as "not sent", never as delivered. */
   failed?: boolean
+  /** How far an outbound message got. Absent means unknown (still queued, or a
+   *  marker that never landed), which the UI renders as nothing rather than as an
+   *  affirmative claim. */
+  status?: DeliveryStatus
 }
 
 export interface ClientCallbacks {
@@ -101,6 +112,10 @@ export interface ClientCallbacks {
    *  relay and dropped from the outbox. The UI marks that exact message failed so
    *  it never reads as delivered (the envelope id equals the UI message id). */
   onSendFailed?: (envId: string, reason: string) => void
+  /** Optional: how far one of OUR sent messages got, by content id. Only ever
+   *  moves forward (sent -> delivered), and both states are the relay's word, not
+   *  a signed statement by the peer. A UI hint, never a security property. */
+  onDelivery?: (peer: string, id: string, status: DeliveryStatus) => void
   /** Optional: the authenticated connection came up (true) or dropped (false).
    *  Fires on every transition, including automatic reconnects. */
   onConnection?: (connected: boolean) => void
@@ -119,6 +134,9 @@ export class NightjarClient {
   private connecting = false
   private reconnectAttempt = 0
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null
+  /** Transient send-error codes already surfaced, so a retry loop reports a stuck
+   *  queue once rather than on every flush. Cleared when a send gets through. */
+  private readonly warnedSendCodes = new Set<string>()
   /** When the mutual-invite redemption sync last ran (throttles the reconnect backstop). */
   private lastRedemptionSyncAt = 0
 
@@ -186,6 +204,7 @@ export class NightjarClient {
 
   async connect(): Promise<AuthedInfo> {
     this.transport.onDeliver((from, envJson) => void this.handleDeliver(from, envJson))
+    this.transport.onDelivered((id, from) => void this.markDelivery(from, id, 'delivered'))
     this.transport.onSendError((ref, code, msg) => this.handleSendError(ref, code, msg))
     this.transport.onClose(() => {
       this.cb.onConnection?.(false)
@@ -221,6 +240,9 @@ export class NightjarClient {
     // DESIGN 6.3), so they can be verified without waiting for a first message.
     // Throttled; best-effort.
     void this.flushInviteRedemptions().catch(() => {})
+    // Catch up on messages the peer picked up while we were offline: the live
+    // delivery report has no one to reach then, and nothing is queued for it.
+    void this.flushDeliveredChecks().catch(() => {})
   }
 
   /** Land pending trust work: the inviter pin (DESIGN 6.3) and inbound
@@ -365,7 +387,26 @@ export class NightjarClient {
   // surfaced; transient ones (queue_full, a not-registered race) stay queued.
   private handleSendError(ref: string, code: string, msg: string): void {
     const permanent = code === 'bad_to' || code === 'bad_envelope' || code === 'too_large'
-    if (!permanent) return
+    if (!permanent) {
+      // A transient rejection keeps the entry queued and retries, which is right,
+      // but retrying in total silence is the worst failure mode in the system: a
+      // full recipient inbox (queue_full, which is shared across ALL senders) can
+      // swallow every message to that peer for the whole 7-day retry horizon while
+      // the sender sees nothing wrong. Say so once per code, without touching the
+      // outbox: the message really is still pending, so it must not read as failed.
+      if (!this.warnedSendCodes.has(code)) {
+        this.warnedSendCodes.add(code)
+        if (code === 'queue_full') {
+          this.cb.onError?.(
+            "their inbox is full, so messages are not getting through right now. Yours are still queued and will retry, but they may not arrive until their device catches up.",
+          )
+        } else {
+          this.cb.onError?.(`the relay is refusing messages for now (${code}): still queued, will retry`)
+        }
+      }
+      return
+    }
+    this.warnedSendCodes.delete(code)
     // Flag the persisted outbound row failed BEFORE dropping the outbox entry, so
     // a reload re-renders it as "not sent" rather than as delivered. The row is
     // keyed by (peer, out, contentId); the peer comes from the outbox entry (both
@@ -500,6 +541,12 @@ export class NightjarClient {
     return this.contacts.markVerified(peerId, Date.now())
   }
 
+  /** Withdraw a verification (user-initiated only, never automatic; see
+   *  ContactStore.unverify). The contact and its key are kept. */
+  async unverify(peerId: string): Promise<void> {
+    return this.contacts.unverify(peerId)
+  }
+
   /**
    * Send text to a peer. Uses the current session, or opens a new one (X3DH) if
    * none exists. Runs under the per-peer lock. Returns the CONTENT msgId (hex),
@@ -611,6 +658,82 @@ export class NightjarClient {
     return entry.id
   }
 
+  /**
+   * Record how far one of our outbound messages got, and tell the UI.
+   *
+   * Monotonic: 'sent' never overwrites 'delivered', so an out-of-order report (a
+   * reconnect catch-up racing a live report, or a retransmit re-resolving
+   * waitSent) cannot walk a message backwards.
+   *
+   * The status is sealed INSIDE the row rather than kept beside it, so a device
+   * image learns nothing about which rows are outbound or how many reached the
+   * peer (DESIGN 8.5). That costs a re-seal, which runs under the per-peer lock so
+   * a row keeps exactly one writer, and draws a fresh salt so there is no
+   * keystream reuse. Best-effort throughout: a delivery indicator must never
+   * affect message handling.
+   */
+  private async markDelivery(peer: string, id: string, status: DeliveryStatus): Promise<void> {
+    if (!this.history) return
+    try {
+      const changed = await this.lock.withLock(sessionLock(peer), async () => {
+        const key = this.history!.storageKey(peer, 'out', id)
+        const row = await this.store.historyGet(key)
+        if (!row) return false // ephemeral, deleted, or a control envelope
+        const msg = this.history!.open(row)
+        if (msg.status === status || msg.status === 'delivered') return false
+        const resealed = this.history!.seal({ ...msg, status }, row.failed)
+        await this.store.historyUpdate(resealed)
+        return true
+      })
+      if (changed) this.cb.onDelivery?.(peer, id, status)
+    } catch {
+      /* best-effort: never let a status update disturb messaging */
+    }
+  }
+
+  /**
+   * Catch up on deliveries that happened while this device was offline.
+   *
+   * The live report (`delivered`) is fire-and-forget, so it reaches nobody when
+   * the sender is away, which for a phone is the common case. Rather than have the
+   * relay keep a delivery log for us (DESIGN 7.5 says it keeps none), we ask, on
+   * reconnect, which of our own recent unconfirmed envelope ids the peer's inbox
+   * has recorded as consumed. Bounded, and only ever about ids we generated.
+   *
+   * Never downgrades: an id the relay does not report stays 'sent', because the
+   * relay's seen-id set has its own retention and absence is not evidence.
+   */
+  private async flushDeliveredChecks(): Promise<void> {
+    if (!this.history) return
+    const rows = await this.store.historyLoadAll()
+    const byPeer = new Map<string, string[]>()
+    for (const row of rows) {
+      if (row.failed) continue
+      let msg
+      try {
+        msg = this.history.open(row)
+      } catch {
+        continue
+      }
+      if (msg.dir !== 'out' || msg.status !== 'sent') continue
+      // The relay's seen-id set is pruned on its own TTL, so an older message
+      // would answer "not delivered" forever. Do not ask about those at all.
+      if (Date.now() - msg.ts > SEEN_ID_TTL_MS) continue
+      const list = byPeer.get(msg.peerId) ?? []
+      if (list.length < MAX_DELIVERED_CHECK_IDS) list.push(msg.id)
+      byPeer.set(msg.peerId, list)
+    }
+    for (const [peer, ids] of byPeer) {
+      if (ids.length === 0) continue
+      try {
+        const delivered = await this.directory.deliveredCheck(peer, ids)
+        for (const id of delivered) await this.markDelivery(peer, id, 'delivered')
+      } catch {
+        /* best-effort */
+      }
+    }
+  }
+
   /** All persisted conversations, decrypted and grouped by peer, each sorted
    *  oldest-first (P10b boot hydration). Rows that do not authenticate under the
    *  current key are skipped rather than throwing, so one corrupt row cannot block
@@ -630,6 +753,7 @@ export class NightjarClient {
         const m = this.history.open(row)
         const msg: StoredMessage = { id: m.id, dir: m.dir, text: m.text, ts: m.ts }
         if (row.failed) msg.failed = true
+        if (m.status) msg.status = m.status
         ;(out[m.peerId] ??= []).push(msg)
       } catch {
         /* unreadable record (corruption / wrong key): skip it */
@@ -710,7 +834,17 @@ export class NightjarClient {
   // dropped when the relay acks durable storage (`sent`). Retransmission on a
   // later flush re-sends the byte-identical stored envelope; the relay dedups.
   private fire(e: OutboxEntry): void {
-    void this.transport.waitSent(e.id).then(() => this.store.removeOutbox(e.id))
+    void this.transport.waitSent(e.id).then(() => {
+      this.warnedSendCodes.clear() // something got through: a later stall warns again
+      // Stamp a POSITIVE "it left this device" marker before dropping the outbox
+      // entry. The status must never be inferred from the ABSENCE of a failure
+      // marker: marking a row failed is best-effort and can be skipped or throw
+      // while the outbox entry is dropped regardless, so "no marker" has to mean
+      // unknown, not sent. A control envelope (a delete) has no history row, and
+      // historyUpdate only touches rows that exist, so it is a no-op there.
+      void this.markDelivery(e.to, e.id, 'sent')
+      return this.store.removeOutbox(e.id)
+    })
     try {
       this.transport.raw({ t: 'send', to: e.to, env: e.env as WireEnvelope, ...(e.silent ? { silent: true } : {}) })
     } catch {

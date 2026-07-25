@@ -288,4 +288,30 @@ export class ContactStore {
       c.verifiedAt = now
     })
   }
+
+  /**
+   * Withdraw a verification the user no longer stands behind (they verified the
+   * wrong person, or a later comparison did not match).
+   *
+   * Deliberately MANUAL only. Nothing automatic, and in particular nothing driven
+   * by a scan, may reach this: the scanned input is attacker-chosen, so an
+   * automatic downgrade would hand anyone who can show a camera a QR code a
+   * durable way to strip a real verification.
+   *
+   * Drops to 'unverified' rather than restoring whatever the contact was before.
+   * 'invite' asserts that an invite authenticated this direction (6.3), which is a
+   * first-contact fact, and re-asserting it here would re-state an authentication
+   * the user has just disputed.
+   */
+  async unverify(peerId: string): Promise<void> {
+    await this.mutate((map) => {
+      const c = map[peerId]
+      if (!c) throw new Error('contacts: unverify an unknown peer')
+      c.trust = 'unverified'
+      // null, not undefined: the field is `number | null`, and the backup encoder
+      // validates it as such (backup.ts), so an undefined would make this contact
+      // silently fail validation and be DROPPED on restore.
+      c.verifiedAt = null
+    })
+  }
 }

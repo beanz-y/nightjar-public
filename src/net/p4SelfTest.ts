@@ -60,9 +60,9 @@ async function makeClient(
   )
 }
 
-async function waitUntil(pred: () => boolean, ms = 4000): Promise<void> {
+async function waitUntil(pred: () => boolean | Promise<boolean>, ms = 4000): Promise<void> {
   const start = performance.now()
-  while (!pred()) {
+  while (!(await pred())) {
     if (performance.now() - start > ms) throw new Error('timed out waiting for a message')
     await new Promise((r) => setTimeout(r, 25))
   }
@@ -171,6 +171,33 @@ export async function runP4SelfTest(bootstrapInvite: string): Promise<P4SelfTest
       !aliceAfterEph.some((m) => m.text === ephText) // not stored on the sender
     log.push(`session-only shown live + persisted on NEITHER side: ${ephemeralOk ? 'PASS' : 'FAIL'}`)
 
+    // Delivery indicator: Alice's earlier messages should now read 'delivered',
+    // because Bob's device acked them and the relay reported that back over her
+    // live socket. Bob's own SENT message should likewise be marked. This proves
+    // the whole loop through the REAL relay: ack -> recipient inbox -> sender
+    // inbox -> live socket -> re-sealed history row.
+    await waitUntil(async () => {
+      const rows = (await alice.loadAllHistory())[bob.userId] ?? []
+      return rows.filter((m) => m.dir === 'out' && m.status === 'delivered').length >= 2
+    })
+    const aliceOut = ((await alice.loadAllHistory())[bob.userId] ?? []).filter((m) => m.dir === 'out')
+    const bobOut = ((await bob.loadAllHistory())[alice.userId] ?? []).filter((m) => m.dir === 'out')
+    const deliveredOk =
+      aliceOut.length > 0 &&
+      aliceOut.every((m) => m.status === 'delivered') &&
+      bobOut.every((m) => m.status === 'delivered')
+    log.push(
+      `delivery reported by the relay (alice out: ${aliceOut.map((m) => m.status ?? 'none').join(',')}): ${deliveredOk ? 'PASS' : 'FAIL'}`,
+    )
+
+    // Catch-up path: the same question asked explicitly, which is what a sender who
+    // was OFFLINE when the ack happened uses on reconnect (nothing is queued for
+    // the live report, by design).
+    const checkIds = aliceOut.map((m) => m.id)
+    const confirmed = await alice.directory.deliveredCheck(bob.userId, checkIds)
+    const checkOk = checkIds.length > 0 && checkIds.every((id) => confirmed.includes(id))
+    log.push(`offline catch-up query confirmed ${confirmed.length}/${checkIds.length}: ${checkOk ? 'PASS' : 'FAIL'}`)
+
     const ok =
       bRecv[0] === 'hello from alice' &&
       aRecv[0] === 'hi back from bob' &&
@@ -181,6 +208,8 @@ export async function runP4SelfTest(bootstrapInvite: string): Promise<P4SelfTest
       historyOk &&
       deleteOk &&
       ephemeralOk &&
+      deliveredOk &&
+      checkOk &&
       errors.length === 0
     // Surface the FULL ids (both stay registered in the Directory) so the app can
     // message one and exercise the contact + verify UI against a real peer.

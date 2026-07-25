@@ -341,10 +341,14 @@ input {
 .tile:hover {
   border-color: var(--accent);
 }
+/* The icon is an inline SVG (src/ui/icons.tsx), not a Unicode glyph: several of
+   the symbol codepoints we used are missing from the default Android fonts and
+   rendered as tofu boxes on real phones. */
 .tile-icon {
-  font-size: 1.4rem;
+  display: flex;
+  align-items: center;
+  justify-content: center;
   width: 2rem;
-  text-align: center;
   color: var(--accent);
   flex-shrink: 0;
 }
@@ -580,6 +584,19 @@ textarea.mono {
 .msg-out .msg-meta {
   text-align: right;
 }
+/* Delivery indicator on your own messages. Kept quiet on purpose: it is a hint
+   from the relay, not a guarantee about the other person (DESIGN 8.8). */
+.delivery {
+  margin-left: 0.3rem;
+  letter-spacing: -0.08em;
+}
+.delivery.pending {
+  opacity: 0.55;
+}
+.delivery.delivered {
+  color: var(--accent);
+  opacity: 0.9;
+}
 /* Centered day separator, like common messengers. */
 .day-sep {
   display: flex;
@@ -775,6 +792,45 @@ textarea.mono {
 .verified-note {
   color: var(--ok);
   font-weight: 600;
+}
+
+/* Scan-to-compare on the verify screen. Three visual weights, matching how much
+   the outcome is allowed to mean: ok (the codes agree, and the human still has
+   the last word), warn (refused, nothing is wrong with the contact), bad (the
+   safety numbers differ, which is the finding this whole screen exists for). */
+.scan-panel {
+  margin: 0.6rem 0;
+}
+.scan-result {
+  border-radius: 0.5rem;
+  padding: 0.7rem 0.8rem;
+  margin: 0.8rem 0;
+  border: 1px solid var(--border);
+}
+.scan-result p {
+  margin: 0 0 0.35rem;
+}
+.scan-result p:last-child {
+  margin-bottom: 0;
+}
+.scan-ok {
+  border-color: var(--ok);
+  background: color-mix(in srgb, var(--ok) 10%, var(--panel));
+}
+.scan-warn {
+  border-color: var(--warn);
+  background: color-mix(in srgb, var(--warn) 10%, var(--panel));
+}
+.scan-bad {
+  border-color: var(--error);
+  background: color-mix(in srgb, var(--error) 12%, var(--panel));
+}
+.scan-bad strong {
+  color: var(--error);
+}
+.confirm-block,
+.verified-block {
+  margin-top: 0.8rem;
 }
 
 /* --- about + warrant canary (P7) --------------------------------------- */

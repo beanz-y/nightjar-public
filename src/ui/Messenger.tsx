@@ -37,6 +37,7 @@ interface Props {
     mintInvite: () => Promise<MintedInvite | null>
     syncInviteContacts: () => Promise<number>
     markVerified: (peer: string) => void
+    unverify: (peer: string) => void
     ensureContact: (peer: string) => Promise<boolean>
     enableNotifications: () => void
     disableNotifications: () => void
@@ -235,7 +236,9 @@ export function Messenger({ identity, contacts, aliases, conversations, notify, 
           <SafetyNumberView
             myIkSigPub={identity.ikSig.publicKey}
             contact={selectedContact}
+            name={aliases[selectedContact.peerId]?.trim() || ''}
             onVerify={() => actions.markVerified(selectedContact.peerId)}
+            onUnverify={() => actions.unverify(selectedContact.peerId)}
             onBack={() => setChatView('chat')}
           />
         ) : (

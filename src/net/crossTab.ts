@@ -16,6 +16,8 @@
 // The channel is opened only while unlocked and closed on lock/teardown, so a
 // locked tab (which holds no plaintext) never receives one.
 
+import type { DeliveryStatus } from '../storage/historyStore'
+
 /** A message shaped exactly like the UI's `Message`, carried across tabs so a
  *  sibling renders an identical bubble (same id => idempotent dedup on apply). */
 export interface RenderMsg {
@@ -48,7 +50,17 @@ export interface CrossTabFailed {
   id: string
 }
 
-export type CrossTabEvent = CrossTabAppend | CrossTabDelete | CrossTabFailed
+/** Move a bubble's delivery indicator forward (sending -> sent -> delivered), so a
+ *  second open tab shows the same ticks without waiting for a reload. Carries the
+ *  peer because the status is keyed by (peer, id) on the storage side. */
+export interface CrossTabStatus {
+  kind: 'status'
+  peer: string
+  id: string
+  status: DeliveryStatus
+}
+
+export type CrossTabEvent = CrossTabAppend | CrossTabDelete | CrossTabFailed | CrossTabStatus
 
 export interface CrossTab {
   /** Broadcast a render event to sibling tabs (no-op if unsupported/closed). */
@@ -63,7 +75,7 @@ export const CROSS_TAB_CHANNEL = 'nightjar-render'
 function isEvent(v: unknown): v is CrossTabEvent {
   if (!v || typeof v !== 'object') return false
   const k = (v as { kind?: unknown }).kind
-  return k === 'append' || k === 'delete' || k === 'failed'
+  return k === 'append' || k === 'delete' || k === 'failed' || k === 'status'
 }
 
 /**

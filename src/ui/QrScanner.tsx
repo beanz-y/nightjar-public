@@ -9,15 +9,25 @@ import { decodeQrFrame } from './qrDecode'
 interface Props {
   onDecode: (text: string) => void
   onCancel: () => void
+  /** What to point the camera at. The scanner is used for invites, user-id codes
+   *  and safety numbers, so the caller names its own target. */
+  hint?: string
+  /** What to do instead when the camera cannot be used. Defaults to the invite
+   *  flow's paste box; the verify screen has no such box, so it says to compare
+   *  the digits by eye. A dead end here would push someone to give up on the one
+   *  check that matters most. */
+  fallback?: string
 }
 
 type Status = 'starting' | 'scanning' | 'error'
 
-export function QrScanner({ onDecode, onCancel }: Props) {
+export function QrScanner({ onDecode, onCancel, hint, fallback }: Props) {
   const videoRef = useRef<HTMLVideoElement>(null)
   const canvasRef = useRef<HTMLCanvasElement>(null)
   const [status, setStatus] = useState<Status>('starting')
   const [error, setError] = useState<string>('')
+
+  const alt = fallback ?? 'Use "enter a code" below instead.'
 
   useEffect(() => {
     let stream: MediaStream | null = null
@@ -33,7 +43,7 @@ export function QrScanner({ onDecode, onCancel }: Props) {
     void (async () => {
       const media = globalThis.navigator?.mediaDevices
       if (!media?.getUserMedia) {
-        setError('This browser cannot open the camera. Use "enter a code" below instead.')
+        setError(`This browser cannot open the camera. ${alt}`)
         setStatus('error')
         return
       }
@@ -43,8 +53,8 @@ export function QrScanner({ onDecode, onCancel }: Props) {
         const name = e instanceof DOMException ? e.name : ''
         setError(
           name === 'NotAllowedError'
-            ? 'Camera access was blocked. Allow it in your browser, or use "enter a code" below.'
-            : 'Could not start the camera. Use "enter a code" below instead.',
+            ? `Camera access was blocked. Allow it in your browser, or: ${alt}`
+            : `Could not start the camera. ${alt}`,
         )
         setStatus('error')
         return
@@ -96,7 +106,7 @@ export function QrScanner({ onDecode, onCancel }: Props) {
       </div>
 
       {status === 'starting' && <p className="muted small">starting the camera…</p>}
-      {status === 'scanning' && <p className="muted small">Point the camera at the invite QR code.</p>}
+      {status === 'scanning' && <p className="muted small">{hint ?? 'Point the camera at the invite QR code.'}</p>}
       {status === 'error' && <p className="error small">{error}</p>}
 
       <button className="ghost small" onClick={onCancel}>

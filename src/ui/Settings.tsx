@@ -8,6 +8,7 @@ import type { Identity } from '../crypto/identity'
 import type { CanaryResult } from '../verify/canary'
 import { About } from './About'
 import { BackupPanel } from './BackupPanel'
+import { DownloadIcon, ShieldCheckIcon } from './icons'
 import { NotifySettings } from './NotifySettings'
 import { QrCode } from './QrCode'
 import { type TimeFormat, setTimeFormat, useTimeFormat } from './timePref'
@@ -141,7 +142,9 @@ export function Settings({
       </div>
 
       <button className="tile" onClick={() => setMode('backup')}>
-        <span className="tile-icon" aria-hidden="true">⭳</span>
+        <span className="tile-icon" aria-hidden="true">
+          <DownloadIcon />
+        </span>
         <span>
           <span className="tile-title">Back up identity</span>
           <span className="tile-sub muted small">Save your identity + contacts under a passphrase.</span>
@@ -149,7 +152,9 @@ export function Settings({
       </button>
 
       <button className="tile" onClick={() => setMode('about')}>
-        <span className="tile-icon" aria-hidden="true">✔</span>
+        <span className="tile-icon" aria-hidden="true">
+          <ShieldCheckIcon />
+        </span>
         <span>
           <span className="tile-title">Verify this build</span>
           <span className="tile-sub muted small">How this app works and how to check the code you are running.</span>

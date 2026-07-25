@@ -79,6 +79,44 @@ describe('ContactStore.markVerified', () => {
   })
 })
 
+describe('ContactStore.unverify', () => {
+  it('withdraws a verification, keeping the contact and its key', async () => {
+    const store = fresh()
+    const a = generateIdentity()
+    await store.recordFirstContact(a.userId, a.ikSig.publicKey, NOW)
+    await store.markVerified(a.userId, NOW + 5)
+    await store.unverify(a.userId)
+    const c = await store.get(a.userId)
+    expect(c?.trust).toBe('unverified')
+    // null, never undefined: undefined fails the backup encoder's validation and
+    // the contact would be dropped on restore.
+    expect(c?.verifiedAt).toBeNull()
+    expect(c?.ikSig).toBeTruthy() // still a contact, still messageable
+  })
+
+  it('drops to unverified rather than restoring a prior invite trust', async () => {
+    // 'invite' asserts an invite authenticated this direction (6.3). Re-asserting
+    // it here would re-state exactly the authentication the user just disputed.
+    const store = fresh()
+    const a = generateIdentity()
+    await store.recordFirstContact(a.userId, a.ikSig.publicKey, NOW, 'invite')
+    await store.markVerified(a.userId, NOW + 5)
+    await store.unverify(a.userId)
+    expect(await store.trustLevel(a.userId)).toBe('unverified')
+  })
+
+  it('can be re-verified afterwards, and throws on an unknown peer', async () => {
+    const store = fresh()
+    const a = generateIdentity()
+    await store.recordFirstContact(a.userId, a.ikSig.publicKey, NOW)
+    await store.markVerified(a.userId, NOW + 5)
+    await store.unverify(a.userId)
+    await store.markVerified(a.userId, NOW + 9)
+    expect(await store.trustLevel(a.userId)).toBe('verified')
+    await expect(store.unverify(generateIdentity().userId)).rejects.toThrow(/unknown peer/)
+  })
+})
+
 describe('KeyConflictError', () => {
   it('carries the peer id', () => {
     const e = new KeyConflictError('peer-x')

@@ -51,6 +51,7 @@ export class Transport {
   >()
   private readonly sentWaiters = new Map<string, () => void>()
   private deliverHandler: ((from: string, envJson: unknown) => void) | null = null
+  private deliveredHandler: ((id: string, from: string) => void) | null = null
   private closeHandler: (() => void) | null = null
   private sendErrorHandler: ((ref: string, code: string, msg: string) => void) | null = null
 
@@ -168,6 +169,12 @@ export class Transport {
       this.deliverHandler?.(msg.from, msg.env)
       return
     }
+    if (msg.t === 'delivered') {
+      // Unsolicited (no reqId): the recipient's inbox reporting that one of our
+      // envelopes was picked up. Purely a UI hint.
+      this.deliveredHandler?.(msg.id, msg.from)
+      return
+    }
     if ('reqId' in msg) {
       const p = this.pending.get(msg.reqId)
       if (p) {
@@ -228,6 +235,12 @@ export class Transport {
 
   onDeliver(handler: (from: string, envJson: unknown) => void): void {
     this.deliverHandler = handler
+  }
+
+  /** Register the delivery-report handler ({t:'delivered'}: the recipient's device
+   *  picked up one of our envelopes). */
+  onDelivered(handler: (id: string, from: string) => void): void {
+    this.deliveredHandler = handler
   }
 
   onClose(handler: () => void): void {

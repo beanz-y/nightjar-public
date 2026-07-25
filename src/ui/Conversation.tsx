@@ -59,6 +59,39 @@ function isTouchDevice(): boolean {
 // Max composer height before it scrolls internally (about five lines).
 const COMPOSE_MAX_PX = 140
 
+// The delivery indicator, shown on your own messages only.
+//
+// Deliberately modest, because both states are the RELAY'S word (DESIGN 8.8), not
+// a signed statement by the other device: "sent" means their inbox stored it,
+// "delivered" means their device picked it up. Neither says anyone read it, and a
+// dishonest relay can withhold or fake either. So the tooltips say what actually
+// happened, and an unknown state renders NOTHING rather than guessing.
+//
+// Only the last outbound message in a run carries it, next to the timestamp,
+// matching how the rest of this log stays quiet.
+function DeliveryMark({ status, failed }: { status: 'sent' | 'delivered' | undefined; failed: boolean | undefined }) {
+  if (failed) return null // "not sent" already says it, louder
+  if (status === 'delivered') {
+    return (
+      <span className="delivery delivered" title="Their device picked this up. It does not mean they have read it.">
+        ✓✓
+      </span>
+    )
+  }
+  if (status === 'sent') {
+    return (
+      <span className="delivery sent" title="Stored for them by the relay. Their device has not picked it up yet.">
+        ✓
+      </span>
+    )
+  }
+  return (
+    <span className="delivery pending" title="Still on this device, waiting to be sent.">
+      ·
+    </span>
+  )
+}
+
 interface Props {
   peer: string
   /** Local nickname for this chat, or '' if none. */
@@ -278,6 +311,9 @@ export function Conversation({ peer, name, messages, trust, onSend, onVerify, on
                     {showTime && formatTime(m.ts, timeFmt)}
                     {m.ephemeral && <span className="ephemeral-mark">{showTime ? ' · ' : ''}session-only, not saved</span>}
                     {m.failed && <span className="error">{showTime || m.ephemeral ? ' · ' : ''}not sent</span>}
+                    {/* Only on the last message of an outbound run: the one whose
+                        state the sender is actually watching. */}
+                    {m.dir === 'out' && showTime && <DeliveryMark status={m.status} failed={m.failed} />}
                   </span>
                 )}
               </div>

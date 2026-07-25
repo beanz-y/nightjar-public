@@ -37,6 +37,14 @@ const ROW_AAD_TAG = 'Nightjar-histrow-v1'
 const KEY_TAG = 'Nightjar-histkey-v1'
 const decoder = new TextDecoder()
 
+/** How far an outbound message got. Absent means "not known to have left this
+ *  device", which is what a queued message and a lost marker both look like: the
+ *  UI shows nothing rather than asserting a delivery that may not have happened.
+ *  Both states are the RELAY'S WORD (see DESIGN 8.8), not a signed peer statement.
+ *   - 'sent'      the recipient's inbox durably stored the envelope.
+ *   - 'delivered' the recipient's device picked it up and acked. */
+export type DeliveryStatus = 'sent' | 'delivered'
+
 /** A message as history holds it (all fields are sealed at rest). */
 export interface HistoryMessage {
   id: string
@@ -44,6 +52,11 @@ export interface HistoryMessage {
   dir: 'in' | 'out'
   ts: number
   text: string
+  /** Outbound only. Sealed WITH the message rather than kept beside it (unlike
+   *  `failed`) because a plaintext delivery flag would tell a forensic image which
+   *  rows are outbound and how many reached the peer, and DESIGN 8.5 promises the
+   *  database reveals no such thing at rest. */
+  status?: DeliveryStatus
 }
 
 export class HistoryStore {
@@ -72,13 +85,17 @@ export class HistoryStore {
     return domainSeparate(ROW_AAD_TAG, utf8(storageKey), Uint8Array.from([HISTORY_FORMAT_VERSION]))
   }
 
-  /** Seal a full message into a storable record. Throws AppLockedError if locked. */
+  /** Seal a full message into a storable record. Throws AppLockedError if locked.
+   *  A re-seal (a status change) draws a FRESH salt, so it is a new key+nonce and
+   *  never a keystream reuse against the previous ciphertext. */
   seal(msg: HistoryMessage, failed?: boolean): HistoryRecord {
     const key = this.storageKey(msg.peerId, msg.dir, msg.id)
     const salt = randomBytes(HISTORY_SALT_BYTES)
     const { key: k, nonce } = this.bodyKeyNonce(salt)
-    // Compact JSON: i=id, p=peer, d=dir, t=ts, x=text.
-    const plain = utf8(JSON.stringify({ i: msg.id, p: msg.peerId, d: msg.dir, t: msg.ts, x: msg.text }))
+    // Compact JSON: i=id, p=peer, d=dir, t=ts, x=text, s=delivery status.
+    const body: Record<string, unknown> = { i: msg.id, p: msg.peerId, d: msg.dir, t: msg.ts, x: msg.text }
+    if (msg.status) body.s = msg.status
+    const plain = utf8(JSON.stringify(body))
     const ct = aeadSeal(k, nonce, plain, this.aad(key))
     return failed ? { key, salt, ct, failed: true } : { key, salt, ct }
   }
@@ -88,7 +105,19 @@ export class HistoryStore {
   open(rec: HistoryRecord): HistoryMessage {
     const { key: k, nonce } = this.bodyKeyNonce(rec.salt)
     const plain = aeadOpen(k, nonce, rec.ct, this.aad(rec.key))
-    const o = JSON.parse(decoder.decode(plain)) as { i: string; p: string; d: 'in' | 'out'; t: number; x: string }
-    return { id: o.i, peerId: o.p, dir: o.d, ts: o.t, text: o.x }
+    const o = JSON.parse(decoder.decode(plain)) as {
+      i: string
+      p: string
+      d: 'in' | 'out'
+      t: number
+      x: string
+      s?: string
+    }
+    const msg: HistoryMessage = { id: o.i, peerId: o.p, dir: o.d, ts: o.t, text: o.x }
+    // Only the two known values are honoured. A row written by a future version
+    // carrying some other status reads as "unknown" rather than being surfaced as
+    // a delivery claim this build cannot vouch for.
+    if (o.s === 'sent' || o.s === 'delivered') msg.status = o.s
+    return msg
   }
 }

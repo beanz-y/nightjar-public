@@ -152,12 +152,22 @@ export interface SessionStore {
    *  is not possible (by design: the DB reveals no peer); a full scan is the only
    *  reader, which the app does once at unlock. */
   historyLoadAll(): Promise<HistoryRecord[]>
+  /** One record by its opaque storage key, or null. */
+  historyGet(key: string): Promise<HistoryRecord | null>
+  /** Overwrite one record in place, ONLY if it already exists (never resurrects a
+   *  deleted row: a status update racing a delete-for-everyone must not put the
+   *  message back). Used to re-seal a row whose delivery status changed, which is a
+   *  post-commit annotation on an existing message, not message content, so it does
+   *  not ride the ratchet commit. Callers hold the per-peer lock so a row still has
+   *  exactly one writer. */
+  historyUpdate(rec: HistoryRecord): Promise<void>
   /** Remove exactly one record by its opaque storage key (delete / ephemeral). */
   historyRemove(key: string): Promise<void>
   /** Mark one record failed by its opaque storage key. No-op if the row is gone. */
   historyMarkFailed(key: string): Promise<void>
-  /** Clear ONLY the history store (the forgot-secret app-lock reset: erase saved
-   *  messages while keeping sessions/dedup/outbox so live messaging still works). */
+  /** Clear the saved-history row classes, meaning messages AND their delete
+   *  tombstones (the forgot-secret app-lock reset: erase saved messages while
+   *  keeping sessions/dedup/outbox so live messaging still works). */
   historyClear(): Promise<void>
 
   // --- delete tombstones (P10d) ------------------------------------------
@@ -317,12 +327,25 @@ export class MemorySessionStore implements SessionStore {
     this.outbox.delete(id)
   }
 
+  // Sorted like the IndexedDB implementation. Map iteration is already insertion
+  // order here, so without this an ordering test would pass in memory and fail
+  // only in production, where the backing order is by random key.
   async pendingOutbox(): Promise<OutboxEntry[]> {
-    return [...this.outbox.values()].map(clone)
+    return [...this.outbox.values()].map(clone).sort((a, b) => a.createdAt - b.createdAt)
   }
 
   async historyLoadAll(): Promise<HistoryRecord[]> {
     return [...this.history.values()].map(clone)
+  }
+
+  async historyGet(key: string): Promise<HistoryRecord | null> {
+    const r = this.history.get(key)
+    return r ? clone(r) : null
+  }
+
+  async historyUpdate(rec: HistoryRecord): Promise<void> {
+    if (!this.history.has(rec.key)) return
+    this.history.set(rec.key, clone(rec))
   }
 
   async historyRemove(key: string): Promise<void> {
@@ -336,6 +359,7 @@ export class MemorySessionStore implements SessionStore {
 
   async historyClear(): Promise<void> {
     this.history.clear()
+    this.tombstones.clear()
   }
 
   async hasTombstone(key: string): Promise<boolean> {
@@ -433,7 +457,27 @@ export class IdbSessionStore implements SessionStore {
           // dedup row EARLY is the only unsafe direction, so never stamp 0).
           if (from >= 1 && from < 4 && tx) migrateRetentionStamps(tx.objectStore(SEEN), tx.objectStore(FAILURES))
         }
-        req.onsuccess = () => resolve(req.result)
+        req.onsuccess = () => {
+          const db = req.result
+          // Another tab later opens this DB at a HIGHER version: step aside so its
+          // upgrade is not blocked forever. Without this, the newer tab's open sits
+          // in `blocked` until this connection closes, which for a PWA left open in
+          // a background tab is "never".
+          db.onversionchange = () => {
+            this.dbPromise = null
+            db.close()
+          }
+          resolve(db)
+        }
+        // An open that needs an upgrade while ANOTHER tab still holds the old
+        // version fires `blocked` and then never fires success or error. Failing
+        // here is what stops the caller awaiting a promise that can never settle:
+        // an unsettled promise cannot be caught, so the UI would hang on the unlock
+        // spinner with no error at all (the bootstrap try/catch never runs).
+        req.onblocked = () => {
+          this.dbPromise = null
+          reject(new Error('storage is open in another tab running an older version of Nightjar: close it, or reload this tab'))
+        }
         req.onerror = () => {
           this.dbPromise = null // a failed open must not wedge every later call
           reject(req.error)
@@ -595,9 +639,16 @@ export class IdbSessionStore implements SessionStore {
     await this.tx(OUTBOX, 'readwrite', (t) => t.objectStore(OUTBOX).delete(id))
   }
 
+  // Ordered oldest-FIRST by creation time. `getAll()` yields IndexedDB key order,
+  // and the key is the entry id (a random 16-byte hex, see saveBookWithOutbox), so
+  // the raw order is uncorrelated with the order the user actually did things. The
+  // relay drains in arrival order, which is our flush order, so an unordered flush
+  // lets a queued control (a delete, and anything later that targets an existing
+  // message) overtake the message it refers to. Sorting here is the single place
+  // that fixes it for every caller.
   async pendingOutbox(): Promise<OutboxEntry[]> {
     const entries = await this.tx<OutboxEntry[]>(OUTBOX, 'readonly', (t) => t.objectStore(OUTBOX).getAll())
-    return entries ?? []
+    return (entries ?? []).sort((a, b) => a.createdAt - b.createdAt)
   }
 
   async historyLoadAll(): Promise<HistoryRecord[]> {
@@ -607,6 +658,30 @@ export class IdbSessionStore implements SessionStore {
 
   async historyRemove(key: string): Promise<void> {
     await this.tx(HISTORY, 'readwrite', (t) => t.objectStore(HISTORY).delete(key))
+  }
+
+  async historyGet(key: string): Promise<HistoryRecord | null> {
+    const r = await this.tx<HistoryRecord | undefined>(HISTORY, 'readonly', (t) => t.objectStore(HISTORY).get(key))
+    return r ?? null
+  }
+
+  // Existence is re-checked inside the SAME transaction as the put, so a row
+  // deleted in between (delete-for-everyone, an ephemeral cleanup) is not
+  // resurrected by a status update that was already in flight.
+  async historyUpdate(rec: HistoryRecord): Promise<void> {
+    const db = await this.open()
+    await new Promise<void>((resolve, reject) => {
+      const t = db.transaction(HISTORY, 'readwrite')
+      const store = t.objectStore(HISTORY)
+      const get = store.get(rec.key)
+      get.onsuccess = () => {
+        if (get.result !== undefined) store.put(rec, rec.key)
+      }
+      get.onerror = () => reject(get.error)
+      t.oncomplete = () => resolve()
+      t.onabort = () => reject(t.error)
+      t.onerror = () => reject(t.error)
+    })
   }
 
   async historyMarkFailed(key: string): Promise<void> {
@@ -629,9 +704,15 @@ export class IdbSessionStore implements SessionStore {
     })
   }
 
+  // Clears every row class that belongs to saved history, not just the messages.
+  // Tombstones are keyed by the same opaque history key, so leaving them behind
+  // survived the "forgot your secret" reset as a count of applied deletes, and
+  // (since the reset discards the LDK) as rows nothing could ever open or attribute
+  // again. DESIGN 8.5 says that reset erases the saved history, so it must.
   async historyClear(): Promise<void> {
-    await this.tx(HISTORY, 'readwrite', (t) => {
+    await this.tx([HISTORY, TOMBSTONES], 'readwrite', (t) => {
       t.objectStore(HISTORY).clear()
+      t.objectStore(TOMBSTONES).clear()
       return null
     })
   }

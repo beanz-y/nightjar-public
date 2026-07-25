@@ -1,6 +1,6 @@
 import { SELF, env, runInDurableObject } from 'cloudflare:test'
 import { describe, expect, it, vi } from 'vitest'
-import { MAX_PUSH_SUBS } from '../../src/crypto/constants'
+import { MAX_DELIVERED_CHECK_IDS, MAX_PUSH_SUBS } from '../../src/crypto/constants'
 import { type Identity, generateIdentity } from '../../src/crypto/identity'
 import { utf8 } from '../../src/crypto/primitives'
 import { OWN_BUNDLE_VERSION, buildOwnBundle, generateSignedPrekey, verifyFetchedBundle } from '../../src/crypto/prekeys'
@@ -570,6 +570,97 @@ describe('end-to-end messaging through the relay', () => {
     })
     await new Promise((r) => setTimeout(r, 100))
     expect(redelivered).toBe(false)
+  })
+})
+
+// The delivery indicator. The relay reports what it already knows (an envelope was
+// picked up and dropped from the queue), so the tests check exactly that: the live
+// report reaches a connected sender, and a sender who was away can ask afterwards.
+// Nothing is stored for either: no delivery log is created (DESIGN 7.5).
+describe('delivery reporting', () => {
+  async function pair() {
+    const alice = generateIdentity()
+    const bob = generateIdentity()
+    const aConn = await connectAndAuth(alice)
+    const bConn = await connectAndAuth(bob)
+    await register(aConn, ownBundleFor(alice), await adminInvite())
+    await register(bConn, ownBundleFor(bob), await adminInvite())
+    return { alice, bob, aConn, bConn }
+  }
+  // The relay structurally validates every envelope, so these carry a real header
+  // and ciphertext. The contents are irrelevant here: nothing decrypts them.
+  const envelope = (id: string): WireEnvelope => ({
+    id,
+    kind: 'normal',
+    header: encodeMessageHeaderWire({ version: 1, dhPub: new Uint8Array(32), pn: 0, n: 0 }),
+    ciphertext: b64encode(new Uint8Array(16)),
+  })
+
+  it('tells a connected sender when the recipient picks a message up', async () => {
+    const { alice, bob, aConn, bConn } = await pair()
+    aConn.send({ t: 'send', to: bob.userId, env: envelope('d1') })
+    expect((await aConn.waitFor('sent')).id).toBe('d1')
+    const deliver = await bConn.waitFor('deliver')
+    bConn.send({ t: 'ack', id: deliver.env.id })
+    const report = await aConn.waitFor('delivered')
+    expect(report.id).toBe('d1')
+    // Named so the sender can find its own local row; it is the acking user.
+    expect(report.from).toBe(bob.userId)
+    void alice
+  })
+
+  it('answers a catch-up query for a sender who was offline when it happened', async () => {
+    // The live report is fire-and-forget with nothing queued behind it, so this
+    // path is what makes the indicator work for a phone that was asleep.
+    const { alice, bob, aConn, bConn } = await pair()
+    aConn.send({ t: 'send', to: bob.userId, env: envelope('d2') })
+    await aConn.waitFor('sent')
+    const deliver = await bConn.waitFor('deliver')
+    bConn.send({ t: 'ack', id: deliver.env.id })
+    await aConn.waitFor('delivered') // ordering: the ack has been processed
+
+    const reqId = nextReq()
+    aConn.send({ t: 'deliveredCheck', reqId, to: bob.userId, ids: ['d2', 'never-sent'] })
+    const list = (await aConn.waitPred(
+      (m) => m.t === 'deliveredList' && (m as { reqId?: string }).reqId === reqId,
+    )) as Extract<ServerMessage, { t: 'deliveredList' }>
+    // Only the id actually picked up comes back: absence is never a false positive.
+    expect(list.ids).toEqual(['d2'])
+    void alice
+  })
+
+  it('reports nothing for an envelope still sitting in the queue', async () => {
+    const { bob, aConn } = await pair()
+    aConn.send({ t: 'send', to: bob.userId, env: envelope('d3') })
+    await aConn.waitFor('sent')
+    // Bob never connects, so nothing is acked and nothing is delivered.
+    const reqId = nextReq()
+    aConn.send({ t: 'deliveredCheck', reqId, to: bob.userId, ids: ['d3'] })
+    const list = (await aConn.waitPred(
+      (m) => m.t === 'deliveredList' && (m as { reqId?: string }).reqId === reqId,
+    )) as Extract<ServerMessage, { t: 'deliveredList' }>
+    expect(list.ids).toEqual([])
+  })
+
+  it('bounds how many ids one query may ask about', async () => {
+    const { bob, aConn } = await pair()
+    const reqId = nextReq()
+    const ids = Array.from({ length: MAX_DELIVERED_CHECK_IDS + 50 }, (_, i) => `x${i}`)
+    aConn.send({ t: 'deliveredCheck', reqId, to: bob.userId, ids })
+    const list = (await aConn.waitPred(
+      (m) => m.t === 'deliveredList' && (m as { reqId?: string }).reqId === reqId,
+    )) as Extract<ServerMessage, { t: 'deliveredList' }>
+    expect(list.ids).toEqual([]) // none exist, and the DO did bounded work
+  })
+
+  it('rejects a query naming a malformed recipient', async () => {
+    const { aConn } = await pair()
+    const reqId = nextReq()
+    aConn.send({ t: 'deliveredCheck', reqId, to: 'not-a-user-id', ids: ['x'] })
+    const err = (await aConn.waitPred(
+      (m) => m.t === 'error' && (m as { reqId?: string }).reqId === reqId,
+    )) as Extract<ServerMessage, { t: 'error' }>
+    expect(err.code).toBe('bad_to')
   })
 })
 

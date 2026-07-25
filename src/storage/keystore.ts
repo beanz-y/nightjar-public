@@ -49,7 +49,22 @@ export class IdbKeyStore implements KeyStore {
         req.onupgradeneeded = () => {
           req.result.createObjectStore(STORE_NAME)
         }
-        req.onsuccess = () => resolve(req.result)
+        req.onsuccess = () => {
+          const db = req.result
+          db.onversionchange = () => {
+            this.dbPromise = null
+            db.close()
+          }
+          resolve(db)
+        }
+        // A blocked open fires neither success nor error, so without this the
+        // caller awaits a promise that can never settle (see the same guard in
+        // sessionStore). This DB is pinned at version 1 today, so this is purely
+        // defensive against a future bump.
+        req.onblocked = () => {
+          this.dbPromise = null
+          reject(new Error('storage is open in another tab running an older version of Nightjar: close it, or reload this tab'))
+        }
         req.onerror = () => {
           this.dbPromise = null // a failed open must not wedge every later call
           reject(req.error)

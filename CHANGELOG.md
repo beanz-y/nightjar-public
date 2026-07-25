@@ -11,6 +11,57 @@ release tags cut by the deploy pipeline. Dates are the tag dates.
 
 ## [Unreleased]
 
+## [1.6.0] - 2026-07-24
+
+### Added
+- **Scan a contact's code to compare safety numbers.** The verify screen can now
+  use the camera instead of asking you to read 40 digits, which is the step people
+  actually get wrong. The QR payload changed to carry, alongside the same digits,
+  a short tag identifying the device displaying it. That matters more than it
+  sounds: a safety number is the same on both devices, so a code carrying only the
+  digits cannot tell a real scan of your contact's screen from someone handing you
+  back a picture of your own. Scanning is fail-closed, and it names what happened
+  rather than just passing or failing: a self-scan, a code from a different
+  contact, an invite code, or an app version mismatch each get their own message.
+  Both devices need this version to scan each other; comparing by eye is unchanged
+  and always available.
+- **A scan never verifies on its own, and never un-verifies either.** A match
+  unlocks the confirmation, and you still confirm that you scanned their actual
+  device, in person or on a live call. The camera can prove two codes agree; it
+  cannot prove where the image came from, and a forwarded photo of a genuine code
+  looks identical. A mismatch is shown loudly and changes nothing that is stored,
+  so nobody can strip your verifications by putting a QR code in front of a camera.
+- **Remove a verification.** If you learn you confirmed the wrong person you can
+  now withdraw it, from the verify screen, behind a confirmation. It keeps the
+  contact, their key, and your messages, and puts them back to unverified. Until
+  now "verified" was a one-way door, which is not a good place to add a faster
+  route into.
+- **Sent and delivered indicators.** Your own messages show whether they are still
+  on your device, stored for the other person, or picked up by their device. Both
+  positive states are the relay's word, not a signed statement from your contact,
+  and the tooltips say exactly that. "Delivered" means a device accepted the bytes:
+  it does not mean anyone read it. There are no read receipts, deliberately, and
+  the reasoning is in DESIGN 1.2 and 8.8. Nothing is stored on the relay for this,
+  and the status is sealed inside your message history like the message itself, so
+  a device image learns nothing new from it.
+
+### Fixed
+- **The "back up identity" icon rendered as an empty box on Android.** It, and two
+  others, were Unicode symbols from blocks the default Android fonts do not cover.
+  All the menu icons are now drawn by the app, so they no longer depend on which
+  fonts a device happens to ship.
+- **Queued messages could pile up in the wrong order.** The outbox was flushed in
+  storage-key order, which is effectively random, rather than in the order you
+  actually did things. It now flushes oldest first.
+- **A full recipient inbox failed silently.** If someone's inbox was full, messages
+  to them kept retrying with nothing shown, for up to a week. It now says so once.
+- **"Erase saved messages" left the delete records behind.** The forgot-your-secret
+  reset cleared your messages but not the markers recording which messages had been
+  deleted for everyone. It now clears both, as that screen always said it would.
+- **A future storage upgrade would have hung a second open tab.** The database open
+  path had no handler for the case where another tab still holds an older version,
+  so it would have waited forever with no error rather than telling you to reload.
+
 ## [1.5.3] - 2026-07-22
 
 ### Fixed

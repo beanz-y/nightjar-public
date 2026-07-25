@@ -50,4 +50,17 @@ export class DirectoryClient {
     if (r.t !== 'redemptions') throw new Error(`inviteRedemptions: unexpected ${r.t}`)
     return Array.isArray(r.joiners) ? r.joiners : []
   }
+
+  /** Which of `ids` the recipient's inbox has recorded as picked up (delivery
+   *  indicator catch-up). Same untrusted-relay discipline as above: a garbage
+   *  response degrades to "none confirmed", never to a false positive, and the
+   *  caller filters to ids it actually asked about. */
+  async deliveredCheck(to: string, ids: string[]): Promise<string[]> {
+    const id = reqId()
+    const r = await this.transport.request(id, { t: 'deliveredCheck', reqId: id, to, ids })
+    if (r.t !== 'deliveredList') throw new Error(`deliveredCheck: unexpected ${r.t}`)
+    if (!Array.isArray(r.ids)) return []
+    const asked = new Set(ids)
+    return r.ids.filter((x): x is string => typeof x === 'string' && asked.has(x))
+  }
 }

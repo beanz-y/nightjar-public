@@ -104,6 +104,20 @@ export interface PresenceMsg {
   watching: boolean
 }
 
+/** "Which of these envelopes has the recipient's device picked up?" (delivery
+ *  indicator). Answers what the relay already knows: an envelope is deleted from
+ *  the recipient's inbox and its id recorded as seen when their device acks
+ *  durable consumption. Used on reconnect to catch up on deliveries that happened
+ *  while this device was offline, since the live report has no one to reach then.
+ *  Bounded per request; the ids are the sender's own, so this reveals nothing the
+ *  sender did not already generate. */
+export interface DeliveredCheckMsg {
+  t: 'deliveredCheck'
+  reqId: string
+  to: string
+  ids: string[]
+}
+
 export type ClientMessage =
   | AuthMsg
   | RegisterMsg
@@ -114,6 +128,7 @@ export type ClientMessage =
   | SendMsg
   | AckMsg
   | DrainMsg
+  | DeliveredCheckMsg
   | PushSubscribeMsg
   | PushUnsubscribeMsg
   | PresenceMsg
@@ -181,6 +196,31 @@ export interface SentMsg {
   id: string // sender-side durability ack: stored at the recipient inbox
 }
 
+/** Unsolicited: the recipient's device has picked this envelope up (it acked
+ *  durable consumption and the relay dropped the queued copy). This is the
+ *  RELAY'S WORD, exactly like `sent`, not a signed statement by the peer: a
+ *  malicious relay can withhold it, and could assert it for an envelope it in fact
+ *  dropped. It is a UI hint, never a security property, and the UI labels it as
+ *  such. Fire-and-forget: if the sender has no live socket, nothing is stored and
+ *  nothing is queued (the sender catches up with `deliveredCheck` on reconnect). */
+export interface DeliveredMsg {
+  t: 'delivered'
+  id: string
+  /** Who picked it up. UNTRUSTED, and used only to locate a local history row:
+   *  a relay naming the wrong peer just points at a row that does not exist, and
+   *  the update is a no-op. It is not new information either way, since the sender
+   *  chose that recipient. */
+  from: string
+}
+
+/** Reply to `deliveredCheck`: the subset of the asked-about ids the recipient's
+ *  inbox has recorded as consumed. */
+export interface DeliveredListMsg {
+  t: 'deliveredList'
+  reqId: string
+  ids: string[]
+}
+
 export interface ErrorMsg {
   t: 'error'
   code: string
@@ -201,4 +241,6 @@ export type ServerMessage =
   | RedemptionsMsg
   | DeliverMsg
   | SentMsg
+  | DeliveredMsg
+  | DeliveredListMsg
   | ErrorMsg

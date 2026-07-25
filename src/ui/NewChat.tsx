@@ -8,6 +8,7 @@
 // trust-on-first-use chat). Showing an invite reuses the existing InvitePanel.
 
 import { useState } from 'react'
+import { KeyboardIcon, PlusIcon, ScanIcon } from './icons'
 import { InvitePanel } from './InvitePanel'
 import { QrScanner } from './QrScanner'
 import type { MintedInvite } from './useNightjar'
@@ -98,7 +99,9 @@ export function NewChat({ minted, onMint, onSync, onCode, onOpened, onClose }: P
       </div>
 
       <button className="tile" onClick={() => setMode('scan')}>
-        <span className="tile-icon" aria-hidden="true">⧉</span>
+        <span className="tile-icon" aria-hidden="true">
+          <ScanIcon />
+        </span>
         <span>
           <span className="tile-title">Scan a code</span>
           <span className="tile-sub muted small">Point the camera at their invite or "my code" QR.</span>
@@ -106,7 +109,9 @@ export function NewChat({ minted, onMint, onSync, onCode, onOpened, onClose }: P
       </button>
 
       <button className="tile" onClick={() => setMode('enter')}>
-        <span className="tile-icon" aria-hidden="true">⌨</span>
+        <span className="tile-icon" aria-hidden="true">
+          <KeyboardIcon />
+        </span>
         <span>
           <span className="tile-title">Enter a code or user id</span>
           <span className="tile-sub muted small">Paste an invite link/code, or a 52-char user id.</span>
@@ -120,7 +125,9 @@ export function NewChat({ minted, onMint, onSync, onCode, onOpened, onClose }: P
           if (!minted) onMint()
         }}
       >
-        <span className="tile-icon" aria-hidden="true">＋</span>
+        <span className="tile-icon" aria-hidden="true">
+          <PlusIcon />
+        </span>
         <span>
           <span className="tile-title">Invite someone new</span>
           <span className="tile-sub muted small">Show a single-use invite QR to bring a new person onto Nightjar.</span>
