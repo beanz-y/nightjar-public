@@ -60,7 +60,22 @@ export interface CrossTabStatus {
   status: DeliveryStatus
 }
 
-export type CrossTabEvent = CrossTabAppend | CrossTabDelete | CrossTabFailed | CrossTabStatus
+/** The user deleted (or cleared) a conversation here. Render-only in siblings,
+ *  like every other event: the storage work already happened once, in the tab that
+ *  performed it. `keepThread` distinguishes clearing the messages from removing
+ *  the contact entirely. */
+export interface CrossTabConversationRemoved {
+  kind: 'conversationRemoved'
+  peer: string
+  keepThread: boolean
+}
+
+export type CrossTabEvent =
+  | CrossTabAppend
+  | CrossTabDelete
+  | CrossTabFailed
+  | CrossTabStatus
+  | CrossTabConversationRemoved
 
 export interface CrossTab {
   /** Broadcast a render event to sibling tabs (no-op if unsupported/closed). */
@@ -75,7 +90,7 @@ export const CROSS_TAB_CHANNEL = 'nightjar-render'
 function isEvent(v: unknown): v is CrossTabEvent {
   if (!v || typeof v !== 'object') return false
   const k = (v as { kind?: unknown }).kind
-  return k === 'append' || k === 'delete' || k === 'failed' || k === 'status'
+  return k === 'append' || k === 'delete' || k === 'failed' || k === 'status' || k === 'conversationRemoved'
 }
 
 /**

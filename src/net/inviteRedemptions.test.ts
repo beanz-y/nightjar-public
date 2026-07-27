@@ -171,8 +171,13 @@ describe('client.syncInviteContacts (mutual invite)', () => {
     const good = generateIdentity()
     // A conflict is unreachable under honest operation (userId == hash(IK_sig)), so
     // stub addContact to force the branch and prove it is not silently swallowed.
-    ;(h.client as unknown as { addContact: (peerId: string) => Promise<void> }).addContact = async (peerId: string) => {
+    // addContact reports whether a record now exists (it can be refused for a peer
+    // the user deleted), so the stub has to honour that contract too.
+    ;(h.client as unknown as { addContact: (peerId: string) => Promise<boolean> }).addContact = async (
+      peerId: string,
+    ) => {
       if (peerId === bad.userId) throw new KeyConflictError(peerId)
+      return true
     }
     h.setJoiners([bad.userId, good.userId])
 

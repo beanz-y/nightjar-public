@@ -26,6 +26,10 @@ interface Props {
   /** Relay connection state. Surfaced inside a conversation because on a phone the
    *  global topbar (which carries the dot) steps aside for the chat. */
   connected: boolean
+  /** The peer of the most recent full delete, from THIS tab or a sibling. `selected`
+   *  is per-tab state that a cross-tab render event cannot reach, so this is what
+   *  closes a pane whose conversation no longer exists. */
+  removedPeer: { peer: string; n: number } | null
   notify: NotifyState
   storagePersisted: boolean | null
   canary: CanaryResult | null
@@ -41,6 +45,8 @@ interface Props {
     syncInviteContacts: () => Promise<number>
     markVerified: (peer: string) => void
     unverify: (peer: string) => void
+    clearMessages: (peer: string) => void
+    deleteConversation: (peer: string) => void
     ensureContact: (peer: string) => Promise<boolean>
     enableNotifications: () => void
     disableNotifications: () => void
@@ -54,7 +60,7 @@ function shortId(id: string): string {
   return `${id.slice(0, 6)}…${id.slice(-4)}`
 }
 
-export function Messenger({ identity, connected, contacts, aliases, conversations, notify, storagePersisted, canary, bioAvailable, lockMethods, actions }: Props) {
+export function Messenger({ identity, connected, removedPeer, contacts, aliases, conversations, notify, storagePersisted, canary, bioAvailable, lockMethods, actions }: Props) {
   const displayName = (peer: string): string => aliases[peer]?.trim() || shortId(peer)
   const [selected, setSelected] = useState<string | null>(null)
   const [chatView, setChatView] = useState<'chat' | 'verify'>('chat')
@@ -90,6 +96,20 @@ export function Messenger({ identity, connected, contacts, aliases, conversation
       })
     }
   }, [conversations, selected])
+
+  // A conversation deleted here or in another tab must not stay open: the pane would
+  // show an empty chat with no contact and no trust badge, and typing in it would
+  // re-create the contact and a session as though the user had asked for it.
+  useEffect(() => {
+    if (!removedPeer) return
+    setUnread((u) => {
+      if (!u.has(removedPeer.peer)) return u
+      const n = new Set(u)
+      n.delete(removedPeer.peer)
+      return n
+    })
+    setSelected((cur) => (cur === removedPeer.peer ? null : cur))
+  }, [removedPeer])
 
   const clearUnread = (peer: string) =>
     setUnread((u) => {
@@ -259,6 +279,19 @@ export function Messenger({ identity, connected, contacts, aliases, conversation
             onVerify={() => void openVerify()}
             onRename={(n) => actions.renameChat(selected, n)}
             onDelete={(id, failed) => void actions.deleteMessage(selected, id, failed)}
+            onClearMessages={() => actions.clearMessages(selected)}
+            onDeleteConversation={() => {
+              // Drop this pane's own per-peer state too, or the thread stays
+              // selected and flagged unread after the data behind it is gone.
+              setUnread((u) => {
+                if (!u.has(selected)) return u
+                const n = new Set(u)
+                n.delete(selected)
+                return n
+              })
+              setSelected(null)
+              actions.deleteConversation(selected)
+            }}
             onBack={() => setSelected(null)}
           />
         )}

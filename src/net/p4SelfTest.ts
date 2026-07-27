@@ -198,6 +198,43 @@ export async function runP4SelfTest(bootstrapInvite: string): Promise<P4SelfTest
     const checkOk = checkIds.length > 0 && checkIds.every((id) => confirmed.includes(id))
     log.push(`offline catch-up query confirmed ${confirmed.length}/${checkIds.length}: ${checkOk ? 'PASS' : 'FAIL'}`)
 
+    // Delete keeps the ratchet ON PURPOSE, so a deleted contact can still reach you.
+    // Removing it would black-hole them: their app keeps sending on the session it
+    // still holds, those messages arrive undecryptable and are acked-and-dropped, and
+    // the relay reports that ack back to them as "delivered". This proves the whole
+    // loop over the REAL relay: alice deletes bob, bob (who knows nothing about it)
+    // sends, and it still lands.
+    await alice.deleteConversation(bob.userId)
+    const aliceAfterDelete = (await alice.loadAllHistory())[bob.userId] ?? []
+    const aliceKnowsBob = await alice.trustOf(bob.userId)
+    const reachText = 'can I still reach you'
+    await bob.sendText(alice.userId, reachText)
+    let reached = false
+    try {
+      await waitUntil(() => aRecv.includes(reachText))
+      reached = true
+    } catch {
+      reached = false
+    }
+    const stillReachableOk = aliceAfterDelete.length === 0 && aliceKnowsBob === null && reached
+    log.push(
+      `delete cleared alice's copy (${aliceAfterDelete.length} rows, contact ${aliceKnowsBob}) yet bob still reached her: ${stillReachableOk ? 'PASS' : 'FAIL'}`,
+    )
+
+    // ...and his message re-records him as a plain TOFU contact, which is what makes
+    // the safety number available again on the reopened chat. It must come back at
+    // 'unverified': the in-person verification alice had is NOT restored by a delete
+    // being undone (DESIGN 6.2/8.9).
+    let relearned: string | null = null
+    try {
+      await waitUntil(async () => (await alice.trustOf(bob.userId)) !== null)
+      relearned = await alice.trustOf(bob.userId)
+    } catch {
+      relearned = await alice.trustOf(bob.userId)
+    }
+    const relearnOk = relearned === 'unverified'
+    log.push(`his message re-recorded him as a contact (trust ${relearned}, verification NOT restored): ${relearnOk ? 'PASS' : 'FAIL'}`)
+
     const ok =
       bRecv[0] === 'hello from alice' &&
       aRecv[0] === 'hi back from bob' &&
@@ -210,6 +247,8 @@ export async function runP4SelfTest(bootstrapInvite: string): Promise<P4SelfTest
       ephemeralOk &&
       deliveredOk &&
       checkOk &&
+      stillReachableOk &&
+      relearnOk &&
       errors.length === 0
     // Surface the FULL ids (both stay registered in the Directory) so the app can
     // message one and exercise the contact + verify UI against a real peer.

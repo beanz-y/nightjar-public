@@ -138,6 +138,20 @@ function computeNotify(pushKey: string | null): NotifyState {
   }
 }
 
+/** Wording for history rows that would not open during a clear or a delete.
+ *
+ *  The count is DATABASE-WIDE and cannot be otherwise: the only thing naming a row
+ *  is sealed inside the part that will not open, so an unreadable row cannot be
+ *  attributed to any conversation, including the one being deleted. Saying "N
+ *  messages could not be removed" inside a per-chat notice would read as a claim
+ *  about that chat, which is more than we know. */
+function unreadableNote(n: number): string {
+  const rows = `${n} stored ${n === 1 ? 'message' : 'messages'}`
+  const it = n === 1 ? 'it' : 'they'
+  const was = n === 1 ? 'was' : 'were'
+  return `${rows} in your saved history could not be read at all, so ${it} could not be matched to any conversation and ${was} left in place.`
+}
+
 export function useNightjar() {
   const [phase, setPhase] = useState<Phase>('loading')
   const [error, setError] = useState<string | null>(null)
@@ -157,6 +171,16 @@ export function useNightjar() {
   const [lockMethods, setLockMethods] = useState<Array<'pass' | 'pin' | 'bio'>>([])
   const [bioAvailable, setBioAvailable] = useState(false)
   const [restorePending, setRestorePending] = useState(false)
+  /** The peer of the most recent FULL delete, local or from a sibling tab. The
+   *  conversation pane keeps its own `selected` state, which no cross-tab event can
+   *  reach, so without this a sibling tab keeps the deleted chat open and typing in
+   *  it re-creates the contact and a session. Carries a nonce so deleting the same
+   *  peer twice still fires. */
+  const [removedPeer, setRemovedPeer] = useState<{ peer: string; n: number } | null>(null)
+  const removedSeqRef = useRef(0)
+  const noteRemoved = useCallback((peer: string) => {
+    setRemovedPeer({ peer, n: ++removedSeqRef.current })
+  }, [])
 
   const liveRef = useRef<Live | null>(null)
   const storesRef = useRef<Stores | null>(null)
@@ -195,7 +219,24 @@ export function useNightjar() {
 
   // Remove a bubble from a conversation (delete-for-everyone, either direction).
   const removeBubble = useCallback((peer: string, id: string) => {
-    setConversations((prev) => ({ ...prev, [peer]: (prev[peer] ?? []).filter((m) => m.id !== id) }))
+    setConversations((prev) => {
+      const cur = prev[peer]
+      // Do NOT create the key for a peer we hold nothing for: this also runs as a
+      // cross-tab and inbound receiver, and writing an empty array would rebuild a
+      // thread row for a conversation the user just deleted.
+      if (!cur) return prev
+      return { ...prev, [peer]: cur.filter((m) => m.id !== id) }
+    })
+  }, [])
+
+  /** Drop a whole conversation from the in-RAM view. */
+  const dropConversation = useCallback((peer: string) => {
+    setConversations((prev) => {
+      if (!(peer in prev)) return prev
+      const next = { ...prev }
+      delete next[peer]
+      return next
+    })
   }, [])
 
   // Mark a bubble failed by id, matched across conversations (a send-failure id is
@@ -335,6 +376,18 @@ export function useNightjar() {
         if (ev.kind === 'append') appendMessage(ev.peer, ev.msg)
         else if (ev.kind === 'delete') removeBubble(ev.peer, ev.id)
         else if (ev.kind === 'status') markStatus(ev.peer, ev.id, ev.status)
+        else if (ev.kind === 'conversationRemoved') {
+          dropConversation(ev.peer)
+          if (!ev.keepThread) noteRemoved(ev.peer)
+          // A full delete also removed the contact and the nickname, which this tab
+          // still holds in state; without re-reading them the thread row would
+          // linger here, empty, until something else happened to refresh it.
+          if (!ev.keepThread) {
+            void listContacts().catch(() => {})
+            const live = liveRef.current
+            if (live) void live.client.listAliases().then(setAliases).catch(() => {})
+          }
+        }
         else markFailed(ev.id)
       })
 
@@ -793,6 +846,48 @@ export function useNightjar() {
     }
   }, [])
 
+  /** Remove the saved messages for a chat, keeping the contact and its verification. */
+  const clearMessages = useCallback(async (peer: string) => {
+    const live = liveRef.current
+    if (!live) return
+    try {
+      const { removed, unreadable } = await live.client.clearMessages(peer)
+      dropConversation(peer)
+      broadcast({ kind: 'conversationRemoved', peer, keepThread: true })
+      const msgs = `${removed} saved ${removed === 1 ? 'message' : 'messages'}`
+      setNotice(unreadable > 0 ? `removed ${msgs} from this device. ${unreadableNote(unreadable)}` : `removed ${msgs} from this device`)
+    } catch (e) {
+      setNotice(`could not clear the messages: ${String(e instanceof Error ? e.message : e)}`)
+    }
+  }, [broadcast, dropConversation])
+
+  /** Delete everything this device holds for a peer. Not a block: see DESIGN 8.9. */
+  const deleteConversation = useCallback(async (peer: string) => {
+    const live = liveRef.current
+    if (!live) return
+    try {
+      const { removed, unreadable, cancelled } = await live.client.deleteConversation(peer)
+      dropConversation(peer)
+      noteRemoved(peer)
+      broadcast({ kind: 'conversationRemoved', peer, keepThread: false })
+      await listContacts()
+      setAliases(await live.client.listAliases())
+      const msgs = `${removed} ${removed === 1 ? 'message' : 'messages'}`
+      // NOT "cancelled N not yet sent": an outbox row survives the socket write until
+      // the relay acks it, so some of these may already be at the relay and will
+      // still be delivered. Say only what is provable, which is that nothing further
+      // goes out from here.
+      const queued = cancelled > 0 ? `, and removed ${cancelled} still queued here` : ''
+      setNotice(
+        unreadable > 0
+          ? `deleted from this device (${msgs}${queued}). ${unreadableNote(unreadable)}`
+          : `deleted from this device (${msgs}${queued})`,
+      )
+    } catch (e) {
+      setNotice(`could not delete the conversation: ${String(e instanceof Error ? e.message : e)}`)
+    }
+  }, [broadcast, dropConversation, listContacts])
+
   // Withdraw a verification. Only ever called from an explicit, confirmed user
   // action on the verify screen: a scan result must never reach this, or anyone
   // able to put a QR code in front of a camera could strip a real verification.
@@ -936,6 +1031,7 @@ export function useNightjar() {
     lockMethods,
     bioAvailable,
     restorePending,
+    removedPeer,
     actions: {
       enrollLock,
       makeBiometricMethod,
@@ -955,6 +1051,8 @@ export function useNightjar() {
       syncInviteContacts,
       markVerified,
       unverify,
+      clearMessages,
+      deleteConversation,
       ensureContact,
       dismissNotice,
       dismissSecurityNotice,

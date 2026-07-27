@@ -284,9 +284,17 @@ async function handleNormal(env: Envelope, from: string, deps: InboundDeps): Pro
   const { store, now } = deps
   const book = await store.loadBook(from)
   if (!book || book.sessions.length === 0) {
-    // No session yet: a normal message ahead of its initial, or on a session we
-    // no longer hold. Throw so it is retried (until the poison bound drops it).
-    throw new Error(`inbound: no session for ${from} (normal message before initial?)`)
+    // No session yet: a normal message ahead of its initial, or on a session this
+    // device no longer holds (a restore, or an eviction of the sessions database).
+    // Deleting a conversation is NOT a cause: it deliberately keeps the session
+    // (DESIGN 8.9), precisely so this branch is not what a deleted peer hits.
+    // Throw so it is retried until the poison bound drops it.
+    //
+    // The peer id is deliberately NOT in this message. It reaches the user as a
+    // notice, and the relay redelivers on every connect for up to the envelope TTL,
+    // so interpolating it would have the app printing that identifier repeatedly,
+    // for weeks, on a conversation the user may have no record of.
+    throw new Error('inbound: no session for this sender (normal message before initial?)')
   }
 
   // Try each session, current first. The one whose AEAD authenticates wins; a

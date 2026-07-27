@@ -11,6 +11,48 @@ release tags cut by the deploy pipeline. Dates are the tag dates.
 
 ## [Unreleased]
 
+## [1.7.0] - 2026-07-26
+
+### Added
+- **Delete a conversation.** Two options on any chat. "Clear messages" removes the
+  saved messages and keeps everything else. "Delete from this device" also removes
+  the contact, any verification, the name you gave them, and anything still queued
+  to send.
+- **A deleted contact can still reach you, on purpose.** Deleting keeps the
+  encryption session, and that is a deliberate choice rather than something we
+  forgot. If it were removed, their app would carry on sending on the session it
+  still holds, those messages would arrive here unreadable and be discarded, and
+  their app would still show them as delivered. That lies to both people at once:
+  someone who deleted a chat to tidy up would stop receiving that person for good
+  with nothing on screen to say so, while the sender watched every message turn to a
+  delivered tick. Deleting is a filing decision and must not quietly become a
+  one-way mute. It is also not a block, and Nightjar does not have one; that gap is
+  real and we would rather name it than have a delete pretend to fill it. So their
+  messages still arrive and reopen the chat, with no name and no verification. The
+  honest cost, which the confirmation states: the kept session still names them on
+  this device.
+- The confirmation says the rest before you act too: it is local, it does not touch
+  their copy, they are not told, and it discards any in-person verification.
+- **A deleted contact stays deleted, until they actually reach you.** The mutual
+  invite re-learns anyone who redeemed one of your invites on every connection, so
+  without this a deleted contact reappeared within about a minute, for up to a
+  month. Deleted peers now go in a short-lived local list that only the automatic
+  paths consult. A message that genuinely arrives from that person, or adding them
+  back yourself, records them again as a plain unverified contact and clears the
+  list entry. That last part matters more than it sounds: without a stored key there
+  is no safety number, so a conversation you were actively having would have had the
+  most important check in the app quietly unavailable.
+
+### Fixed
+- **The list of deleted contacts could erase itself.** Its housekeeping pass treated
+  "could not read the list" the same as "the list is empty" and deleted it, which
+  would have let every deleted contact reappear through the mutual invite. Only a
+  successful read can now clear it.
+- **A re-established conversation no longer gives up a one-time prekey it did not
+  need to.** The safeguard that avoids reusing a prekey the other side has already
+  consumed now applies only where that is actually true, rather than to anyone
+  deleted in the past month.
+
 ## [1.6.1] - 2026-07-25
 
 ### Fixed

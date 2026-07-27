@@ -21,6 +21,7 @@ import {
   MAX_DELIVERED_CHECK_IDS,
   OPK_BATCH,
   OPK_REPLENISH_THRESHOLD,
+  OPK_VEND_TTL_MS,
   OUTBOX_RETRY_HORIZON_MS,
   SEEN_ID_TTL_MS,
   SPK_ROTATION_MS,
@@ -148,6 +149,10 @@ export class NightjarClient {
    *  every reconnect (a waking phone re-enters it on visibility and network
    *  events). Throttled for the same reason the redemption sync is. */
   private lastDeliveredCheckAt = 0
+  /** Peers whose contact record is being re-fetched right now (see recoverContact),
+   *  so a burst of messages from a peer we hold no record for causes ONE directory
+   *  fetch rather than one per message. */
+  private readonly recoveringContacts = new Set<string>()
 
   constructor(
     private readonly identity: Identity,
@@ -240,6 +245,8 @@ export class NightjarClient {
     if (this.authed?.registered) {
       void this.maybeRotateSpk().catch(() => {})
     }
+    // Age out expired deleted-peer markers on disk, not just on read (8.9).
+    void this.contacts.pruneDismissals().catch(() => {})
     // Age out client-side dedup/failure rows (P8). Best-effort maintenance;
     // the replay guard is intentionally never pruned (DESIGN 4.3).
     void this.store.pruneExpired(Date.now()).catch(() => {})
@@ -263,7 +270,11 @@ export class NightjarClient {
     let changed = false
     for (const r of pending.records) {
       try {
-        await this.contacts.recordFirstContact(r.peerId, b64decode(r.ikSig, 32), Date.now())
+        // A refusal here means the user deleted this peer, so dropping the parked
+        // record is the intended outcome, not a lost write: if they ever get a
+        // message through again, the inbound path records them fresh (an `initial`
+        // via handleInitial, a `normal` on a kept session via recoverContact).
+        await this.contacts.recordFirstContact(r.peerId, b64decode(r.ikSig, 32), Date.now(), 'unverified', true)
         changed = true
         await this.contacts.mutatePendingTrust((p) => {
           p.records = p.records.filter((x) => x.peerId !== r.peerId)
@@ -280,7 +291,10 @@ export class NightjarClient {
     }
     if (pending.inviterPin) {
       try {
-        await this.addInviteContact(pending.inviterPin)
+        // The RETRY of a parked pin is relay-driven, unlike the join that parked it:
+        // without this it would re-add a deleted inviter at 'invite' trust and clear
+        // the marker, which is the exact resurrection the choke point exists to stop.
+        await this.addInviteContact(pending.inviterPin, true)
         changed = true
         await this.contacts.mutatePendingTrust((p) => {
           delete p.inviterPin
@@ -326,10 +340,15 @@ export class NightjarClient {
       const known = new Set((await this.contacts.list()).map((c) => c.peerId))
       for (const joiner of new Set(joiners)) {
         if (joiner === this.userId || known.has(joiner) || !USER_ID_RE.test(joiner)) continue
+        // Cheap pre-check purely to avoid work: the authoritative refusal is inside
+        // recordFirstContact (a check here alone would be a TOCTOU across the fetch
+        // below). Without it we would fetch a deleted peer's bundle on every connect
+        // for 30 days, vending and wasting one of THEIR one-time prekeys each time.
+        if ((await this.contacts.dismissedAt(joiner)) !== null) continue
         try {
-          await this.addContact(joiner)
+          const recorded = await this.addContact(joiner, true) // refused for a deleted peer
           known.add(joiner)
-          added++
+          if (recorded) added++
         } catch (e) {
           if (e instanceof KeyConflictError) {
             this.cb.onSecurity?.(
@@ -505,11 +524,11 @@ export class NightjarClient {
   /** Pin the inviter as an invite-trusted contact (DESIGN 6.3). Fetches the
    *  inviter's bundle, checks the key<->userId binding, and records them at
    *  'invite' trust (inviter -> joiner authentication). */
-  async addInviteContact(inviterUserId: string): Promise<void> {
+  async addInviteContact(inviterUserId: string, relayDriven = false): Promise<void> {
     const { bundle } = await this.directory.fetchBundle(inviterUserId)
     if (!bundle) throw new Error(`inviter ${inviterUserId} is not registered`)
     if (deriveUserId(bundle.ikSigPub) !== inviterUserId) throw new Error('inviter key does not match its id')
-    await this.contacts.recordFirstContact(inviterUserId, bundle.ikSigPub, Date.now(), 'invite')
+    await this.contacts.recordFirstContact(inviterUserId, bundle.ikSigPub, Date.now(), 'invite', relayDriven)
   }
 
   /** Add a contact by userId (TOFU): fetch their bundle, enforce the key<->userId
@@ -518,11 +537,15 @@ export class NightjarClient {
    *  "verify does nothing after I add someone by their code/QR"). Idempotent and
    *  never downgrades an existing invite/verified contact (recordFirstContact only
    *  upgrades trust). Throws if the peer is not registered. */
-  async addContact(peerId: string): Promise<void> {
+  async addContact(peerId: string, relayDriven = false): Promise<boolean> {
     const { bundle } = await this.directory.fetchBundle(peerId)
     if (!bundle) throw new Error(`${peerId} is not registered`)
     if (deriveUserId(bundle.ikSigPub) !== peerId) throw new Error(`directory served a key that does not match ${peerId}`)
-    await this.contacts.recordFirstContact(peerId, bundle.ikSigPub, Date.now())
+    // `relayDriven` marks the mutual-invite sync, which the contact store refuses
+    // for a peer the user deleted. A user-initiated add lifts that block instead.
+    // Returns whether a record now exists, so the caller does not report adding
+    // someone it was refused.
+    return this.contacts.recordFirstContact(peerId, bundle.ikSigPub, Date.now(), 'unverified', relayDriven)
   }
 
   /** The trust level held for a peer (DESIGN 6), or null if unknown. */
@@ -648,8 +671,32 @@ export class NightjarClient {
         await this.contacts.recordFirstContact(to, bundle.ikSigPub, now)
       }
 
-      const ini = x3dhInitiate(this.identity, bundle, now)
-      const state0 = initRatchetInitiator(ini.sk, ini.ad, bundle.spk.pub)
+      // Re-establishing with someone whose session we USED to hold, and deleted
+      // recently, must NOT use the directory's one-time prekey. The vend is
+      // idempotent per (fetcher, target) for OPK_VEND_TTL_MS, so a re-fetch inside
+      // that window hands back the SAME OPK, whose private half the peer consumed
+      // when the first session was set up. They would fail to respond, our initial
+      // would be poison-dropped after its retries, and the conversation would be
+      // silently dead while our own UI showed it delivered. The no-OPK path is the
+      // documented degraded mode (DESIGN 4.3) and always opens, because the peer
+      // keeps its signed-prekey private half through the retire grace period.
+      //
+      // `hadSession` is load-bearing, not belt-and-braces. Deleting a conversation
+      // KEEPS the session (8.9), so reaching this branch at all means the session
+      // was lost some other way. A peer deleted before any session existed consumed
+      // NOTHING, and stripping their prekey would downgrade a perfectly healthy
+      // handshake to the degraded path for no reason.
+      let usable = bundle
+      try {
+        const dismissal = await this.contacts.getDismissal(to)
+        if (dismissal?.hadSession && now - dismissal.at < OPK_VEND_TTL_MS && bundle.opk) {
+          usable = { ...bundle, opk: null }
+        }
+      } catch {
+        /* best-effort: on doubt, use the bundle as served */
+      }
+      const ini = x3dhInitiate(this.identity, usable, now)
+      const state0 = initRatchetInitiator(ini.sk, ini.ad, usable.spk.pub)
       const { state, header, ciphertext } = ratchetEncrypt(state0, plaintext)
       const env: WireEnvelope = {
         id: contentIdHex,
@@ -755,6 +802,119 @@ export class NightjarClient {
         /* best-effort */
       }
     }
+  }
+
+  /**
+   * Remove the saved messages for one peer, keeping the contact, its verification
+   * and the live session. "Clear this chat", not "delete this person".
+   *
+   * Returns how many rows could not be opened (and so could not be identified or
+   * removed). Reported rather than swallowed: an unopenable row is one the caller
+   * must not claim to have deleted.
+   */
+  async clearMessages(peer: string): Promise<{ removed: number; unreadable: number }> {
+    return this.lock.withLock(sessionLock(peer), () => this.sweepHistory(peer))
+  }
+
+  /**
+   * Delete what this device holds for one peer: saved messages, the contact record
+   * and its verification, the nickname, and any queued sends.
+   *
+   * It deliberately KEEPS the ratchet session, so the peer can still reach you.
+   * Destroying it black-holes them: their app keeps sending on the session it still
+   * holds, those messages arrive on a device with no session, fail to decrypt, and
+   * are acked-and-dropped, which the relay reports back to them as DELIVERED. Both
+   * sides are then lied to. Someone who deleted a chat to tidy up silently stops
+   * receiving that person for good, with nothing on screen to say so, while the
+   * sender watches every message turn to a delivered tick. A delete is a filing
+   * decision, and it must not quietly become a one-way mute nobody can see.
+   *
+   * It is not a substitute for blocking either, and must never read as one: this
+   * removes what is YOURS and leaves the channel they can reach you on. Nightjar
+   * has no block yet, and that is the honest gap, not something a delete can fake.
+   *
+   * The at-rest cost is small and is disclosed rather than hidden: the session names
+   * this peer on the device. That store already names EVERY contact in cleartext, so
+   * removing one row moved nothing from unreadable to readable. Keying it opaquely
+   * (as history already is) is the real fix and is its own piece of work.
+   *
+   * Ordering is chosen for crash recoverability, since inbound cannot interleave
+   * anyway (the whole thing runs under the per-peer lock that processInbound and
+   * sendText also take). Messages go FIRST and the contact goes LAST, so a failure
+   * part-way leaves the conversation still visible and the operation repeatable,
+   * rather than an orphaned thread the UI can no longer offer to delete.
+   *
+   * What this cannot do, and what the UI must therefore not claim: it does not
+   * block them (Nightjar has no block, and their next message reopens the chat as a
+   * fresh unverified contact), it does not touch their copy, and it cannot recall
+   * anything already handed to the relay.
+   */
+  async deleteConversation(peer: string): Promise<{ removed: number; unreadable: number; cancelled: number }> {
+    return this.lock.withLock(sessionLock(peer), async () => {
+      // 1. Saved messages. The only enumerator is a full scan plus a decrypt per
+      //    row, because history keys are opaque by design.
+      const swept = await this.sweepHistory(peer)
+      // 2. Queued sends to this peer, so nothing further goes out to them. An
+      //    envelope already handed to the socket is gone; we cannot recall it, and
+      //    the caller's wording must not pretend otherwise. Counted because
+      //    "what was still queued is gone" is something to be told, not inferred.
+      let cancelled = 0
+      for (const e of await this.store.pendingOutbox()) {
+        if (e.to === peer) {
+          await this.store.removeOutbox(e.id).catch(() => {})
+          cancelled++
+        }
+      }
+      // 3. Mark the peer deleted BEFORE the contact write, so an interruption still
+      //    leaves the marker that keeps the relay-driven paths from re-adding them.
+      //    Idempotent, and `remove` below preserves what this records.
+      //
+      //    `hadSession` is captured HERE, while the book is still readable, because
+      //    it is the only honest basis for the stale-prekey judgement on a later
+      //    re-establishment: a peer deleted before any session existed never
+      //    consumed a one-time prekey (see the send path).
+      const hadSession = ((await this.store.loadBook(peer))?.sessions.length ?? 0) > 0
+      await this.contacts.markDismissed(peer, Date.now(), hadSession)
+      // 4. The ratchet session book is INTENTIONALLY LEFT ALONE (see the doc above):
+      //    it is what lets this peer keep reaching you, and its removal is what would
+      //    silently destroy their messages while telling them they had arrived.
+      // 5. Contact, nickname, parked trust work.
+      await this.contacts.remove(peer, Date.now())
+      return { ...swept, cancelled }
+    })
+  }
+
+  /** Remove every history row belonging to `peer`. Caller holds the per-peer lock,
+   *  which is what makes the scan's snapshot authoritative: without it, a message
+   *  committing mid-scan would survive and re-hydrate the "deleted" conversation. */
+  private async sweepHistory(peer: string): Promise<{ removed: number; unreadable: number }> {
+    if (!this.history) return { removed: 0, unreadable: 0 }
+    const rows = await this.store.historyLoadAll()
+    let removed = 0
+    let unreadable = 0
+    for (const row of rows) {
+      let msg
+      try {
+        msg = this.history.open(row)
+      } catch (e) {
+        // A row that cannot be opened is normally corruption, and is counted so the
+        // caller never claims to have deleted it. But the SAME throw happens when
+        // the idle app-lock fires mid-sweep and discards the key: every remaining
+        // row would then "fail to open", the sweep would report a tidy count, and
+        // the caller would go on to destroy the session and the outbox having
+        // deleted almost nothing. Fail the whole operation instead, so the user is
+        // told and can retry with the conversation still intact.
+        if (!this.history.isUnlocked) {
+          throw new Error('the app locked while deleting; nothing further was removed, try again')
+        }
+        unreadable++
+        continue
+      }
+      if (msg.peerId !== peer) continue
+      await this.store.historyRemove(row.key)
+      removed++
+    }
+    return { removed, unreadable }
   }
 
   /** All persisted conversations, decrypted and grouped by peer, each sorted
@@ -956,12 +1116,68 @@ export class NightjarClient {
         void this.maybeReplenishOpks().catch(() => {})
       }
     } else if (res.kind === 'dropped') {
-      this.cb.onError?.(`dropped an undecryptable message from ${from.slice(0, 8)}…: ${res.reason}`)
+      // No peer id: after a delete this fires on every reconnect for as long as the
+      // relay holds their queued messages, and printing the id would undo the very
+      // thing the delete promised (see the same reasoning in inbound.ts).
+      this.cb.onError?.(`dropped a message that could not be read: ${res.reason}`)
     }
     try {
       this.transport.raw({ t: 'ack', id: env.id })
     } catch {
       // Socket gone; the relay redelivers and we re-ack on reconnect.
+    }
+    // After the ack, never before it: recovering a contact is a trust convenience
+    // and must not sit between a decrypted message and its acknowledgement.
+    if (res.kind === 'delivered') void this.recoverContact(from, now)
+  }
+
+  /**
+   * A message arrived from someone we hold no contact record for. Re-record them.
+   *
+   * This is the other half of deleting a conversation (8.9). The delete keeps the
+   * ratchet session on purpose, so the peer's app keeps sending `normal` messages,
+   * and the normal-message path is the one inbound path that never reaches the
+   * first-contact recording an `initial` gets. Without this the conversation comes
+   * back with no stored IK_sig, and therefore no SAFETY NUMBER: the priority-1
+   * control (DESIGN 6, 12), silently unavailable on a conversation the user is
+   * actively having. It is also what makes 8.9's promise true, that a message from
+   * a deleted peer records them again and lifts the deletion marker.
+   *
+   * Re-fetching the bundle is sound rather than a trust hole: a userId IS
+   * SHA-256(IK_sig) (DESIGN 3), and the binding check below rejects anything else,
+   * so a hostile or compelled directory cannot substitute a key for a known id.
+   *
+   * Deliberately NOT relay-driven. The trigger is a message that authenticated
+   * under a ratchet session only this peer can hold, which is the same evidence
+   * `handleInitial` records on, not something the relay can assert.
+   */
+  private async recoverContact(peer: string, seenAt: number): Promise<void> {
+    if (this.recoveringContacts.has(peer)) return // a burst must cause one fetch, not one each
+    try {
+      if (await this.contacts.trustLevel(peer)) return // already known: nothing to do
+    } catch {
+      return // contacts unreadable (locked mid-teardown); the next message retries
+    }
+    this.recoveringContacts.add(peer)
+    try {
+      const { bundle } = await this.directory.fetchBundle(peer)
+      if (!bundle) return // deregistered: retried whenever they next get through
+      if (deriveUserId(bundle.ikSigPub) !== peer) {
+        throw new Error(`directory served a key that does not match ${peer}`)
+      }
+      // A delete pressed WHILE that fetch was in flight has to win, or the recovery
+      // would quietly undo it. Checked inside the contacts lock, next to the write.
+      await this.contacts.recordFirstContact(peer, bundle.ikSigPub, Date.now(), 'unverified', false, seenAt)
+      this.cb.onContactsChanged?.()
+    } catch (e) {
+      if (e instanceof KeyConflictError) {
+        this.cb.onSecurity?.(
+          `a message arrived from ${peer.slice(0, 12)}… whose key conflicts with the one stored for them. Verify safety numbers with this contact.`,
+        )
+      }
+      // Anything else (offline, not registered) is retried on their next message.
+    } finally {
+      this.recoveringContacts.delete(peer)
     }
   }
 

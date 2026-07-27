@@ -23,6 +23,7 @@
 // The safety-number rendering and the verify/invite UI are the React layer (still
 // to come); this module is the durable trust STATE and the binding checks.
 
+import { INVITE_TTL_MS } from '../crypto/constants'
 import { deriveUserId } from '../crypto/identity'
 import { openBlob, sealBlob } from '../crypto/appLock'
 import { b64decode, b64encode } from '../wire/codec'
@@ -60,6 +61,13 @@ const CONTACTS_KEY = 'contacts.v1'
 const CONTACTS_LOCK = 'nightjar-contacts'
 const PENDING_KEY = 'contacts.pending.v1'
 const ALIASES_KEY = 'aliases.v1'
+/** Peers deleted on this device (see ContactStore.remove). Sealed like the others. */
+const DISMISSED_KEY = 'contacts.dismissed.v1'
+/** A dismissal expires with the relay-side invite record that motivates it, so the
+ *  list cannot become a permanent record of everyone you ever deleted. */
+const DISMISSAL_TTL_MS = INVITE_TTL_MS
+/** Bound, newest kept: this list is convenience, never a security control. */
+const MAX_DISMISSALS = 200
 const MAX_PENDING_RECORDS = 100
 const MAX_ALIAS_LENGTH = 60
 const encoder = new TextEncoder()
@@ -75,6 +83,18 @@ function isLegacyPlaintextJson(raw: Uint8Array): boolean {
   } catch {
     return false
   }
+}
+
+/** A peer the user deleted here. `auto` false means they have since been recorded
+ *  again deliberately, so only the timestamp still matters (the send path uses it
+ *  to avoid a one-time prekey the peer already consumed). `hadSession` records
+ *  whether a ratchet session existed at deletion time, which is what makes that
+ *  prekey judgement correct: a peer deleted before any session existed consumed
+ *  nothing, so their next handshake must NOT be pushed onto the degraded path. */
+interface Dismissal {
+  at: number
+  auto: boolean
+  hadSession: boolean
 }
 
 /** Trust work that failed transiently and must not be lost (P8): an inviter pin
@@ -145,6 +165,77 @@ export class ContactStore {
     })
   }
 
+  /** Peers deleted on this device, so the relay-driven paths do not add them back.
+   *  PROPAGATES a read failure: callers that only consult the list can fall back to
+   *  "no dismissals", but a caller that is about to REWRITE or DELETE the blob must
+   *  be able to tell "genuinely empty" from "could not read it", or a single failed
+   *  open silently destroys every deletion marker on the device. */
+  private async loadDismissals(): Promise<Record<string, Dismissal>> {
+    const bytes = await this.getSealed(DISMISSED_KEY, DISMISSED_KEY)
+    if (!bytes) return {}
+    const m = JSON.parse(decoder.decode(bytes)) as Record<string, Dismissal>
+    if (!m || typeof m !== 'object') return {}
+    // Age out, so this never becomes a permanent shadow list of people you once
+    // deleted. The reason it exists (the relay's invite record) expires too.
+    const cutoff = Date.now() - DISMISSAL_TTL_MS
+    const out: Record<string, Dismissal> = {}
+    for (const [peer, d] of Object.entries(m)) {
+      if (d && typeof d.at === 'number' && d.at > cutoff) {
+        out[peer] = { at: d.at, auto: d.auto !== false, hadSession: d.hadSession === true }
+      }
+    }
+    return out
+  }
+
+  /** The consulting read: fail-OPEN, because a corrupt or wrong-key blob must never
+   *  be able to break contact recording for the whole app. Never use this to decide
+   *  what to write back; see `loadDismissals`. */
+  private async readDismissals(): Promise<Record<string, Dismissal>> {
+    try {
+      return await this.loadDismissals()
+    } catch {
+      return {}
+    }
+  }
+
+  /** Read-modify-write of the contact map AND the dismissal list under ONE hold of
+   *  the contacts lock, so a delete and a concurrent record cannot interleave and
+   *  disagree about whether this peer exists. */
+  private async mutateWithDismissals<T>(
+    fn: (map: Record<string, Contact>, dismissals: Record<string, Dismissal>) => T,
+  ): Promise<T> {
+    return this.lock.withLock(CONTACTS_LOCK, async () => {
+      const map = await this.read()
+      // Fail-open for the GATE decision (an unreadable list must not stop contacts
+      // being recorded), but remember that it failed, so the write-back below can
+      // never mistake "unreadable" for "empty" and delete the whole blob.
+      let readOk = true
+      let dismissals: Record<string, Dismissal> = {}
+      try {
+        dismissals = await this.loadDismissals()
+      } catch {
+        readOk = false
+      }
+      const before = JSON.stringify(dismissals)
+      const result = fn(map, dismissals)
+      await this.write(map)
+      if (JSON.stringify(dismissals) !== before) {
+        const trimmed = Object.entries(dismissals)
+          .sort((a, b) => b[1].at - a[1].at)
+          .slice(0, MAX_DISMISSALS)
+        // Writing new markers over an unreadable blob loses nothing (it was already
+        // unusable), but DELETING on the strength of a failed read would throw away
+        // markers we simply could not see.
+        if (trimmed.length === 0) {
+          if (readOk) await this.store.delete(DISMISSED_KEY)
+        } else {
+          await this.putSealed(DISMISSED_KEY, DISMISSED_KEY, encoder.encode(JSON.stringify(Object.fromEntries(trimmed))))
+        }
+      }
+      return result
+    })
+  }
+
   async get(peerId: string): Promise<Contact | null> {
     return (await this.read())[peerId] ?? null
   }
@@ -173,17 +264,124 @@ export class ContactStore {
     ikSig: Uint8Array,
     now: number,
     trust: 'unverified' | 'invite' = 'unverified',
-  ): Promise<void> {
+    /** Set by paths the USER did not ask for: the mutual-invite redemption sync and
+     *  the pending-trust retry, both driven by what the relay reports. Those are
+     *  refused for a peer the user deleted; everything else (an actual message from
+     *  them, or the user adding them back) records normally and clears the block.
+     *  See `remove` for why the check has to be in here and not at the call site. */
+    relayDriven = false,
+    /** Refuse if the peer was deleted AFTER this moment. Used by the inbound
+     *  recovery path, whose bundle fetch takes long enough for a user to press
+     *  delete part-way through: without it, a message that arrived just before the
+     *  delete would re-create the contact just after it. Checked here, under the
+     *  same lock as the write, for the same reason `relayDriven` is. */
+    refuseIfDismissedAfter?: number,
+  ): Promise<boolean> {
     if (deriveUserId(ikSig) !== peerId) throw new Error('contacts: IK_sig does not match peer id')
     const encoded = b64encode(ikSig)
-    await this.mutate((map) => {
+    return this.mutateWithDismissals((map, dismissals) => {
+      if (relayDriven && dismissals[peerId]?.auto) return false // deleted here; do not resurrect
+      const d0 = dismissals[peerId]
+      if (refuseIfDismissedAfter !== undefined && d0 && d0.at > refuseIfDismissedAfter) return false
       const existing = map[peerId]
       if (existing) {
         if (existing.ikSig !== encoded) throw new KeyConflictError(peerId)
         if (trust === 'invite' && existing.trust === 'unverified') existing.trust = 'invite'
-        return
+        return true
       }
+      // Recording again on purpose (they messaged, or the user re-added them) lifts
+      // the auto-block, but keeps the deletion TIMESTAMP: the send path needs it to
+      // avoid re-using a one-time prekey the peer already consumed (see client.ts).
+      const d = dismissals[peerId]
+      if (d) d.auto = false
       map[peerId] = { peerId, ikSig: encoded, trust, firstSeen: now, verifiedAt: null }
+      return true
+    })
+  }
+
+  /**
+   * Forget a peer: their contact record, their nickname, and any parked pending
+   * trust, plus a marker that stops the RELAY-driven paths re-adding them.
+   *
+   * The marker is what makes a delete stick. Without it, the mutual invite
+   * (DESIGN 6.3) re-learns anyone who redeemed one of your invites on the very
+   * next connect, for as long as the relay retains the invite record, so the
+   * deleted contact would silently return within about a minute.
+   *
+   * It is enforced inside `recordFirstContact`, which is the single choke point
+   * every path funnels through, rather than at the call sites. A call-site check
+   * would be a time-of-check gap: `addContact` performs a NETWORK bundle fetch
+   * between reading the contact list and writing the record, so a delete landing
+   * during that fetch would be overwritten by a decision made before it happened.
+   *
+   * This is NOT a block. Nightjar has none: the relay accepts a message for any
+   * registered user, and a message that actually arrives from this peer records
+   * them again as a new, unverified contact. The marker only stops the app adding
+   * them back on its own initiative.
+   */
+  async remove(peerId: string, now: number): Promise<void> {
+    // Three separate blobs, so three separate holds of the contacts lock rather
+    // than one nested hold (the lock is a plain mutex, not re-entrant). The caller
+    // holds the per-peer session lock across the whole delete, which is what makes
+    // the sequence atomic against sending and receiving.
+    await this.mutateWithDismissals((map, dismissals) => {
+      delete map[peerId]
+      // `markDismissed` normally ran first and already recorded whether a session
+      // existed; preserve that rather than flattening it to a conservative false.
+      dismissals[peerId] = { at: now, auto: true, hadSession: dismissals[peerId]?.hadSession === true }
+    })
+    await this.setAlias(peerId, '')
+    await this.mutatePendingTrust((p) => {
+      if (p.inviterPin === peerId) delete p.inviterPin
+      p.records = p.records.filter((r) => r.peerId !== peerId)
+    })
+  }
+
+  /** Record the deletion marker without touching the contact map, so an interruption
+   *  part-way through a delete still leaves the marker behind. `hadSession` says
+   *  whether a ratchet session existed at this moment, which is the only honest
+   *  basis for the send path's stale-prekey judgement (see `getDismissal`). */
+  async markDismissed(peerId: string, now: number, hadSession = false): Promise<void> {
+    await this.mutateWithDismissals((_map, dismissals) => {
+      dismissals[peerId] = { at: now, auto: true, hadSession }
+    })
+  }
+
+  /** When this peer was deleted here, or null. */
+  async dismissedAt(peerId: string): Promise<number | null> {
+    return (await this.readDismissals())[peerId]?.at ?? null
+  }
+
+  /** The deletion record, or null. The send path uses it to decide whether a
+   *  re-established session must skip the directory's one-time prekey: that is only
+   *  true when a session existed when they were deleted, because only then did the
+   *  peer already consume the prekey the directory would serve again. */
+  async getDismissal(peerId: string): Promise<{ at: number; hadSession: boolean } | null> {
+    const d = (await this.readDismissals())[peerId]
+    return d ? { at: d.at, hadSession: d.hadSession } : null
+  }
+
+  /** Rewrite the dismissal blob without its expired entries. Filtering happens on
+   *  every read, so this changes no behaviour; it is what makes the 30-day bound
+   *  true ON DISK rather than only in memory, which is what DESIGN 8.9 claims.
+   *  Called on connect alongside the other retention sweeps.
+   *
+   *  Uses the PROPAGATING read on purpose. This method deletes the blob when nothing
+   *  is left, so running it on a fail-open empty result would turn any single failed
+   *  open (a lock engaging mid-sweep, say) into the permanent loss of every deletion
+   *  marker, and the mutual invite would then re-learn every deleted contact. */
+  async pruneDismissals(): Promise<void> {
+    await this.lock.withLock(CONTACTS_LOCK, async () => {
+      const raw = await this.store.get(DISMISSED_KEY)
+      if (raw == null) return
+      let kept: Record<string, Dismissal>
+      try {
+        kept = await this.loadDismissals() // already TTL-filtered
+      } catch {
+        return // could not read it: leave it exactly as it is
+      }
+      if (Object.keys(kept).length === 0) await this.store.delete(DISMISSED_KEY)
+      else await this.putSealed(DISMISSED_KEY, DISMISSED_KEY, encoder.encode(JSON.stringify(kept)))
     })
   }
 
@@ -257,6 +455,7 @@ export class ContactStore {
       await this.store.delete(CONTACTS_KEY)
       await this.store.delete(PENDING_KEY)
       await this.store.delete(ALIASES_KEY)
+      await this.store.delete(DISMISSED_KEY)
     })
   }
 
@@ -275,6 +474,9 @@ export class ContactStore {
       // Clear any pending-trust work parked by the PRIOR identity on this device
       // so a restored identity starts from a clean ledger (fresh-device premise).
       await this.store.delete(PENDING_KEY)
+      // Likewise the deleted-peer list: it belongs to the identity that made it,
+      // and inheriting it would silently gate contacts for a different identity.
+      await this.store.delete(DISMISSED_KEY)
     })
   }
 

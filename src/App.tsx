@@ -35,6 +35,7 @@ export function App() {
     lockMethods,
     bioAvailable,
     restorePending,
+    removedPeer,
     actions,
   } = useNightjar()
   const canary = useCanary()
@@ -143,6 +144,7 @@ export function App() {
               <Messenger
                 identity={identity}
                 connected={connected}
+                removedPeer={removedPeer}
                 contacts={contacts}
                 aliases={aliases}
                 conversations={conversations}

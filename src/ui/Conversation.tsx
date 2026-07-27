@@ -114,6 +114,10 @@ interface Props {
   /** Delete-for-everyone a message you sent (P10d). `failed` is true for a
    *  never-delivered message (removed locally only). */
   onDelete: (id: string, failed?: boolean) => void
+  /** Remove the saved messages, keeping the contact and its verification. */
+  onClearMessages: () => void
+  /** Remove everything this device holds for this peer. */
+  onDeleteConversation: () => void
   /** Relay connection state. Shown here only when it is BAD: on a phone the global
    *  topbar steps aside for the chat, and "we are not connected" is the state worth
    *  interrupting for. A permanent green dot would just be decoration. */
@@ -122,7 +126,20 @@ interface Props {
   onBack?: () => void
 }
 
-export function Conversation({ peer, name, messages, trust, connected, onSend, onVerify, onRename, onDelete, onBack }: Props) {
+export function Conversation({
+  peer,
+  name,
+  messages,
+  trust,
+  connected,
+  onSend,
+  onVerify,
+  onRename,
+  onDelete,
+  onClearMessages,
+  onDeleteConversation,
+  onBack,
+}: Props) {
   const [draft, setDraft] = useState('')
   const [renaming, setRenaming] = useState(false)
   const [nameDraft, setNameDraft] = useState(name)
@@ -136,6 +153,9 @@ export function Conversation({ peer, name, messages, trust, connected, onSend, o
   const [sessionOnly, setSessionOnly] = useState(false)
   // Whether the header shows the peer's full user id or a truncated one.
   const [idOpen, setIdOpen] = useState(false)
+  // The chat menu, and which destructive action is awaiting confirmation.
+  const [chatMenu, setChatMenu] = useState(false)
+  const [confirmWipe, setConfirmWipe] = useState<'clear' | 'delete' | null>(null)
   const timeFmt = useTimeFormat()
   const endRef = useRef<HTMLDivElement>(null)
   const msgsRef = useRef<HTMLDivElement>(null)
@@ -188,6 +208,18 @@ export function Conversation({ peer, name, messages, trust, connected, onSend, o
     if (wasNearBottom) scrollToBottom()
   }, [draft])
 
+  useEffect(() => {
+    if (!chatMenu) return
+    const close = () => setChatMenu(false)
+    const onKey = (e: KeyboardEvent) => e.key === 'Escape' && setChatMenu(false)
+    document.addEventListener('click', close)
+    document.addEventListener('keydown', onKey)
+    return () => {
+      document.removeEventListener('click', close)
+      document.removeEventListener('keydown', onKey)
+    }
+  }, [chatMenu])
+
   // Close the delete menu on any outside click / Escape.
   useEffect(() => {
     if (!menuFor) return
@@ -218,6 +250,8 @@ export function Conversation({ peer, name, messages, trust, connected, onSend, o
   const now = Date.now()
 
   const shortId = `${peer.slice(0, 8)}…${peer.slice(-6)}`
+  /** How to refer to this person in prose. */
+  const who = name.trim() || shortId
 
   return (
     <div className="convo">
@@ -288,8 +322,93 @@ export function Conversation({ peer, name, messages, trust, connected, onSend, o
           <button className="ghost small" onClick={onVerify}>
             {trust === 'verified' ? 'verified ✓' : 'verify'}
           </button>
+          <div className="chat-menu-wrap">
+            <button
+              className="icon-btn"
+              title="chat options"
+              aria-label="chat options"
+              onClick={(e) => {
+                e.stopPropagation()
+                setChatMenu((v) => !v)
+              }}
+            >
+              ⋯
+            </button>
+            {chatMenu && (
+              <div className="chat-menu" onClick={(e) => e.stopPropagation()}>
+                <button
+                  className="ghost small block"
+                  onClick={() => {
+                    setChatMenu(false)
+                    setConfirmWipe('clear')
+                  }}
+                >
+                  Clear messages
+                </button>
+                <button
+                  className="danger small block"
+                  onClick={() => {
+                    setChatMenu(false)
+                    setConfirmWipe('delete')
+                  }}
+                >
+                  Delete from this device
+                </button>
+              </div>
+            )}
+          </div>
         </div>
       </header>
+
+      {/* Destructive actions carry their limits IN the confirmation, not in a help
+          page. The one people get wrong is blocking: Nightjar has none, so a delete
+          that stayed silent about it would be read as one. */}
+      {confirmWipe && (
+        <div className={`wipe-confirm ${confirmWipe === 'delete' ? 'wipe-delete' : ''}`} role="alertdialog">
+          {confirmWipe === 'clear' ? (
+            <>
+              <p className="small">
+                <strong>Clear the saved messages in this chat?</strong> They are removed from this device only.{' '}
+                {who} is not told, keeps their copy, and this does not affect anything already on its way to them.
+              </p>
+              <p className="tiny muted">Your contact and any verification stay exactly as they are.</p>
+            </>
+          ) : (
+            <>
+              <p className="small">
+                <strong>Delete this conversation from this device?</strong> This removes the saved messages, anything
+                still waiting to send to them, the contact, and the name you gave them.
+              </p>
+              <p className="tiny">
+                <strong>This does not block them.</strong> Nightjar has no block yet. {who} can still message you, and
+                if they do the conversation comes back as a new contact with no name and no verification. Your device
+                keeps the encryption session for exactly that reason, so this does not erase every trace of them from
+                it.
+                {trust === 'verified' && ' You verified this contact in person, and that is discarded.'}
+              </p>
+              <p className="tiny muted">
+                {who} is not told. They keep their copy, and anything already handed to the relay still reaches them.
+              </p>
+            </>
+          )}
+          <div className="row">
+            <button
+              className="danger"
+              onClick={() => {
+                const mode = confirmWipe
+                setConfirmWipe(null)
+                if (mode === 'clear') onClearMessages()
+                else onDeleteConversation()
+              }}
+            >
+              {confirmWipe === 'clear' ? 'clear messages' : 'delete from this device'}
+            </button>
+            <button className="ghost" onClick={() => setConfirmWipe(null)}>
+              cancel
+            </button>
+          </div>
+        </div>
+      )}
 
       <div className="msgs" ref={msgsRef}>
         {messages.length === 0 && <p className="muted small">No messages yet. Say hello.</p>}

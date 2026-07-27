@@ -924,6 +924,47 @@ textarea.mono {
   font-weight: 600;
 }
 
+/* Chat options menu (clear / delete), anchored under its button in the header. */
+.chat-menu-wrap {
+  position: relative;
+  flex-shrink: 0;
+}
+.chat-menu {
+  position: absolute;
+  top: 100%;
+  right: 0;
+  z-index: 20;
+  margin-top: 0.35rem;
+  min-width: 13rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+  padding: 0.5rem;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 0.5rem;
+  box-shadow: 0 8px 24px rgb(0 0 0 / 45%);
+}
+.chat-menu button {
+  text-align: left;
+}
+/* The destructive confirmation. It sits above the message log rather than in a
+   modal so the conversation it is about stays visible behind the decision. */
+.wipe-confirm {
+  flex-shrink: 0;
+  padding: 0.7rem var(--gutter);
+  border-bottom: 1px solid var(--border);
+  background: color-mix(in srgb, var(--warn) 10%, var(--panel));
+  border-top: 2px solid var(--warn);
+}
+.wipe-confirm.wipe-delete {
+  background: color-mix(in srgb, var(--error) 10%, var(--panel));
+  border-top-color: var(--error);
+}
+.wipe-confirm p {
+  margin: 0 0 0.4rem;
+}
+
 /* Scan-to-compare on the verify screen. Three visual weights, matching how much
    the outcome is allowed to mean: ok (the codes agree, and the human still has
    the last word), warn (refused, nothing is wrong with the contact), bad (the
