@@ -65,11 +65,11 @@ function suite(name: string, make: () => SessionStore) {
       const entry: OutboxEntry = { id: 'o1', to: 'carol', env: { any: 'thing' }, createdAt: 123 }
       await store.saveBookWithOutbox('carol', book('cc'), entry)
       expect((await store.load('carol'))?.rk).toBe('cc')
-      const pending = await store.pendingOutbox()
+      const pending = (await store.pendingOutbox()).entries
       expect(pending).toHaveLength(1)
       expect(pending[0].id).toBe('o1')
       await store.removeOutbox('o1')
-      expect(await store.pendingOutbox()).toHaveLength(0)
+      expect((await store.pendingOutbox()).entries).toHaveLength(0)
     })
 
     it('keeps seen, replay, and outbox independent of each other', async () => {
@@ -112,10 +112,10 @@ function suite(name: string, make: () => SessionStore) {
       const store = make()
       await store.saveBook('a', book('aa'))
       await store.saveBook('b', book('bb'))
-      expect((await store.list()).sort()).toEqual(['a', 'b'])
+      expect((await store.listKeys()).sort()).toEqual(['a', 'b'])
       await store.delete('a')
       expect(await store.loadBook('a')).toBeNull()
-      expect(await store.list()).toEqual(['b'])
+      expect(await store.listKeys()).toEqual(['b'])
     })
   })
 }

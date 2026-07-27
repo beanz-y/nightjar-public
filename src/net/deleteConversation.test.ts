@@ -94,7 +94,7 @@ describe('deleteConversation', () => {
     expect(res.cancelled).toBe(1)
     expect(res.unreadable).toBe(0)
     expect(await h.store.historyLoadAll()).toEqual([])
-    expect(await h.store.pendingOutbox()).toEqual([])
+    expect((await h.store.pendingOutbox()).entries).toEqual([])
     expect(await h.contacts.get(h.peer.userId)).toBeNull()
     expect(await h.contacts.trustLevel(h.peer.userId)).toBeNull()
     expect(await h.contacts.getAliases()).toEqual({})

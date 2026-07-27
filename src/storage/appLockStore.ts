@@ -29,7 +29,14 @@ import {
   wrapBiometric,
   wrapKnowledge,
 } from '../crypto/appLock'
-import { INFO_CONTACTS, INFO_HISTORY_BODY, INFO_HISTORY_INDEX } from '../crypto/constants'
+import {
+  INFO_CONTACTS,
+  INFO_HISTORY_BODY,
+  INFO_HISTORY_INDEX,
+  INFO_PREKEYS,
+  INFO_SESSION_BODY,
+  INFO_SESSION_INDEX,
+} from '../crypto/constants'
 import type { KeyStore } from './keystore'
 import type { Lock } from './lock'
 
@@ -157,9 +164,26 @@ export class AppLockStore {
     return bio ? bio.credentialId : null
   }
 
-  /** Clear the LDK from RAM (idle-lock / "lock now"). Reusable, unlike a teardown. */
+  /**
+   * Clear the LDK from RAM (idle-lock / "lock now"). Reusable, unlike a teardown.
+   *
+   * Overwrites the key material before dropping it. This is BEST-EFFORT and is not
+   * relied on anywhere: JavaScript cannot guarantee erasure, since the runtime is
+   * free to have copied these bytes during garbage collection, and @noble allocates
+   * fresh arrays internally that we never see. It narrows the window in which a RAM
+   * capture of a LOCKED device finds the key; it does not close one, and nothing in
+   * DESIGN depends on it. Caching the sub-keys (below) is what makes it worth doing
+   * at all: without the cache there would be one fresh derived copy per message.
+   */
   lockNow(): void {
+    if (this.ldk) this.ldk.fill(0)
     this.ldk = null
+    this.clearSubKeys()
+  }
+
+  private clearSubKeys(): void {
+    for (const k of this.subKeys.values()) k.fill(0)
+    this.subKeys.clear()
   }
 
   private requireLdk(): Uint8Array {
@@ -167,40 +191,83 @@ export class AppLockStore {
     return this.ldk
   }
 
+  /** Derived once per unlock and reused. Sessions re-seal on EVERY message, so
+   *  deriving per call would put one throwaway HKDF output per message on the heap,
+   *  none of which can be wiped. One cached copy per use is one thing to overwrite. */
+  private readonly subKeys = new Map<string, Uint8Array>()
+
+  private cachedSubKey(info: string): Uint8Array {
+    const ldk = this.requireLdk() // throws while locked, BEFORE any cache hit
+    let k = this.subKeys.get(info)
+    if (!k) {
+      k = subKey(ldk, info)
+      this.subKeys.set(info, k)
+    }
+    return k
+  }
+
   /** Sub-keys for the at-rest uses (only while unlocked). */
   historyBodyKey(): Uint8Array {
-    return subKey(this.requireLdk(), INFO_HISTORY_BODY)
+    return this.cachedSubKey(INFO_HISTORY_BODY)
   }
   historyIndexKey(): Uint8Array {
-    return subKey(this.requireLdk(), INFO_HISTORY_INDEX)
+    return this.cachedSubKey(INFO_HISTORY_INDEX)
   }
   contactsKey(): Uint8Array {
-    return subKey(this.requireLdk(), INFO_CONTACTS)
+    return this.cachedSubKey(INFO_CONTACTS)
+  }
+  sessionBodyKey(): Uint8Array {
+    return this.cachedSubKey(INFO_SESSION_BODY)
+  }
+  sessionIndexKey(): Uint8Array {
+    return this.cachedSubKey(INFO_SESSION_INDEX)
+  }
+  prekeysKey(): Uint8Array {
+    return this.cachedSubKey(INFO_PREKEYS)
   }
 
   /** Re-wrap the LDK under a new knowledge secret (change PIN/passphrase). Must be
    *  unlocked. Replaces the existing knowledge wrap, keeping any biometric. */
   async changeKnowledge(kind: 'pass' | 'pin', secret: string): Promise<void> {
-    const ldk = this.requireLdk()
-    await this.lock.withLock(APPLOCK_LOCK, async () => {
-      const rec = await this.loadRecord()
-      if (!rec) throw new Error('app-lock: not configured')
-      const others = rec.methods.filter((m) => m.kind === 'bio')
-      const fresh = await wrapKnowledge(ldk, secret, kind, { kdf: this.kdf })
-      await this.keys.put(HISTORY_LOCK_KEY, encodeLockRecord({ version: 1, methods: [fresh, ...others] }))
-    })
+    // A private COPY, taken before anything can await. This looks like paranoia and
+    // is not: `wrapKnowledge` awaits a multi-second Argon2id INTERNALLY, and since
+    // lockNow() now overwrites the live array, an idle-lock landing in that window
+    // would have this wrap 32 zero bytes and persist them as the new record. The
+    // user would then "unlock" successfully into a key that opens nothing, with no
+    // way back. Working from a copy means the rewrap completes CORRECTLY even if the
+    // app locks mid-operation, which is better than failing it. The copy is wiped
+    // whichever way this ends.
+    const ldk = Uint8Array.from(this.requireLdk())
+    try {
+      await this.lock.withLock(APPLOCK_LOCK, async () => {
+        const rec = await this.loadRecord()
+        if (!rec) throw new Error('app-lock: not configured')
+        const others = rec.methods.filter((m) => m.kind === 'bio')
+        const fresh = await wrapKnowledge(ldk, secret, kind, { kdf: this.kdf })
+        await this.keys.put(HISTORY_LOCK_KEY, encodeLockRecord({ version: 1, methods: [fresh, ...others] }))
+      })
+    } finally {
+      ldk.fill(0)
+    }
   }
 
   /** Add or replace the biometric wrap (must be unlocked). */
   async addBiometric(credentialId: Uint8Array, prfSecret: Uint8Array): Promise<void> {
-    const ldk = this.requireLdk()
-    await this.lock.withLock(APPLOCK_LOCK, async () => {
-      const rec = await this.loadRecord()
-      if (!rec) throw new Error('app-lock: not configured')
-      const others = rec.methods.filter((m) => m.kind !== 'bio')
-      const bio = wrapBiometric(ldk, credentialId, prfSecret)
-      await this.keys.put(HISTORY_LOCK_KEY, encodeLockRecord({ version: 1, methods: [...others, bio] }))
-    })
+    // A private copy, for the reason spelled out in changeKnowledge. The wrap itself
+    // is synchronous here, but the cross-tab lock and the keystore read before it
+    // are not, and that is window enough for an idle-lock to zero the live array.
+    const ldk = Uint8Array.from(this.requireLdk())
+    try {
+      await this.lock.withLock(APPLOCK_LOCK, async () => {
+        const rec = await this.loadRecord()
+        if (!rec) throw new Error('app-lock: not configured')
+        const others = rec.methods.filter((m) => m.kind !== 'bio')
+        const bio = wrapBiometric(ldk, credentialId, prfSecret)
+        await this.keys.put(HISTORY_LOCK_KEY, encodeLockRecord({ version: 1, methods: [...others, bio] }))
+      })
+    } finally {
+      ldk.fill(0)
+    }
   }
 
   /** Remove the biometric wrap (a knowledge factor always remains; the biometric
@@ -223,7 +290,9 @@ export class AppLockStore {
   async reset(): Promise<void> {
     await this.lock.withLock(APPLOCK_LOCK, async () => {
       await this.keys.delete(HISTORY_LOCK_KEY)
+      if (this.ldk) this.ldk.fill(0)
       this.ldk = null
+      this.clearSubKeys()
     })
   }
 }

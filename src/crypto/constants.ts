@@ -222,6 +222,29 @@ export const INFO_LOCK_WRAP = 'Nightjar_LockWrap_v1'
 export const INFO_HISTORY_BODY = 'Nightjar_HistBody_v1'
 export const INFO_HISTORY_INDEX = 'Nightjar_HistIndex_v1'
 export const INFO_CONTACTS = 'Nightjar_Contacts_v1'
+export const INFO_SESSION_BODY = 'Nightjar_SessBody_v1'
+export const INFO_SESSION_INDEX = 'Nightjar_SessIndex_v1'
+export const INFO_PREKEYS = 'Nightjar_Prekeys_v1'
+
+// Ratchet sessions + the send queue at rest (P11). Until this, the sessions store
+// was keyed by the peer's userId in CLEARTEXT with the serialized ratchet state
+// (root key, chain keys, DH privates, skipped message keys) beside it, so a device
+// image without the unlock secret listed every peer AND could decrypt everything
+// those conversations went on to say. Both are now sealed under LDK sub-keys, the
+// same shape history already used (8.5): opaque HMAC storage key, fresh per-record
+// salt, AAD binding the key and a dedicated format version.
+/** KDF info expanding key+nonce for a sealed session row (mirrors INFO_HISTORY). */
+export const INFO_SESSION = 'Nightjar_Session_v1'
+export const SESSION_SALT_BYTES = 16
+/** Session-ROW format version bound into each row's AAD. SEPARATE from the wire
+ *  `VERSION` and from `HISTORY_FORMAT_VERSION` for the same reason those are
+ *  separate from each other: an at-rest artifact must not be invalidated by an
+ *  unrelated bump. Bump only on a deliberate row-format change, with a migration. */
+export const SESSION_FORMAT_VERSION = 0x01
+/** Value of the sessions DB `meta` marker once every session + outbox row has been
+ *  rewritten in the sealed format. Written INSIDE the migration transaction, so the
+ *  marker and the rows can never disagree. */
+export const SESSION_SEAL_VERSION = 1
 /** Argon2id params for a knowledge-factor KEK: same as the backup blob (64 MiB,
  *  t=3, p=1; ~2.3 s desktop). Reused deliberately so there is one tuned cost. */
 export const LOCK_ARGON2_M_KIB = BACKUP_ARGON2_M_KIB

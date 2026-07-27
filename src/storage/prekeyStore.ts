@@ -8,9 +8,11 @@
 // never seed two sessions. Mutations run under a lock to serialise concurrent
 // consumes (two different peers' initials arriving at once).
 
+import { openBlob, sealBlob } from '../crypto/appLock'
 import { SPK_RETIRE_GRACE_MS } from '../crypto/constants'
 import type { KeyPair } from '../crypto/primitives'
 import { type WireSignedPrekey, b64decode, b64encode } from '../wire/codec'
+import type { AppLockStore } from './appLockStore'
 import type { KeyStore } from './keystore'
 import type { Lock } from './lock'
 
@@ -18,6 +20,17 @@ export const PREKEYS_KEY = 'prekeys.v1'
 const PREKEYS_LOCK = 'nightjar-prekeys'
 const encoder = new TextEncoder()
 const decoder = new TextDecoder()
+
+/** A pre-P11 blob was plaintext JSON. A sealed blob (or a corrupt one) is not valid
+ *  JSON, so this distinguishes "needs adopting" from "must not be trusted". */
+function isLegacyPlaintextJson(raw: Uint8Array): boolean {
+  try {
+    const v = JSON.parse(decoder.decode(raw)) as unknown
+    return !!v && typeof v === 'object'
+  } catch {
+    return false
+  }
+}
 
 interface StoredSpk {
   id: number
@@ -64,16 +77,39 @@ export class PrekeyStore {
   constructor(
     private readonly store: KeyStore,
     private readonly lock: Lock,
+    /** When present, the blob is sealed at rest under the app-lock's prekey sub-key
+     *  (P11). These are the SIGNED-prekey and one-time-prekey PRIVATE halves, which
+     *  are exactly what is needed to answer (and so decrypt) a first-contact X3DH
+     *  message waiting at the relay: leaving them in cleartext left a whole class of
+     *  incoming conversation readable from a device image that the sealed session
+     *  store does not cover. Sealing costs no boot re-ordering, because PrekeyStore
+     *  is only ever constructed inside activate(), after unlock. Omitted in tests
+     *  (plaintext), like ContactStore. */
+    private readonly appLock?: AppLockStore,
   ) {}
 
   private async read(): Promise<StoredPrekeys> {
-    const bytes = await this.store.get(PREKEYS_KEY)
-    if (!bytes) return { spks: [], opks: [] }
+    const raw = await this.store.get(PREKEYS_KEY)
+    if (!raw) return { spks: [], opks: [] }
+    if (!this.appLock) return JSON.parse(decoder.decode(raw)) as StoredPrekeys
+    let bytes: Uint8Array
+    try {
+      bytes = openBlob(this.appLock.prekeysKey(), PREKEYS_KEY, raw)
+    } catch (e) {
+      // A device that predates P11 stored this as plaintext JSON. Adopt it and
+      // re-seal, exactly as ContactStore does for its pre-P10c blobs. A genuinely
+      // corrupt or wrong-key sealed blob does not parse as JSON, so it re-throws
+      // rather than being silently treated as data.
+      if (!isLegacyPlaintextJson(raw)) throw e
+      await this.write(JSON.parse(decoder.decode(raw)) as StoredPrekeys)
+      return JSON.parse(decoder.decode(raw)) as StoredPrekeys
+    }
     return JSON.parse(decoder.decode(bytes)) as StoredPrekeys
   }
 
   private async write(data: StoredPrekeys): Promise<void> {
-    await this.store.put(PREKEYS_KEY, encoder.encode(JSON.stringify(data)))
+    const bytes = encoder.encode(JSON.stringify(data))
+    await this.store.put(PREKEYS_KEY, this.appLock ? sealBlob(this.appLock.prekeysKey(), PREKEYS_KEY, bytes) : bytes)
   }
 
   /** Persist the freshly generated prekey material (from registration). Replaces

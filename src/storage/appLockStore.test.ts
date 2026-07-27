@@ -122,3 +122,65 @@ describe('AppLockStore (P10c)', () => {
     expect(await new MemoryKeyStore().get(HISTORY_LOCK_KEY)).toBeNull()
   })
 })
+
+// Key hygiene on lock (P11). Best-effort by nature: JavaScript cannot guarantee
+// erasure, and nothing in the design depends on this. It is worth doing only
+// because the sub-keys are now CACHED: session rows re-seal on every message, so
+// deriving per call would put one un-wipeable copy on the heap per message sent.
+describe('AppLockStore key hygiene', () => {
+  it('overwrites the key material on lock rather than only dropping the reference', async () => {
+    const s = make()
+    await s.enroll([{ kind: 'pass', secret: 'a strong passphrase' }])
+    // Hold references to the live arrays, which is what a RAM capture would find.
+    const body = s.historyBodyKey()
+    const sess = s.sessionBodyKey()
+    const index = s.sessionIndexKey()
+    expect(body.some((b) => b !== 0)).toBe(true)
+
+    s.lockNow()
+
+    for (const k of [body, sess, index]) expect([...k].every((b) => b === 0)).toBe(true)
+  })
+
+  it('hands out the SAME cached sub-key rather than deriving a fresh copy per call', async () => {
+    // One thing to overwrite per sub-key, instead of one per message.
+    const s = make()
+    await s.enroll([{ kind: 'pass', secret: 'a strong passphrase' }])
+    expect(s.sessionIndexKey()).toBe(s.sessionIndexKey())
+  })
+
+  it('re-derives cleanly after an unlock, so caching cannot serve a stale key', async () => {
+    const s = make()
+    await s.enroll([{ kind: 'pass', secret: 'a strong passphrase' }])
+    const before = bytesToHex(s.sessionBodyKey())
+    s.lockNow()
+    await s.unlockWithSecret('a strong passphrase')
+    expect(bytesToHex(s.sessionBodyKey())).toBe(before)
+  })
+
+  it('a lock landing mid-rewrap still wraps the REAL key, never the zeroed one', async () => {
+    // The reason changeKnowledge works from a private copy. Argon2id takes seconds
+    // and is awaited INSIDE wrapKnowledge, so an idle-lock in that window would
+    // otherwise have it wrap 32 zero bytes and persist them: the user would then
+    // "unlock" successfully into a key that opens nothing, with no way back. This is
+    // the assertion that would have caught that, so do not weaken it.
+    const keys = new MemoryKeyStore()
+    let onKdf: (() => void) | null = null
+    const slowKdf: Argon2Kdf = async (secret, salt) => {
+      onKdf?.()
+      return hash256(new Uint8Array([...secret, ...salt]))
+    }
+    const s = new AppLockStore(keys, new InMemoryLock(), slowKdf)
+    await s.enroll([{ kind: 'pass', secret: 'the original passphrase' }])
+    const realKey = bytesToHex(s.sessionBodyKey()) // what everything at rest is sealed under
+
+    onKdf = () => s.lockNow() // the idle lock fires while the KDF is running
+    await s.changeKnowledge('pass', 'the replacement passphrase')
+
+    onKdf = null
+    await s.unlockWithSecret('the replacement passphrase')
+    // The SAME key came back, so nothing sealed before the change became unopenable.
+    expect(bytesToHex(s.sessionBodyKey())).toBe(realKey)
+    expect([...s.historyBodyKey()].every((b) => b === 0)).toBe(false)
+  })
+})

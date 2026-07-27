@@ -49,6 +49,8 @@ export function App() {
   const diagAvailable = import.meta.env.DEV || (globalThis.location?.hash ?? '').includes('diag')
 
   const isReady = phase === 'ready' && !!identity && registered
+  /** Nothing that could name a contact renders while the app is behind its lock. */
+  const locked = phase === 'locked' || phase === 'enroll'
   const showCanaryBanner = !!canary?.alarming && !canaryDismissed && !about
 
   return (
@@ -58,18 +60,28 @@ export function App() {
         <span className={`dot ${connected ? 'dot-on' : 'dot-off'}`} title={connected ? 'connected' : 'offline'} />
       </header>
 
-      {securityNotices.map((d) => (
-        <div className="banner banner-alert" role="alert" key={d}>
-          <span className="small">
-            <strong>security: </strong>
-            {d}
-          </span>
-          <button className="link" onClick={() => actions.dismissSecurityNotice(d)}>
-            dismiss
-          </button>
-        </div>
-      ))}
+      {/* Not on the lock or enroll screens. A security notice names a peer by the
+          first 12 characters of their user id, which is plenty to confirm a guess,
+          and these banners are sticky. Rendering them above a LOCKED app puts that
+          identifier on the screen of a device someone just picked up, without the
+          unlock secret: the exact at-rest exposure the app-lock exists to prevent.
+          They stay in state and reappear after unlock. */}
+      {!locked &&
+        securityNotices.map((d) => (
+          <div className="banner banner-alert" role="alert" key={d}>
+            <span className="small">
+              <strong>security: </strong>
+              {d}
+            </span>
+            <button className="link" onClick={() => actions.dismissSecurityNotice(d)}>
+              dismiss
+            </button>
+          </div>
+        ))}
 
+      {/* `notice` is deliberately NOT gated: it never carries a peer id (the two
+          inbound paths that once did had them removed), and the app-lock reset says
+          what a reset just cost on the enroll screen that follows it. */}
       {notice && (
         <div className="banner" role="status">
           <span className="small">{notice}</span>

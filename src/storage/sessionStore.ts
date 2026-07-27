@@ -25,8 +25,9 @@
 // is still enforced one layer up by the inbound processor / client holding the
 // per-peer lock.
 
-import { ENVELOPE_TTL_MS, TOMBSTONE_TTL_MS } from '../crypto/constants'
+import { ENVELOPE_TTL_MS, SESSION_SEAL_VERSION, TOMBSTONE_TTL_MS } from '../crypto/constants'
 import type { RatchetSnapshot } from '../crypto/ratchet'
+import type { SessionSealer } from './sessionSeal'
 
 /** One ratchet session inside a peer's book. `id` is a stable local handle
  *  (a UUID minted at creation); it never crosses the wire. */
@@ -75,6 +76,37 @@ export interface HistoryRecord {
    *  a reload re-renders it as "not sent". A plain flag (not inside the AEAD, and
    *  not sensitive); absent means not failed. */
   failed?: boolean
+}
+
+/** A session book as it sits on disk (P11): sealed under the LDK, at an opaque
+ *  HMAC storage key. Deliberately carries NO copy of that key, unlike a
+ *  HistoryRecord: the opener always knows which peer it asked for, so the AAD is
+ *  rebuilt from that rather than trusted from the value (see sessionSeal.ts). */
+export interface SealedSessionRecord {
+  salt: Uint8Array
+  ct: Uint8Array
+}
+
+/** A queued outgoing message as it sits on disk (P11). `id` and `createdAt` stay in
+ *  cleartext on purpose: the id is a random transport id that names nobody and
+ *  addresses the row for removal, and the age drives the retry horizon and the
+ *  oldest-first flush, both of which must keep working on a row that will not open.
+ *  Only the peer and the envelope are sealed. Both plaintext fields are bound into
+ *  the AAD, so neither can be edited without breaking the seal. */
+export interface SealedOutboxRecord {
+  id: string
+  createdAt: number
+  salt: Uint8Array
+  ct: Uint8Array
+}
+
+/** What `pendingOutbox` found. `unreadable` counts rows that exist but will not
+ *  open; they are KEPT and reported rather than skipped, because an outbox entry
+ *  committed in the same transaction as its ratchet advance can never be
+ *  re-encrypted, so silently dropping one is a message lost with no trace. */
+export interface PendingOutbox {
+  entries: OutboxEntry[]
+  unreadable: string[]
 }
 
 /** A delete-for-everyone (P10d) applied inside a receive commit: remove the target
@@ -130,7 +162,12 @@ export interface SessionStore {
   /** Replace the peer's current session snapshot (keeps a one-session book). */
   save(peerId: string, snap: RatchetSnapshot): Promise<void>
   delete(peerId: string): Promise<void>
-  list(): Promise<string[]>
+  /** The OPAQUE storage keys of every stored session book. Deliberately not named
+   *  `list()` returning peer ids any more: once rows are sealed (P11) the keys are
+   *  HMAC hex and cannot be mapped back to a peer, and a method typed `string[]`
+   *  that silently changed meaning is exactly the kind of trap the type system
+   *  cannot catch. Used for counting and for the migration; nothing routes on it. */
+  listKeys(): Promise<string[]>
 
   // --- dedup / guards ----------------------------------------------------
   hasSeen(msgId: string): Promise<boolean>
@@ -144,7 +181,13 @@ export interface SessionStore {
 
   // --- outbox ------------------------------------------------------------
   removeOutbox(id: string): Promise<void>
-  pendingOutbox(): Promise<OutboxEntry[]>
+  /** Queued sends, oldest first, PLUS the ids of any rows that exist but will not
+   *  open. Two lists rather than one, so no caller can read "could not read it" as
+   *  "there is nothing there": an outbox row committed in the same transaction as
+   *  its ratchet advance can never be re-encrypted, so a silent skip is a message
+   *  destroyed without a trace, and a throw would take the whole connect path down
+   *  because of one bad row. */
+  pendingOutbox(): Promise<PendingOutbox>
 
   // --- history (P10c) ----------------------------------------------------
   /** Every persisted record across all peers (boot hydration). Opaque; the caller
@@ -296,7 +339,7 @@ export class MemorySessionStore implements SessionStore {
     this.books.delete(peerId)
   }
 
-  async list(): Promise<string[]> {
+  async listKeys(): Promise<string[]> {
     return [...this.books.keys()]
   }
 
@@ -330,8 +373,8 @@ export class MemorySessionStore implements SessionStore {
   // Sorted like the IndexedDB implementation. Map iteration is already insertion
   // order here, so without this an ordering test would pass in memory and fail
   // only in production, where the backing order is by random key.
-  async pendingOutbox(): Promise<OutboxEntry[]> {
-    return [...this.outbox.values()].map(clone).sort((a, b) => a.createdAt - b.createdAt)
+  async pendingOutbox(): Promise<PendingOutbox> {
+    return { entries: [...this.outbox.values()].map(clone).sort((a, b) => a.createdAt - b.createdAt), unreadable: [] }
   }
 
   async historyLoadAll(): Promise<HistoryRecord[]> {
@@ -415,7 +458,19 @@ const FAILURES = 'failures'
 const OUTBOX = 'outbox'
 const HISTORY = 'history'
 const TOMBSTONES = 'tombstones'
-const DB_VERSION = 6
+const META = 'meta'
+const SEAL_MARKER = 'sealVersion'
+// STANDING RULE: any change to the ON-DISK shape of SESSIONS or OUTBOX needs its own
+// version bump, and for one reason only. The bump is not how data gets migrated (see
+// migrateToSealed; onupgradeneeded fires before unlock and cannot await, so it can
+// never seal anything). It is the only mechanism that stops a stale bundle, still
+// running in another PWA window after a deploy, from writing rows in the OLD shape
+// beside the new ones. Two shapes for one peer means two forked ratchet copies that
+// both believe they hold the per-peer lock, which emits the same message key and
+// nonce twice: catastrophic, and far worse than whatever the change was fixing.
+// `onblocked` below rejects the new tab's open, and `onversionchange` makes the old
+// tab step aside, which together make the overlap impossible rather than unlikely.
+const DB_VERSION = 7
 
 // A delete-for-everyone inside a receive transaction: remove the target history
 // row and record its tombstone, both keyed by the same opaque history key. The
@@ -427,6 +482,86 @@ function applyDeleteTx(t: IDBTransaction, del: HistoryDelete): void {
 
 export class IdbSessionStore implements SessionStore {
   private dbPromise: Promise<IDBDatabase> | null = null
+
+  /** Set once the app-lock is unlocked, via `useSealer`. While it is null the store
+   *  reads and writes the pre-P11 plaintext shape, which is what the tests use and
+   *  what a database looks like before its one-time migration has run. */
+  private sealer: SessionSealer | null = null
+
+  /** Wire the LDK-backed sealer in. Called from activate(), after unlock and BEFORE
+   *  the migration and the client, so nothing ever touches a session row through a
+   *  half-configured store. */
+  useSealer(sealer: SessionSealer): void {
+    this.sealer = sealer
+  }
+
+  /**
+   * Rewrite every session and outbox row into the sealed format, ONCE, in ONE
+   * transaction. Call after unlock (the sealer needs the LDK) and before the client
+   * exists, so there is no concurrent writer.
+   *
+   * The single transaction is the whole safety argument, and it is why this does not
+   * use the `tx()` helper: that takes exactly one request and returns a promise, and
+   * ANY await between reading the old rows and writing the new ones ends the
+   * transaction, reopening the window where a kill or a quota abort leaves the store
+   * emptied but not yet rewritten. Every primitive here is synchronous (@noble HMAC,
+   * HKDF, XChaCha), so read, seal, clear and write all fit inside one transaction
+   * with no yield, and "partially migrated" is not a state that can exist. An abort
+   * at any point leaves the store byte-identical with the marker unset, and the next
+   * unlock simply runs the whole thing again.
+   *
+   * Idempotence is the marker, read and written INSIDE the same transaction, so it
+   * can never disagree with the rows it describes.
+   */
+  async migrateToSealed(): Promise<void> {
+    const sealer = this.sealer
+    if (!sealer) throw new Error('sessions: cannot migrate without an unlocked app-lock')
+    const db = await this.open() // the ONLY await; everything below is one transaction
+    await new Promise<void>((resolve, reject) => {
+      const t = db.transaction([SESSIONS, OUTBOX, META], 'readwrite')
+      t.oncomplete = () => resolve()
+      t.onabort = () => reject(t.error ?? new Error('sessions: seal migration aborted'))
+      t.onerror = () => reject(t.error ?? new Error('sessions: seal migration failed'))
+      const sessions = t.objectStore(SESSIONS)
+      const outbox = t.objectStore(OUTBOX)
+      const meta = t.objectStore(META)
+
+      const markerReq = meta.get(SEAL_MARKER)
+      markerReq.onsuccess = () => {
+        if (markerReq.result === SESSION_SEAL_VERSION) return // already sealed: commit a no-op
+        // Requests issued from inside this handler keep the transaction alive.
+        const sKeys = sessions.getAllKeys()
+        const sVals = sessions.getAll()
+        const oVals = outbox.getAll()
+        oVals.onsuccess = () => {
+          try {
+            const peers = (sKeys.result ?? []).map(String)
+            const books = (sVals.result ?? []) as SessionBook[]
+            const sealedSessions: Array<{ slot: string; row: SealedSessionRecord }> = []
+            for (let i = 0; i < peers.length; i++) {
+              const peer = peers[i]
+              const book = books[i]
+              if (!peer || !book) continue
+              sealedSessions.push({ slot: sealer.sessionKey(peer), row: sealer.sealSession(peer, book) })
+            }
+            const sealedOutbox = ((oVals.result ?? []) as OutboxEntry[]).map((e) => sealer.sealOutbox(e))
+            // Only now, with every seal computed and nothing left that can throw,
+            // does anything get destroyed.
+            sessions.clear()
+            outbox.clear()
+            for (const s of sealedSessions) sessions.put(s.row, s.slot)
+            for (const o of sealedOutbox) outbox.put(o, o.id)
+            meta.put(SESSION_SEAL_VERSION, SEAL_MARKER)
+          } catch (e) {
+            // A seal that throws part-way aborts the whole transaction, so the
+            // original plaintext rows survive untouched and this retries next unlock.
+            t.abort()
+            reject(e)
+          }
+        }
+      }
+    })
+  }
 
   private open(): Promise<IDBDatabase> {
     if (!this.dbPromise) {
@@ -447,6 +582,10 @@ export class IdbSessionStore implements SessionStore {
           // recording a delete-for-everyone so a target arriving after its delete is
           // suppressed. New empty store; nothing to migrate.
           if (!db.objectStoreNames.contains(TOMBSTONES)) db.createObjectStore(TOMBSTONES)
+          // v6 -> v7 (P11): a `meta` store holding the seal-migration marker. New
+          // empty store; the actual sealing happens in migrateToSealed after unlock,
+          // because the Local Data Key does not exist yet at this point.
+          if (!db.objectStoreNames.contains(META)) db.createObjectStore(META)
           // v2 -> v3: a v2 `sessions` value was a bare RatchetSnapshot; wrap each
           // as a one-session book so a pre-P5 conversation is not lost. (Prod has
           // none yet: the only durable sessions before P5 were isolated dev
@@ -515,13 +654,30 @@ export class IdbSessionStore implements SessionStore {
     })
   }
 
+  // Sealing (P11). Every session read and write goes through these two, so there is
+  // exactly one place that knows the on-disk shape. With no sealer wired (tests,
+  // pre-unlock) rows stay plaintext at the peerId key, which is the pre-P11 format.
+  private sessionSlot(peerId: string): string {
+    return this.sealer ? this.sealer.sessionKey(peerId) : peerId
+  }
+
+  private sealedBook(peerId: string, book: SessionBook): SealedSessionRecord | SessionBook {
+    return this.sealer ? this.sealer.sealSession(peerId, book) : book
+  }
+
   async loadBook(peerId: string): Promise<SessionBook | null> {
-    const v = await this.tx<unknown>(SESSIONS, 'readonly', (t) => t.objectStore(SESSIONS).get(peerId))
-    return (v ?? null) as SessionBook | null
+    const v = await this.tx<unknown>(SESSIONS, 'readonly', (t) => t.objectStore(SESSIONS).get(this.sessionSlot(peerId)))
+    if (v == null) return null
+    // Present-but-will-not-open is a THIRD outcome, never folded into null. A null
+    // here would read as "no session yet", which sends the caller down the
+    // first-contact path and overwrites a conversation that was merely unreadable
+    // for a moment (an idle-lock landing mid-receive). openSession throws instead.
+    return this.sealer ? this.sealer.openSession(peerId, v as SealedSessionRecord) : (v as SessionBook)
   }
 
   async saveBook(peerId: string, book: SessionBook): Promise<void> {
-    await this.tx(SESSIONS, 'readwrite', (t) => t.objectStore(SESSIONS).put(book, peerId))
+    const row = this.sealedBook(peerId, book)
+    await this.tx(SESSIONS, 'readwrite', (t) => t.objectStore(SESSIONS).put(row, this.sessionSlot(peerId)))
   }
 
   async saveBookWithSeen(
@@ -531,9 +687,14 @@ export class IdbSessionStore implements SessionStore {
     history?: HistoryRecord,
     del?: HistoryDelete,
   ): Promise<void> {
+    // Seal BEFORE opening the transaction. Sealing is synchronous, but doing it
+    // inside the callback would put a throw (app locked mid-operation) in the middle
+    // of a half-built multi-store write; out here it aborts with nothing issued.
+    const slot = this.sessionSlot(peerId)
+    const row = this.sealedBook(peerId, book)
     const stores = history || del ? [SESSIONS, SEEN, HISTORY, TOMBSTONES] : [SESSIONS, SEEN]
     await this.tx(stores, 'readwrite', (t) => {
-      t.objectStore(SESSIONS).put(book, peerId)
+      t.objectStore(SESSIONS).put(row, slot)
       t.objectStore(SEEN).put(Date.now(), msgId)
       if (history) t.objectStore(HISTORY).put(history, history.key)
       if (del) applyDeleteTx(t, del)
@@ -549,9 +710,11 @@ export class IdbSessionStore implements SessionStore {
     history?: HistoryRecord,
     del?: HistoryDelete,
   ): Promise<void> {
+    const slot = this.sessionSlot(peerId)
+    const row = this.sealedBook(peerId, book)
     const stores = history || del ? [SESSIONS, SEEN, REPLAY, HISTORY, TOMBSTONES] : [SESSIONS, SEEN, REPLAY]
     await this.tx(stores, 'readwrite', (t) => {
-      t.objectStore(SESSIONS).put(book, peerId)
+      t.objectStore(SESSIONS).put(row, slot)
       t.objectStore(SEEN).put(Date.now(), msgId)
       t.objectStore(REPLAY).put(1, initId)
       if (history) t.objectStore(HISTORY).put(history, history.key)
@@ -561,10 +724,13 @@ export class IdbSessionStore implements SessionStore {
   }
 
   async saveBookWithOutbox(peerId: string, book: SessionBook, entry: OutboxEntry, history?: HistoryRecord): Promise<void> {
+    const slot = this.sessionSlot(peerId)
+    const row = this.sealedBook(peerId, book)
+    const obx = this.sealer ? this.sealer.sealOutbox(entry) : entry
     const stores = history ? [SESSIONS, OUTBOX, HISTORY] : [SESSIONS, OUTBOX]
     await this.tx(stores, 'readwrite', (t) => {
-      t.objectStore(SESSIONS).put(book, peerId)
-      t.objectStore(OUTBOX).put(entry, entry.id)
+      t.objectStore(SESSIONS).put(row, slot)
+      t.objectStore(OUTBOX).put(obx, entry.id)
       if (history) t.objectStore(HISTORY).put(history, history.key)
       return null
     })
@@ -591,10 +757,10 @@ export class IdbSessionStore implements SessionStore {
   }
 
   async delete(peerId: string): Promise<void> {
-    await this.tx(SESSIONS, 'readwrite', (t) => t.objectStore(SESSIONS).delete(peerId))
+    await this.tx(SESSIONS, 'readwrite', (t) => t.objectStore(SESSIONS).delete(this.sessionSlot(peerId)))
   }
 
-  async list(): Promise<string[]> {
+  async listKeys(): Promise<string[]> {
     const keys = await this.tx<IDBValidKey[]>(SESSIONS, 'readonly', (t) => t.objectStore(SESSIONS).getAllKeys())
     return (keys ?? []).map(String)
   }
@@ -649,9 +815,27 @@ export class IdbSessionStore implements SessionStore {
   // lets a queued control (a delete, and anything later that targets an existing
   // message) overtake the message it refers to. Sorting here is the single place
   // that fixes it for every caller.
-  async pendingOutbox(): Promise<OutboxEntry[]> {
-    const entries = await this.tx<OutboxEntry[]>(OUTBOX, 'readonly', (t) => t.objectStore(OUTBOX).getAll())
-    return (entries ?? []).sort((a, b) => a.createdAt - b.createdAt)
+  async pendingOutbox(): Promise<PendingOutbox> {
+    const rows = await this.tx<unknown[]>(OUTBOX, 'readonly', (t) => t.objectStore(OUTBOX).getAll())
+    const entries: OutboxEntry[] = []
+    const unreadable: string[] = []
+    for (const row of rows ?? []) {
+      if (!this.sealer) {
+        entries.push(row as OutboxEntry)
+        continue
+      }
+      // Per row, never per batch: one bad row must not stop every other queued
+      // message from ever being retransmitted, and must not throw the whole connect
+      // path into the error phase. It is reported, not skipped, and not deleted.
+      try {
+        entries.push(this.sealer.openOutbox(row as SealedOutboxRecord))
+      } catch {
+        unreadable.push(String((row as SealedOutboxRecord).id ?? ''))
+      }
+    }
+    // createdAt stays in cleartext precisely so this ordering survives a row that
+    // would not open (see SealedOutboxRecord).
+    return { entries: entries.sort((a, b) => a.createdAt - b.createdAt), unreadable }
   }
 
   async historyLoadAll(): Promise<HistoryRecord[]> {
@@ -779,7 +963,7 @@ export class IdbSessionStore implements SessionStore {
   }
 
   async wipeAll(): Promise<void> {
-    await this.tx([SESSIONS, SEEN, REPLAY, FAILURES, OUTBOX, HISTORY, TOMBSTONES], 'readwrite', (t) => {
+    await this.tx([SESSIONS, SEEN, REPLAY, FAILURES, OUTBOX, HISTORY, TOMBSTONES, META], 'readwrite', (t) => {
       t.objectStore(SESSIONS).clear()
       t.objectStore(SEEN).clear()
       t.objectStore(REPLAY).clear()
@@ -787,6 +971,11 @@ export class IdbSessionStore implements SessionStore {
       t.objectStore(OUTBOX).clear()
       t.objectStore(HISTORY).clear()
       t.objectStore(TOMBSTONES).clear()
+      // An empty store is trivially sealed, so the marker is SET rather than
+      // cleared: leaving it unset would make the next unlock run a migration over
+      // nothing, and leaving a stale marker after a wipe would be a lie about rows
+      // that no longer exist. Both are avoided by writing it in this transaction.
+      t.objectStore(META).put(SESSION_SEAL_VERSION, SEAL_MARKER)
       return null
     })
   }

@@ -11,6 +11,50 @@ release tags cut by the deploy pipeline. Dates are the tag dates.
 
 ## [Unreleased]
 
+## [1.8.0] - 2026-07-26
+
+### Changed
+- **Your conversations are now encrypted on this device, not just your messages.**
+  Until now the app-lock covered your saved messages and your contacts, but not the
+  encryption sessions themselves. Those sat in the clear, filed under each person's
+  user id, which meant someone who took your phone while it was locked could read a
+  list of everyone you talk to and when you last did, and could decrypt everything
+  those conversations went on to say. Both are now sealed with the same key as
+  everything else, and filed under a name that is derived from your secret, so the
+  database identifies nobody. Your queued messages and your one-time keys are sealed
+  too; the one-time keys were what let someone read a brand new conversation
+  arriving for you.
+- **What that does not fix, said plainly.** Your identity key is still stored in the
+  clear, because the app has to work out what screen to show you before you have
+  unlocked anything, and because encrypting it would turn a forgotten passphrase
+  into losing your identity for good. So someone with your locked device can still
+  pretend to be you to the relay: collect messages waiting for you, send messages
+  your contacts' safety numbers will accept, and read new first contacts. Fixing
+  that needs a recovery story first, and it is not in this release.
+- **And it applies going forward, not backward.** Browsers give no way to erase what
+  has already been written to disk, so on a device that ran an earlier version the
+  old unencrypted copies may still be recoverable. Starting clean (export a backup,
+  clear the site's data or reinstall, then restore) is the only way to be rid of
+  them, and it costs every conversation you currently have open.
+- **Resetting a forgotten passphrase now costs more, and says so.** It used to erase
+  your saved messages and contacts and leave your conversations working. Everything
+  is encrypted with that secret now, so a reset ends every conversation as well. You
+  keep your identity, so you are still the same person to everyone who knows you,
+  but you have to message each contact again before they can reach you. The
+  confirmation says this before you type ERASE.
+
+### Fixed
+- **The lock screen could show a contact's id.** A security warning is deliberately
+  sticky, and it was being drawn above the unlock screen, so a device someone had
+  just picked up could display part of a contact's identifier without their ever
+  entering the secret. Those warnings now wait until you are in.
+- **Changing your passphrase while the app locked could have destroyed the key.**
+  The change takes a few seconds, and the automatic lock could land in the middle of
+  it. It now completes correctly regardless.
+- **Corrected the retention figure in the design notes**, which said the local
+  duplicate-message list was cleared after 8 days. It is 30, matching how long the
+  relay will keep retrying an undelivered message, and it has to be.
+
 ## [1.7.0] - 2026-07-26
 
 ### Added

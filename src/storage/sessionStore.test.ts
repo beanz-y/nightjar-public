@@ -41,10 +41,10 @@ function suite(name: string, make: () => SessionStore) {
       const s = make()
       await s.save('a', snap)
       await s.save('b', snap)
-      expect((await s.list()).sort()).toEqual(['a', 'b'])
+      expect((await s.listKeys()).sort()).toEqual(['a', 'b'])
       await s.delete('a')
       expect(await s.load('a')).toBeNull()
-      expect(await s.list()).toEqual(['b'])
+      expect(await s.listKeys()).toEqual(['b'])
     })
 
     it('stores an independent copy (mutating the input does not change stored bytes)', async () => {
@@ -96,7 +96,7 @@ describe('retention maintenance (P8)', () => {
     await store.wipeAll()
     expect(await store.loadBook('peer')).toBeNull()
     expect(await store.hasReplayedInitial('i1')).toBe(false)
-    expect(await store.pendingOutbox()).toEqual([])
+    expect((await store.pendingOutbox()).entries).toEqual([])
   })
 
   it('failure timestamps anchor to the FIRST failure, so an envelope being retried is not kept alive forever', async () => {
@@ -139,7 +139,7 @@ function historySuite(name: string, make: () => SessionStore) {
     it('writes a record atomically with the outbox entry (send)', async () => {
       const s = make()
       await s.saveBookWithOutbox(PEER_A, singleSessionBook(snap), { id: 'env-3', to: PEER_A, env: {}, createdAt: 1 }, hrec('k3'))
-      expect((await s.pendingOutbox()).map((e) => e.id)).toEqual(['env-3'])
+      expect((await s.pendingOutbox()).entries.map((e) => e.id)).toEqual(['env-3'])
       expect((await s.historyLoadAll()).map((r) => r.key)).toEqual(['k3'])
     })
 
@@ -245,7 +245,7 @@ function historySuite(name: string, make: () => SessionStore) {
       // relay drains in the order it receives them.
       await s.saveBookWithOutbox(PEER_A, singleSessionBook(snap), { id: 'zzz-text', to: PEER_A, env: {}, createdAt: 1000 })
       await s.saveBookWithOutbox(PEER_A, singleSessionBook(snap), { id: 'aaa-delete', to: PEER_A, env: {}, createdAt: 2000 })
-      expect((await s.pendingOutbox()).map((e) => e.id)).toEqual(['zzz-text', 'aaa-delete'])
+      expect((await s.pendingOutbox()).entries.map((e) => e.id)).toEqual(['zzz-text', 'aaa-delete'])
     })
   })
 }

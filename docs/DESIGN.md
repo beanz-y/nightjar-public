@@ -131,7 +131,7 @@ cryptographic code was written; the roadmap in section 12 tracks what has shippe
 | Thief of our server / subpoena at rest | No stored plaintext; only undelivered ciphertext (30-day TTL, 7.1) and any opt-in server-stored identity backups, which reduce to passphrase strength (8.3) | Transient routing state only | n/a |
 | Global passive network adversary | No (content) | Yes (out of scope for any practical messenger) | n/a |
 | Thief of your unlocked device | Yes (it is your device) | Yes | n/a |
-| Thief / forensic image of your at-rest (locked or powered-off) device | **Message history and the contact list are encrypted at rest** behind the mandatory app-lock (section 8.5); reading them reduces to the unlock secret's strength (strong for a passphrase/biometric, **weak for a short PIN** against an offline brute-force of the image). BUT the identity and ratchet **session keys stay unencrypted** (needed to run after unlock), so an image can still decrypt *future* traffic once the device is used again. | **Partly, without the secret.** The contact *list* is encrypted, but the ratchet session store is not, and it is keyed by **cleartext user id**, so an image enumerates every peer you hold a session with, deleted or not, plus when each was last used. Opaque session keying is tracked work (8.9). Future-traffic decryption then rebuilds the rest. | n/a |
+| Thief / forensic image of your at-rest (locked or powered-off) device | **Message history, the contact list, the ratchet sessions, the send queue and the prekey privates are all encrypted at rest** behind the mandatory app-lock (section 8.5); reading any of it reduces to the unlock secret's strength (strong for a passphrase/biometric, **weak for a short PIN** against an offline brute-force of the image). BUT the **identity key stays unencrypted** (the app must route its own start-up before you unlock), so an image can still authenticate to the relay AS YOU: collect your undelivered mail, send messages your contacts' safety numbers accept as genuine, and read new first-contact conversations. | **Not from the local database, but yes by other means.** Nothing on disk names a peer any more (session rows are keyed by an opaque HMAC, 8.5). What remains is unattributable: message and session COUNTS, message lengths, and per-message arrival timestamps. The unsealed identity key, however, still lets an imager query the relay as you, so the social graph is reachable that way. See 8.5 for the full residue list. | n/a |
 
 Honest one-sentence version: **Nightjar makes the content of your conversations
 unreadable to everyone but the people in them, once those people have verified
@@ -786,19 +786,41 @@ Honest at-rest posture, stated plainly:
   Methods are wrapped independently, so at-rest security is that of the **weakest
   enrolled method**. The UI labels the PIN accordingly and steers at-rest-sensitive
   users to a passphrase.
-- **The lock protects message history + the contact list only, and is not
-  forward-secret.** The identity and ratchet **session keys stay unencrypted** (the
-  app must be able to authenticate + decrypt after unlock), so a forensic image of
-  the device can still decrypt *future* traffic once the device is used. We do
-  **not** claim parity with Signal/WhatsApp defaults (OS-keychain-backed).
-- **The session store is keyed by cleartext user id, so it names your peers.**
-  Encrypting the contact list does not hide who you talk to from an image of the
-  device: the ratchet session rows are keyed by the peer's user id in the clear and
-  carry a last-used timestamp, so the social graph and its rough timing are readable
-  without the unlock secret. Only the message CONTENT and the contact record's
-  trust/nickname detail are behind the lock. Keying that store opaquely, as history
-  already is, is tracked work; it is called out again in 8.9 because deleting a
-  conversation is where a user is most likely to assume otherwise.
+- **What the lock covers, and the one thing it does not.** Sealed under the LDK:
+  message history, the contact list (with pending trust work and nicknames), the
+  **ratchet sessions**, the **send queue**, and the **prekey private halves**.
+  Session rows are keyed by `hex(HMAC(session-index sub-key, peerId))`, so the
+  database names nobody, and their values carry the ratchet state, so an image
+  cannot decrypt what an existing conversation goes on to say. NOT sealed: the
+  **identity key**, because start-up has to route itself (first run, returning user,
+  or evicted-and-needs-restore) before an unlock can happen, and because sealing it
+  would turn "I forgot my PIN" into permanent, unrecoverable loss of the identity
+  itself. The consequence is stated plainly rather than buried: an imager who takes
+  a locked device gets your identity key, and with it can authenticate to the relay
+  as you, collect your undelivered mail, send messages your contacts' safety numbers
+  will accept, and read new first-contact conversations. Sealing it is a real
+  follow-up, and it needs a recovery story first.
+- **The lock is not forward-secret, and this is not parity with Signal/WhatsApp.**
+  A single key protects everything at rest; those apps use OS-keychain-backed
+  storage, which a PWA has no access to.
+- **"At rest" means powered off, or locked.** Locked means you locked it, or five
+  minutes passed with the tab backgrounded. A device taken while Nightjar is in
+  front of you is an UNLOCKED device, and none of this section applies to it.
+- **Sealing applies going forward, not backward.** On a device that already ran an
+  earlier build, plaintext ratchet state and plaintext prekeys were written to disk
+  many times over, and the web platform offers no way to erase them: IndexedDB has
+  no secure delete, and a recovered page holds a prior root key, which decrypts
+  everything from that point onward. So an existing install is improved, not
+  cleaned. The only real remedy is to export an identity backup, clear this site's
+  data or reinstall, and restore, which costs every existing session.
+- **What a device image still shows without your secret.** The app is installed and
+  an identity is registered here; roughly when it was last used; whether push is on;
+  the NUMBER of stored messages and the approximate LENGTH of each (ciphertext is
+  unpadded, 9); the number of conversations; a per-inbound-message arrival timeline
+  for the 30-day dedup window; counts of accepted sessions, undecryptable envelopes
+  and applied deletes; and a plaintext flag marking which stored messages are failed
+  sends. None of it is attributable to a person. The service worker caches no
+  message data and no app assets.
 - **Biometric strength is the authenticator's.** A hardware platform authenticator
   is strong; a synced/software passkey is weaker. Biometric is never the sole
   factor (a knowledge factor always remains, so a lost authenticator is not a
@@ -994,12 +1016,12 @@ What it can honestly claim, and what it cannot:
   is what re-establishing contact should feel like. Recording them is not a
   courtesy, it is what makes the safety number available at all; a live session with
   no stored key would leave the priority-1 control silently unusable (12).
-- **The at-rest cost of that, stated rather than hidden.** The kept session names
-  this peer on the device. That is a smaller concession than it sounds: the session
-  store already names EVERY contact by a cleartext user id, so removing one row
-  never moved anything from unreadable to readable. Keying that store opaquely, as
-  history already is (8.5), is the real fix and is tracked as its own work; it would
-  close the gap for every contact rather than only deleted ones.
+- **The at-rest cost of that, now much smaller than it was.** The kept session is
+  still a row on the device, but since sessions are sealed and opaquely keyed (8.5)
+  it no longer NAMES the deleted peer: an image sees one more unattributable row.
+  What survives a delete is therefore a count, not an identity. On a device that ran
+  an earlier build, note the caveat in 8.5: the plaintext rows that build already
+  wrote cannot be erased.
 - **It does not reach their device.** Their copy of the conversation is theirs, and
   anything already handed to the relay still reaches them. Delete-for-everyone (8.6)
   is the separate, per-message, best-effort request; this is not that.
@@ -1411,7 +1433,7 @@ Native (Tauri) is **not** on the critical path; it is a demand-gated v2 (10.5).
 | Inbox seen-id TTL | 8 days (>= outbox retry horizon) | 7.1 |
 | SPK rotation / max age / retired-key grace | rotate at ~7 days (client, on connect) / reject if signed age > 14 days / keep a retired SPK private half until expiry + 30 days (envelope TTL) for late in-flight initials | 4.1, 4.2 |
 | One-time prekey vend window | `OPK_VEND_TTL_MS` = 7 days. A bundle fetch is idempotent per (fetcher, target) for that long, so a re-fetch inside the window returns the SAME OPK rather than burning another; that is what anti-depletion buys, and what makes a re-establishment inside the window need the no-OPK path (4.3, 8.9) | 4.3, 8.9 |
-| Client dedup/failure retention | `seen` pruned past 8 days (seen-id TTL), `failures` past 30 days (envelope TTL), on connect; the replay-guard store is never pruned (4.3) | 5.3, 8.1 |
+| Client dedup/failure retention | `seen` AND `failures` both pruned past 30 days (the undelivered-envelope TTL), on connect; the replay-guard store is never pruned (4.3). `seen` must outlive the relay's whole redelivery window, so it is deliberately NOT pruned at the shorter 8-day seen-id TTL: doing so would let a late redelivery skip dedup and burn poison-drop attempts | 5.3, 8.1 |
 | OPK batch / policy | 100 per batch; <= 1 outstanding per (fetcher,target); replenish under 20 | 4.1, 4.3 |
 | User id | `base32(SHA-256(IK_sig_pub))`, full 256-bit, untruncated | 3 |
 | Invite-embedded fingerprint | inviter `IK_sig` at full 256-bit width; joiner does a full-width equality check vs the directory-returned key | 6.3 |
@@ -1428,8 +1450,9 @@ Native (Tauri) is **not** on the critical path; it is a demand-gated v2 (10.5).
 | Delete-for-everyone | `delete{targetContentId}` (kind `0x02`) sent on the current session with its OWN fresh transport id; receiver removes only the compound (this peer, dir=in, target id), records a **tombstone** (opaque history key, TTL = envelope TTL 30 d) so a target arriving after its delete is suppressed; removal + tombstone ride the same tx as the ratchet advance. A still-outboxed target is cancelled, not chased. Best-effort, honest-client-dependent; UI says "delete sent" | 8.6 |
 | Session-only (ephemeral) | NJM1 text with flags bit0 set; **never** sealed to history on either device (send-side seal skipped, receive-side persist gate fails closed). RAM-only, cleared on reload/lock. Delivered EXACTLY like any message (same outbox + ack + retransmit, so a session-establishing initial is reliable); it removes only the persistent history row and leaves no EXTRA at-rest trace (the unencrypted session state any message updates still keys on the peer + stamps the send time). Encrypted identically in transit; does not hide relay metadata or the push nudge; off-the-record courtesy, not a guarantee; delete-for-everyone hidden on ephemeral bubbles; rendered live in other open **unlocked** tabs via a same-origin render `BroadcastChannel` (render-only, never leaves the browser, closed while locked), so the remaining miss is only a tab closed/locked/reloaded at arrival | 8.7 |
 | Delete a conversation | two actions: clear the saved messages, or delete everything local for that peer (messages, contact, verification, nickname, queued sends, parked trust work). Runs under the per-peer session lock; messages removed FIRST, contact LAST, so an interruption leaves a still-deletable conversation. NOT a block (none exists). The ratchet session is deliberately KEPT so the peer can still reach you: destroying it would silently drop their messages while the relay reported **delivered** to them, lying to both sides at once. Their next message reopens the chat and re-records them as an `unverified` TOFU contact (key re-fetched, binding-checked), so a delete costs the **verification**, not the ability to reach you. Disclosed cost: the kept session names them at rest, in a store that already names every contact in cleartext (opaque session keys tracked separately). A deleted peer goes in an app-lock-sealed, 30-day, 200-entry list that ONLY the relay-driven paths (mutual-invite sync, pending-trust retry) consult, so the app never re-adds them on its own; a message from them or a user re-add lifts it. Dropped by the forgot-secret reset and by restore, and a backup predating the delete restores the contact. Tombstones, replay-guard entries and dedup ids deliberately survive (unattributable, and removing them would break 8.6/4.3/dedup). A delete never forces a re-establishment; if one happens anyway inside `OPK_VEND_TTL_MS` for a peer who HAD a session when deleted, the no-OPK path is used, since the directory would re-serve a prekey that peer already consumed | 8.9 |
-| App-lock + at-rest data | random 32-B **LDK** wraps all local at-rest data; the LDK is never stored unwrapped, only wrapped per method: passphrase/PIN via `HKDF(Argon2id(secret, 64 MiB/t3/p1, 16-B salt), 16-B salt, "Nightjar_LockWrap_v1")`, biometric via `HKDF(prfSecret, 16-B salt, same info)`, each `XChaCha20-Poly1305(kek, LDK)` with the method kind bound in the AAD. Mandatory; >=1 knowledge factor; PIN min 6 digits (disclosed weak). Sub-keys `HKDF(LDK, "Nightjar_HistBody_v1" / "Nightjar_HistIndex_v1" / "Nightjar_Contacts_v1")` | 8.5 |
-| History at rest | per-message record in the sessions IndexedDB; the **whole message** (content id, peer, direction, ts, text) sealed with XChaCha20-Poly1305 under key+nonce = HKDF(history-body sub-key, **fresh 16-B per-record salt**, info `"Nightjar_History_v1"`); IndexedDB key = `hex(HMAC(history-index sub-key, peer‖dir‖id))` (opaque: the DB reveals no peer/ts/count); AAD binds that storage key + a history-format version; written in the same tx as the ratchet advance + dedup marker. Contacts/pending/aliases sealed under the contacts sub-key with a fresh 16-B salt | 8.5 |
+| App-lock + at-rest data | random 32-B **LDK** wraps all local at-rest data; the LDK is never stored unwrapped, only wrapped per method: passphrase/PIN via `HKDF(Argon2id(secret, 64 MiB/t3/p1, 16-B salt), 16-B salt, "Nightjar_LockWrap_v1")`, biometric via `HKDF(prfSecret, 16-B salt, same info)`, each `XChaCha20-Poly1305(kek, LDK)` with the method kind bound in the AAD. Mandatory; >=1 knowledge factor; PIN min 6 digits (disclosed weak). Sub-keys `HKDF(LDK, "Nightjar_HistBody_v1" / "Nightjar_HistIndex_v1" / "Nightjar_Contacts_v1" / "Nightjar_SessBody_v1" / "Nightjar_SessIndex_v1" / "Nightjar_Prekeys_v1")`, derived once per unlock and overwritten (best-effort) on lock | 8.5 |
+| History at rest | per-message record in the sessions IndexedDB; the **whole message** (content id, peer, direction, ts, text) sealed with XChaCha20-Poly1305 under key+nonce = HKDF(history-body sub-key, **fresh 16-B per-record salt**, info `"Nightjar_History_v1"`); IndexedDB key = `hex(HMAC(history-index sub-key, peer‖dir‖id))` (opaque: the DB reveals no peer, direction, timestamp or content). What it DOES still reveal is the NUMBER of stored messages (one row each) and each message's approximate length (ciphertext is unpadded, 9), plus a plaintext `failed` flag marking a permanently failed send; AAD binds that storage key + a history-format version; written in the same tx as the ratchet advance + dedup marker. Contacts/pending/aliases sealed under the contacts sub-key with a fresh 16-B salt | 8.5 |
+| Sessions + send queue at rest | the ratchet **SessionBook** is sealed with XChaCha20-Poly1305 under key+nonce = HKDF(session-body sub-key, **fresh 16-B per-record salt**, info `"Nightjar_Session_v1"`), at IndexedDB key `hex(HMAC(session-index sub-key, peerId))` (opaque: the DB names no peer). The AAD binds that storage key + a session-format version and is rebuilt from the peer the CALLER asked for, never from a field in the value, so a row moved into another peer's slot cannot authenticate. A row that exists but will not open is a distinct outcome from "no session", routed away from the poison counter. Outbox rows seal `{to, env, silent}` and keep `id` + `createdAt` in cleartext (neither names anyone; both are AAD-bound) so the retry horizon and oldest-first flush survive an unopenable row, which is reported rather than skipped. Prekey privates sealed under the prekeys sub-key. Migration: ONE IndexedDB transaction, no await inside, marker `meta.sealVersion` written in that same transaction, so an abort leaves the store byte-identical and the next unlock retries | 8.5 |
 | Version octet | starts at `0x01` (classical X25519) | 4.4 |
 | Reproducible build inputs | digest-pinned container (Node + OS + arch), committed lockfile (`npm ci`), no build-time dynamic values (`__APP_VERSION__` injected, never a clock). *`SOURCE_DATE_EPOCH`/`strip-nondeterminism` are inert here (vite emits no timestamps; the manifest hashes content only) and kept only as documented no-ops* | 10.1, P7 |
 | Release hash | `sha256(manifest.txt)`; `manifest.txt` = each `dist/` file as `<sha256-hex>  <relpath>\n`, byte-sorted, LF (one recipe: `scripts/release-hash.mjs` == the pure-shell pipeline). Hashes the **build output**, so the honest claim is "rebuild and diff", not "diff the served bytes" | 10.1, P7 |

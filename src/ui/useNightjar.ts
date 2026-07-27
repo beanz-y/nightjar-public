@@ -11,7 +11,7 @@ import { AppLockAuthError } from '../crypto/appLock'
 import type { Identity } from '../crypto/identity'
 import { NightjarClient, type StoredMessage } from '../net/client'
 import type { DeliveryStatus } from '../storage/historyStore'
-import { type CrossTab, type CrossTabEvent, createCrossTab } from '../net/crossTab'
+import { CROSS_TAB_CHANNEL, type CrossTab, type CrossTabEvent, createCrossTab } from '../net/crossTab'
 import { getRelayOrigin } from '../platform'
 import {
   clearNotifications,
@@ -34,11 +34,12 @@ import { IdbKeyStore, type KeyStore } from '../storage/keystore'
 import { HistoryStore } from '../storage/historyStore'
 import { bootstrapIdentity } from '../storage/identityStore'
 import { IdbSessionStore } from '../storage/sessionStore'
+import { SessionSealer } from '../storage/sessionSeal'
 import { type Lock, createLock } from '../storage/lock'
 import { type Sentinel, createSentinel, requestPersistentStorage } from '../storage/persist'
-import { PrekeyStore } from '../storage/prekeyStore'
+import { PREKEYS_KEY, PrekeyStore } from '../storage/prekeyStore'
 import { type BackupPayload } from '../crypto/backup'
-import { clearPendingRestore, pendingRestore, stageRestoreEnrolled } from '../storage/restore'
+import { RESTORE_PENDING_KEY, clearPendingRestore, pendingRestore, stageRestoreEnrolled } from '../storage/restore'
 import { type Contact, ContactStore } from '../trust/contactStore'
 import {
   type InviteArtifact,
@@ -309,7 +310,13 @@ export function useNightjar() {
     const id = idRef.current
     if (!stores || !id) return
     try {
-      const prekeys = new PrekeyStore(stores.keys, stores.lock)
+      // Sealing (P11) is wired BEFORE anything can read or write a session row, and
+      // the one-time migration runs BEFORE the client exists, so there is never a
+      // concurrent writer and never a half-configured store. Both need the LDK,
+      // which is why they live here and not in the pre-unlock boot effect.
+      stores.sessions.useSealer(new SessionSealer(stores.appLock))
+      await stores.sessions.migrateToSealed()
+      const prekeys = new PrekeyStore(stores.keys, stores.lock, stores.appLock)
       const client = new NightjarClient(
         id,
         stores.sessions,
@@ -376,7 +383,12 @@ export function useNightjar() {
         if (ev.kind === 'append') appendMessage(ev.peer, ev.msg)
         else if (ev.kind === 'delete') removeBubble(ev.peer, ev.id)
         else if (ev.kind === 'status') markStatus(ev.peer, ev.id, ev.status)
-        else if (ev.kind === 'conversationRemoved') {
+        else if (ev.kind === 'lockReset') {
+          // A sibling discarded the Local Data Key. Everything this tab would write
+          // from here is sealed under a key that no longer opens anything, so stop
+          // immediately rather than accumulating unreadable rows.
+          lockNowRef.current?.()
+        } else if (ev.kind === 'conversationRemoved') {
           dropConversation(ev.peer)
           if (!ev.keepThread) noteRemoved(ev.peer)
           // A full delete also removed the contact and the nickname, which this tab
@@ -640,22 +652,46 @@ export function useNightjar() {
     if (!stores) return
     teardownLive()
     try {
-      // History AND contacts/pending/aliases are sealed under the Local Data Key
-      // being discarded here, so they are unrecoverable ciphertext now and must be
-      // cleared (else a re-enrolled lock's new LDK cannot open them and the app
-      // fails to start). The identity survives (it is not under the lock); contacts
-      // can be recovered from a backup.
-      await stores.sessions.historyClear()
+      // EVERYTHING local is sealed under the Local Data Key being discarded here, so
+      // it is all unrecoverable ciphertext the moment this runs and must be cleared,
+      // or a re-enrolled lock's new LDK meets rows nothing can open and the app
+      // cannot start. Since P11 that includes the RATCHET SESSIONS and the send
+      // queue, which is why a reset now ends every conversation rather than only
+      // erasing saved messages. It is not a choice: a discarded key cannot be
+      // reconciled with data encrypted under it.
+      //
+      // The identity still survives, so people can still reach this user, but each
+      // conversation has to be opened again from this side before they can.
+      await stores.sessions.wipeAll()
       await stores.contacts.wipeLocalData()
+      // Prekey privates go with them (sealed since P11), and the flag makes the next
+      // connect re-register a fresh set, exactly as a restore does.
+      await stores.keys.delete(PREKEYS_KEY)
+      await stores.keys.put(RESTORE_PENDING_KEY, Uint8Array.from([1]))
       await stores.appLock.reset()
-    } catch {
-      /* best-effort */
+      // Tell any sibling tab still holding the old key to stop. This tab is on the
+      // lock screen with no channel open, so it posts through a one-shot one.
+      try {
+        const ch = new BroadcastChannel(CROSS_TAB_CHANNEL)
+        ch.postMessage({ kind: 'lockReset' })
+        ch.close()
+      } catch {
+        /* unsupported: the wipe above is what actually protects the data */
+      }
+    } catch (e) {
+      // NOT best-effort any more. A half-finished wipe leaves rows that cannot be
+      // opened and cannot be cleared, so the honest move is to stay on the lock
+      // screen and say so rather than route on to enrollment over broken state.
+      setNotice(`could not reset the app-lock: ${String(e instanceof Error ? e.message : e)}. Nothing was changed; try again.`)
+      setPhase('locked')
+      return
     }
     setConversations({})
     setContacts([])
     setAliases({})
     restorePayloadRef.current = null
     setRestorePending(false)
+    setNotice('the app-lock was reset. Every conversation on this device ended: message each contact again to reopen one, and until you do they cannot reach you.')
     setPhase('enroll')
   }, [teardownLive])
 

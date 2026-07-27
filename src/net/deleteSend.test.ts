@@ -92,7 +92,7 @@ describe('NightjarClient.deleteForEveryone (P10d)', () => {
     await h.seedSentRow(peer.userId, id)
     // Sanity: the row is present, and nothing is queued.
     expect((await h.store.historyLoadAll()).length).toBe(1)
-    expect(await h.store.pendingOutbox()).toEqual([])
+    expect((await h.store.pendingOutbox()).entries).toEqual([])
 
     const { requested } = await h.client.deleteForEveryone(peer.userId, id)
     expect(requested).toBe(true)
@@ -100,7 +100,7 @@ describe('NightjarClient.deleteForEveryone (P10d)', () => {
     expect(await h.store.historyLoadAll()).toEqual([])
     // Exactly one delete control is queued, with a FRESH transport id (never the
     // target content id) and no history row of its own.
-    const out = await h.store.pendingOutbox()
+    const out = (await h.store.pendingOutbox()).entries
     expect(out).toHaveLength(1)
     expect(out[0].id).not.toBe(id)
     expect(out[0].to).toBe(peer.userId)
@@ -117,12 +117,12 @@ describe('NightjarClient.deleteForEveryone (P10d)', () => {
     // The message is still in the outbox (not yet acked/delivered).
     const book = (await h.store.loadBook(peer.userId))!
     await h.store.saveBookWithOutbox(peer.userId, book, { id, to: peer.userId, env: { id, kind: 'normal' }, createdAt: NOW })
-    expect((await h.store.pendingOutbox()).map((e) => e.id)).toEqual([id])
+    expect((await h.store.pendingOutbox()).entries.map((e) => e.id)).toEqual([id])
 
     const { requested } = await h.client.deleteForEveryone(peer.userId, id)
     expect(requested).toBe(false)
     // The queued send was cancelled and NO delete control was queued in its place.
-    expect(await h.store.pendingOutbox()).toEqual([])
+    expect((await h.store.pendingOutbox()).entries).toEqual([])
     // The local copy is removed as well.
     expect(await h.store.historyLoadAll()).toEqual([])
   })
@@ -137,6 +137,6 @@ describe('NightjarClient.deleteForEveryone (P10d)', () => {
     const { requested } = await h.client.deleteForEveryone(peer.userId, id)
     expect(requested).toBe(false)
     expect(await h.store.historyLoadAll()).toEqual([])
-    expect(await h.store.pendingOutbox()).toEqual([])
+    expect((await h.store.pendingOutbox()).entries).toEqual([])
   })
 })

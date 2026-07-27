@@ -170,9 +170,15 @@ function Unlock({ bioAvailable, lockMethods, onUnlock, onUnlockBiometric, onRese
       ) : (
         <div className="lock-reset">
           <p className="small">
-            Resetting the app-lock <strong>erases the saved messages and contacts on this device</strong> (they are
-            encrypted with the secret you forgot, so they cannot be kept). Your <strong>identity is kept</strong>, and
-            your contacts can be recovered from a backup afterwards. Type <code>ERASE</code> to confirm.
+            Resetting the app-lock <strong>erases everything this device has stored</strong>: the saved messages, your
+            contacts, and <strong>every conversation you have open</strong>. All of it is encrypted with the secret you
+            forgot, so none of it can be kept.
+          </p>
+          <p className="small">
+            Your <strong>identity is kept</strong>, so you are still the same person to everyone who knows you, and your
+            contacts can be recovered from a backup afterwards. But each conversation has to be started again from this
+            device: <strong>until you message someone, they cannot reach you</strong>. Type <code>ERASE</code> to
+            confirm.
           </p>
           <input className="mono" placeholder="ERASE" value={confirmText} onChange={(e) => setConfirmText(e.target.value)} />
           <div className="row">

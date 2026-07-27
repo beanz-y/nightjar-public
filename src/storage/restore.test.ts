@@ -68,7 +68,7 @@ describe('stageRestore', () => {
     expect(await d.sessions.loadBook('peer')).toBeNull()
     expect(await d.sessions.hasSeen('msg')).toBe(false)
     expect(await d.sessions.hasReplayedInitial('init')).toBe(false)
-    expect(await d.sessions.pendingOutbox()).toEqual([])
+    expect((await d.sessions.pendingOutbox()).entries).toEqual([])
     expect(await d.keys.get(PREKEYS_KEY)).toBeNull()
 
     // Flag is set, contacts staged, and bootstrap loads the restored identity.

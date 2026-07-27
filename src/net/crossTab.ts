@@ -70,12 +70,23 @@ export interface CrossTabConversationRemoved {
   keepThread: boolean
 }
 
+/** Another tab ran the forgot-secret reset, so the Local Data Key every sibling is
+ *  holding is now dead. Unlike the render events this is not cosmetic: a still
+ *  unlocked sibling would go on sealing ratchet advances under the discarded key,
+ *  writing rows nothing will ever open, for as long as it stayed open. Best-effort
+ *  by nature (a tab mid-write still races), which is why the reset also wipes the
+ *  store outright rather than relying on this. */
+export interface CrossTabLockReset {
+  kind: 'lockReset'
+}
+
 export type CrossTabEvent =
   | CrossTabAppend
   | CrossTabDelete
   | CrossTabFailed
   | CrossTabStatus
   | CrossTabConversationRemoved
+  | CrossTabLockReset
 
 export interface CrossTab {
   /** Broadcast a render event to sibling tabs (no-op if unsupported/closed). */
@@ -90,7 +101,14 @@ export const CROSS_TAB_CHANNEL = 'nightjar-render'
 function isEvent(v: unknown): v is CrossTabEvent {
   if (!v || typeof v !== 'object') return false
   const k = (v as { kind?: unknown }).kind
-  return k === 'append' || k === 'delete' || k === 'failed' || k === 'status' || k === 'conversationRemoved'
+  return (
+    k === 'append' ||
+    k === 'delete' ||
+    k === 'failed' ||
+    k === 'status' ||
+    k === 'conversationRemoved' ||
+    k === 'lockReset'
+  )
 }
 
 /**

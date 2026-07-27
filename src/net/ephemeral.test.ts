@@ -102,7 +102,7 @@ describe('sendText session-only (P10e)', () => {
     // But delivery is UNCHANGED: an outbox entry is committed and the envelope fired,
     // so a session-establishing initial is never dropped (the reliability that a
     // naive outbox-skip would have broken).
-    expect((await h.store.pendingOutbox()).map((e) => e.id)).toEqual([id])
+    expect((await h.store.pendingOutbox()).entries.map((e) => e.id)).toEqual([id])
     expect(h.sent).toHaveLength(1)
     expect(h.sent[0].env.id).toBe(id)
     expect(['normal', 'initial']).toContain(h.sent[0].env.kind)
@@ -117,7 +117,7 @@ describe('sendText session-only (P10e)', () => {
     const rows = await h.store.historyLoadAll()
     expect(rows).toHaveLength(1)
     expect(h.history.open(rows[0])).toMatchObject({ id, peerId: peer.userId, dir: 'out', text: 'keep me' })
-    expect((await h.store.pendingOutbox()).map((e) => e.id)).toEqual([id])
+    expect((await h.store.pendingOutbox()).entries.map((e) => e.id)).toEqual([id])
     expect(h.sent).toHaveLength(1)
   })
 
@@ -133,7 +133,7 @@ describe('sendText session-only (P10e)', () => {
 
     const id = await h.client.sendText(peer.userId, 'off the record, first ever', undefined, NOW, true)
 
-    const out = await h.store.pendingOutbox()
+    const out = (await h.store.pendingOutbox()).entries
     expect(out.map((e) => e.id)).toEqual([id]) // durably queued, not fire-once
     expect((out[0].env as WireEnvelope).kind).toBe('initial') // the X3DH bootstrap
     expect(h.sent).toHaveLength(1) // also fired now
@@ -150,7 +150,7 @@ describe('sendText session-only (P10e)', () => {
 
     // Reliable delivery: the entry is queued (fire caught the not-connected throw),
     // so it flushes on reconnect - a session-only message is NOT silently dropped.
-    expect((await h.store.pendingOutbox()).map((e) => e.id)).toEqual([id])
+    expect((await h.store.pendingOutbox()).entries.map((e) => e.id)).toEqual([id])
     expect(h.sent).toEqual([]) // nothing left the socket while offline
     // ...and it is still never sealed to history.
     expect(await h.store.historyLoadAll()).toEqual([])

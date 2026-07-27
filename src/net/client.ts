@@ -153,6 +153,9 @@ export class NightjarClient {
    *  so a burst of messages from a peer we hold no record for causes ONE directory
    *  fetch rather than one per message. */
   private readonly recoveringContacts = new Set<string>()
+  /** Queued-send ids already reported as unreadable, so a stuck row is surfaced once
+   *  rather than on every reconnect (mirrors `warnedSendCodes`). */
+  private readonly warnedUnreadableOutbox = new Set<string>()
 
   constructor(
     private readonly identity: Identity,
@@ -443,7 +446,7 @@ export class NightjarClient {
     void (async () => {
       try {
         if (this.history) {
-          const entry = (await this.store.pendingOutbox()).find((e) => e.id === ref)
+          const entry = (await this.store.pendingOutbox()).entries.find((e) => e.id === ref)
           if (entry) await this.store.historyMarkFailed(this.history.storageKey(entry.to, 'out', ref))
         }
       } catch {
@@ -859,7 +862,10 @@ export class NightjarClient {
       //    the caller's wording must not pretend otherwise. Counted because
       //    "what was still queued is gone" is something to be told, not inferred.
       let cancelled = 0
-      for (const e of await this.store.pendingOutbox()) {
+      // Only rows that OPEN can be attributed to this peer. An unreadable one names
+      // nobody, so it is neither cancelled nor counted here, exactly as an
+      // unopenable history row is not counted as deleted.
+      for (const e of (await this.store.pendingOutbox()).entries) {
         if (e.to === peer) {
           await this.store.removeOutbox(e.id).catch(() => {})
           cancelled++
@@ -969,7 +975,12 @@ export class NightjarClient {
   async deleteForEveryone(peer: string, id: string): Promise<{ requested: boolean }> {
     // A text's outbox entry is keyed by its content id (the two-id rule makes them
     // equal for a first-send text), so a still-queued target is found by that id.
-    const stillQueued = (await this.store.pendingOutbox()).some((e) => e.id === id && e.to === peer)
+    // Matched on the outbox row's PLAINTEXT id, and on that alone: an id is 16
+    // random bytes, so it cannot collide across peers, and matching this way means a
+    // queued target can still be cancelled on a device where the row will not open.
+    const pending = await this.store.pendingOutbox()
+    const stillQueued =
+      pending.entries.some((e) => e.id === id && e.to === peer) || pending.unreadable.includes(id)
     // Remove the local sent copy regardless (dir='out').
     if (this.history) await this.store.historyRemove(this.history.storageKey(peer, 'out', id)).catch(() => {})
     if (stillQueued) {
@@ -1037,7 +1048,18 @@ export class NightjarClient {
 
   private async flushOutbox(): Promise<void> {
     const now = Date.now()
-    for (const e of await this.store.pendingOutbox()) {
+    const pending = await this.store.pendingOutbox()
+    // A queued row that will not open can never be re-encrypted (its ratchet advance
+    // committed in the same transaction), so it cannot be sent and must not be
+    // silently dropped either. Say so ONCE per id, leave the row in place, and let
+    // the retry horizon below remove it like any other timed-out entry: `createdAt`
+    // is deliberately in cleartext so that still works on a row nothing can read.
+    for (const id of pending.unreadable) {
+      if (this.warnedUnreadableOutbox.has(id)) continue
+      this.warnedUnreadableOutbox.add(id)
+      this.cb.onSendFailed?.(id, 'this queued message could not be read on this device and will not be sent')
+    }
+    for (const e of pending.entries) {
       if (now - e.createdAt > OUTBOX_RETRY_HORIZON_MS) {
         // Past the retry horizon: give up (DESIGN 7.2). Flag the persisted row
         // failed and notify, so this never-delivered message is not shown as

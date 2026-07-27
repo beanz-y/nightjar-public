@@ -33,6 +33,8 @@ import { decryptOrder, promoteSession, updateSession } from '../session/sessionB
 import type { HistoryStore } from '../storage/historyStore'
 import type { PrekeyStore } from '../storage/prekeyStore'
 import type { Lock } from '../storage/lock'
+import { AppLockedError } from '../storage/appLockStore'
+import { SessionSealError } from '../storage/sessionSeal'
 import type { HistoryRecord, SessionStore } from '../storage/sessionStore'
 import { type Envelope, b64encode } from '../wire/codec'
 
@@ -109,6 +111,15 @@ export async function processInbound(env: Envelope, from: string, deps: InboundD
       // it toward the poison bound (the message decrypted, so dropping it would be
       // silent content loss). Not acked -> the relay redelivers within its TTL.
       if (e instanceof HistoryPersistError) throw e
+      // The stored session could not be READ, which says nothing about the envelope.
+      // Two causes, both transient from the message's point of view: the app-lock
+      // engaged mid-receive so the key is gone (AppLockedError), or the row is there
+      // but will not authenticate (SessionSealError). Counting either toward the
+      // poison bound would burn drop attempts against a perfectly healthy
+      // conversation, and after ten idle-locks landing badly it would ack-and-drop a
+      // real message while the relay told the sender it was delivered. Retry on
+      // redelivery instead, exactly like a persist failure.
+      if (e instanceof SessionSealError || e instanceof AppLockedError) throw e
       if (e instanceof PermanentReject) return dropAndAck(store, env.id, from, e.message)
       // Generic decrypt / x3dh / no-session failure: retry a bounded number of
       // times (a reordered message may become decryptable once its initial lands),
