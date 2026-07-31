@@ -11,6 +11,22 @@ release tags cut by the deploy pipeline. Dates are the tag dates.
 
 ## [Unreleased]
 
+## [1.8.2] - 2026-07-26
+
+### Added
+- **The message box now tells you when you are running out of room.** There is a
+  limit of 8,000 characters, which is a chapter rather than a message, so almost
+  nobody will ever see this. Previously the only way to find out was to write the
+  whole thing, press send, and be turned down with the text still sitting there.
+  A count now appears for the last 800 characters, and once you are over the limit
+  it says by how much and the send button is disabled, so the message cannot reach a
+  dead end.
+
+The count and the check that lets you send are built from the same number, so they
+cannot disagree. It counts the way the limit is actually measured, which means an
+emoji usually costs two: the honest figure rather than the flattering one, since the
+flattering one would let a send be refused with room apparently to spare.
+
 ## [1.8.1] - 2026-07-26
 
 ### Added

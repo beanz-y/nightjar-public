@@ -6,7 +6,7 @@ import type { TrustLevel } from '../trust/contactStore'
 import { EphemeralIcon } from './icons'
 import { TrustBadge } from './SafetyNumber'
 import { type TimeFormat, hour12For, useTimeFormat } from './timePref'
-import type { Message } from './useNightjar'
+import { MAX_MESSAGE_CHARS, type Message } from './useNightjar'
 
 // Date/time helpers for the message log, mirroring common messengers: a centered
 // day separator ("Today" / "Yesterday" / weekday / full date) when the day rolls
@@ -59,6 +59,16 @@ function isTouchDevice(): boolean {
 }
 // Max composer height before it scrolls internally (about five lines).
 const COMPOSE_MAX_PX = 140
+/** Where the character counter starts showing: the last 10% of the allowance, which
+ *  is ~800 characters of warning. Enough to react to while typing, and late enough
+ *  that an ordinary message never sees it. */
+const COUNT_VISIBLE_FROM = Math.floor(MAX_MESSAGE_CHARS * 0.9)
+
+/** "1 character" / "2 characters". The counter passes through exactly 1 in both
+ *  directions, so this is reached rather than theoretical. */
+function plural(n: number, noun: string): string {
+  return `${n.toLocaleString()} ${noun}${n === 1 ? '' : 's'}`
+}
 
 // The delivery indicator, shown on your own messages only.
 //
@@ -252,6 +262,15 @@ export function Conversation({
   const shortId = `${peer.slice(0, 8)}…${peer.slice(-6)}`
   /** How to refer to this person in prose. */
   const who = name.trim() || shortId
+
+  // Counted exactly as the send guard counts it (UTF-16 units, MAX_MESSAGE_CHARS),
+  // so what is shown and what is enforced can never disagree. Note this means an
+  // emoji outside the basic plane costs two, which is the honest number rather than
+  // a friendlier-looking one that would let a send be refused with room apparently
+  // to spare.
+  const remaining = MAX_MESSAGE_CHARS - draft.length
+  const overLimit = remaining < 0
+  const showCount = draft.length >= COUNT_VISIBLE_FROM
 
   return (
     <div className="convo">
@@ -502,6 +521,21 @@ export function Conversation({
           </span>
         </div>
       )}
+      {/* Silent until it matters. 8,000 characters is a chapter, not a message, so a
+          counter on every message would be noise for something almost nobody meets.
+          It appears with room still left to react, and turns into a refusal only when
+          the send button has actually been disabled, so the two always agree. Sits
+          ABOVE the compose bar, which is pinned to the bottom and carries the
+          safe-area padding. Described-by rather than a live region: announcing a
+          number on every keystroke is worse for a screen reader than letting one be
+          asked for. */}
+      {showCount && (
+        <p id="compose-count" className={`compose-count tiny${overLimit ? ' over' : ''}`}>
+          {overLimit
+            ? `${plural(-remaining, 'character')} over the ${MAX_MESSAGE_CHARS.toLocaleString()} limit`
+            : `${plural(remaining, 'character')} left`}
+        </p>
+      )}
       <div className={`compose${sessionOnly ? ' compose-ephemeral' : ''}`}>
         <button
           type="button"
@@ -521,6 +555,7 @@ export function Conversation({
           placeholder={sessionOnly ? 'session-only message' : 'message'}
           onChange={(e) => setDraft(e.target.value)}
           onFocus={() => window.setTimeout(scrollToBottom, 300)}
+          aria-describedby={showCount ? 'compose-count' : undefined}
           onKeyDown={(e) => {
             // Physical keyboard: Enter sends, Shift+Enter is a newline. Touch: Enter
             // is a newline and sending is an explicit Send tap.
@@ -530,7 +565,7 @@ export function Conversation({
             }
           }}
         />
-        <button className="primary" disabled={!draft.trim()} onClick={submit}>
+        <button className="primary" disabled={!draft.trim() || overLimit} onClick={submit}>
           {sessionOnly ? 'send once' : 'send'}
         </button>
       </div>

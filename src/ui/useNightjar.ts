@@ -124,7 +124,15 @@ function mergeHistory(
   return out
 }
 
-const MAX_MESSAGE_CHARS = 8000
+/** The longest message that can be sent, counted the way JavaScript counts a string
+ *  (UTF-16 units), which is what the send guard below compares. Exported so the
+ *  composer can warn against the SAME number it will be judged by: a counter that
+ *  disagreed with the check would be worse than no counter.
+ *
+ *  It is deliberately generous. The relay refuses a ciphertext over 64 KiB, and this
+ *  cap keeps a normal message about half that even in a three-byte-per-character
+ *  script, so `too_large` is something a person never meets. */
+export const MAX_MESSAGE_CHARS = 8000
 const USER_ID_RE = /^[a-z2-7]{52}$/
 
 function computeNotify(pushKey: string | null): NotifyState {

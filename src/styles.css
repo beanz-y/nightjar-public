@@ -766,6 +766,20 @@ textarea.mono {
 .msg-menu-note {
   padding: 0 0.1rem;
 }
+/* Sits just above the compose bar, so it reads as a note about what you are typing
+   rather than a page-level warning. Muted while there is room, alarming only once
+   the send button is genuinely disabled. */
+.compose-count {
+  margin: 0;
+  padding: 0 var(--gutter) 0.3rem;
+  text-align: right;
+  color: var(--muted);
+  flex-shrink: 0;
+}
+.compose-count.over {
+  color: var(--danger, #e0656f); /* same fallback the other danger text uses */
+  font-weight: 600;
+}
 .compose {
   display: flex;
   gap: 0.5rem;
