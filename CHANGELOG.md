@@ -11,6 +11,20 @@ release tags cut by the deploy pipeline. Dates are the tag dates.
 
 ## [Unreleased]
 
+## [1.8.1] - 2026-07-26
+
+### Added
+- **The app-lock screen now says what your passphrase or PIN has to be**, instead of
+  letting you find out by being turned down. The requirements are listed under the
+  box and tick off as you meet them. A tester asked for this.
+- It also says what is *not* required, since that is the part people guess at: any
+  characters, any length above the minimum, no mandatory symbols or digits. Capitals
+  matter, and spaces at the start or end are ignored, which is worth knowing before
+  you have to type it again tomorrow.
+
+The list and the check that lets you continue are now built from the same rules, so
+they cannot disagree about what is allowed.
+
 ## [1.8.0] - 2026-07-26
 
 ### Changed

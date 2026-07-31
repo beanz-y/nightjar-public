@@ -33,16 +33,37 @@ function Enroll({ restoring, bioAvailable, onEnroll, makeBiometric }: Props) {
   const [busy, setBusy] = useState(false)
   const [err, setErr] = useState<string | null>(null)
 
-  const issue = (): string | null => {
-    if (kind === 'pin') {
-      if (!/^\d+$/.test(secret)) return 'a PIN must be digits only'
-      if (secret.length < PIN_MIN_DIGITS) return `use at least ${PIN_MIN_DIGITS} digits`
-    } else if (secret.trim().length < LOCK_PASSPHRASE_MIN_LENGTH) {
-      return `use at least ${LOCK_PASSPHRASE_MIN_LENGTH} characters (a few random words work well)`
-    }
-    if (secret !== confirm) return 'the two entries do not match'
-    return null
-  }
+  // The requirements are DERIVED from the same list that is shown on screen, so the
+  // rules a person reads and the rules that actually gate the button cannot drift
+  // apart. Add a rule here and it appears in the list; there is no second copy.
+  const rules: Array<{ label: string; met: boolean; error: string }> =
+    kind === 'pin'
+      ? [
+          {
+            label: 'digits only',
+            met: /^\d+$/.test(secret),
+            error: 'a PIN must be digits only',
+          },
+          {
+            label: `at least ${PIN_MIN_DIGITS} digits`,
+            met: secret.length >= PIN_MIN_DIGITS,
+            error: `use at least ${PIN_MIN_DIGITS} digits`,
+          },
+        ]
+      : [
+          {
+            label: `at least ${LOCK_PASSPHRASE_MIN_LENGTH} characters`,
+            met: secret.trim().length >= LOCK_PASSPHRASE_MIN_LENGTH,
+            error: `use at least ${LOCK_PASSPHRASE_MIN_LENGTH} characters (a few random words work well)`,
+          },
+        ]
+  rules.push({
+    label: 'both entries match',
+    met: secret.length > 0 && secret === confirm,
+    error: 'the two entries do not match',
+  })
+
+  const issue = (): string | null => rules.find((r) => !r.met)?.error ?? null
 
   const submit = async () => {
     const problem = issue()
@@ -106,6 +127,21 @@ function Enroll({ restoring, bioAvailable, onEnroll, makeBiometric }: Props) {
         value={confirm}
         onChange={(e) => setConfirm(e.target.value)}
       />
+
+      {/* What is actually required, said up front rather than discovered by being
+          refused. These are the same checks that gate the button (see `rules`). */}
+      <ul className="lock-rules tiny" aria-label={kind === 'pin' ? 'PIN requirements' : 'passphrase requirements'}>
+        {rules.map((r) => (
+          <li key={r.label} className={r.met ? 'met' : ''}>
+            <span aria-hidden="true">{r.met ? '✓' : '·'}</span> {r.label}
+          </li>
+        ))}
+      </ul>
+      <p className="muted tiny">
+        {kind === 'pass'
+          ? 'Anything else is allowed: any characters, any length above the minimum. Capitals matter, and spaces at the start or end are ignored.'
+          : 'Spaces at the start or end are ignored.'}
+      </p>
 
       {bioAvailable && (
         <label className="row small">

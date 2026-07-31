@@ -1096,6 +1096,23 @@ textarea.mono {
 .lock h2 { margin: 0 0 0.25rem; }
 .lock input { width: 100%; box-sizing: border-box; }
 .lock-choice { gap: 0.5rem; }
+/* The passphrase/PIN requirements, ticked off as they are met. Muted until met, so
+   the list reads as guidance while typing rather than as a wall of errors. */
+.lock-rules {
+  list-style: none;
+  margin: -0.25rem 0 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+  color: var(--muted, #8b8b8b);
+}
+.lock-rules li > span {
+  display: inline-block;
+  width: 1em;
+  text-align: center;
+}
+.lock-rules li.met { color: var(--ok, #3fa46a); }
 .lock-reset {
   display: flex;
   flex-direction: column;
