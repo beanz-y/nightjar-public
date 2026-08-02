@@ -62,6 +62,14 @@ the shape of that residual gap is kept as a documented, demand-gated v2; see
 `docs/DESIGN.md` section 10. The single most important defense is not packaging,
 it is verifying your contacts' safety numbers in person.
 
+## Found a security problem?
+
+Please report it privately rather than opening a public issue: see
+[SECURITY.md](SECURITY.md). GitHub Private Vulnerability Reporting is the preferred
+route, with an email fallback. Reports about the DOCUMENTATION are welcome too. This
+project's central claim is that it does not overstate what it protects, so a claim the
+code cannot support is a real issue here, not a nitpick.
+
 ## License
 
 Licensed under the [Apache License, Version 2.0](LICENSE). The crypto core is a

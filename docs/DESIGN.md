@@ -1245,6 +1245,46 @@ do not control. Alpha and Firefox-only, which is fine for a per-person spot chec
 - **Our own Code-Verify-style extension:** four store pipelines and we would own
   the trust root; MEGA's extension was trojaned in 2018. Not worth it.
 
+### 10.7 Finding out that something is broken (the alerting posture)
+
+Verifiability answers "is the code I am running the code that was published". It says
+nothing about "is the published code, or something it depends on, now known to be
+broken". That is a separate problem, and it is three problems, only one of which can be
+automated.
+
+**A flaw in a dependency we ship.** The production surface is deliberately seven
+packages (`@noble/ciphers`, `@noble/curves`, `@noble/hashes`, `@scure/base`, `jsqr`,
+`react`, `react-dom`), which is the control that makes the rest of this tractable: with
+a committed lockfile and a digest-pinned build container, "are we affected" is a lookup
+rather than an investigation. Alerting is GitHub Dependabot alerts on the repository,
+backed by an `npm audit --omit=dev --audit-level=high` step in the release gate so a
+known critical or high advisory stops a deploy instead of waiting to be noticed. Note
+these are ONE source, not two: both read the GitHub Advisory Database. Neither can see a
+fix that shipped in a release note without an advisory ever being filed, which for a
+small single-maintainer crypto library is a realistic gap, so the release feeds of the
+`@noble` and `@scure` repositories are watched directly.
+
+**A flaw in a primitive or protocol we implement.** X3DH, the Double Ratchet, Argon2id,
+XChaCha20-Poly1305, X25519, Ed25519. **No scanner will ever report these**, because
+there is no package version to compare against; such a result arrives through the CFRG
+list, a vendor's engineering blog, or a paper. This is also where the clean-room
+reimplementation (section 2) cuts against us: a defect in libsignal gets an advisory and
+a fix, while the same defect in our implementation of the same specification is ours
+alone to find. There is no automation for this and we do not pretend otherwise; the
+honest mitigation is periodic review, and the version octet plus floor-and-ceiling
+handling (4.4) is the machinery for responding when a primitive weakens rather than
+breaks.
+
+**A flaw someone else finds in our code.** The repository is public and this is a
+security product, so this will happen. What matters is that the finder has a private
+channel, because without one their options are a public issue that tells attackers
+before a fix exists, a guessed email address, or silence. `SECURITY.md` documents GitHub
+Private Vulnerability Reporting as the preferred route with an email fallback, states
+plainly that there is no bounty, and lists what is already disclosed here so a reporter
+does not spend their time on a documented design decision. It also invites reports about
+the DOCUMENTATION: for this project, a claim the code does not support is a security
+issue in its own right.
+
 ---
 
 ## 11. Reused building blocks (what we already own)

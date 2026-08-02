@@ -11,6 +11,28 @@ release tags cut by the deploy pipeline. Dates are the tag dates.
 
 ## [Unreleased]
 
+### Added
+- **A private way to report a security problem.** [SECURITY.md](SECURITY.md) documents
+  GitHub Private Vulnerability Reporting as the preferred route, with `admin@nightjar.chat`
+  as a fallback. Until now someone who found a flaw had no way to say so privately, and
+  their only options were a public issue that tells attackers before there is a fix, a
+  guessed address, or nothing. It states plainly that there is no bounty, and lists what
+  is already disclosed so nobody spends an evening on a documented design decision.
+  Reports about the documentation are explicitly welcome: for this project a claim the
+  code cannot support is a real issue.
+- **Alerting for the dependencies we ship.** A `dependabot.yml` for weekly grouped
+  updates, including the SHA-pinned release workflow actions, which otherwise never move
+  at all. The release gate now runs `npm audit --omit=dev --audit-level=high`, so a known
+  critical or high advisory against something that reaches users stops a deploy rather
+  than waiting in an inbox. Dev-only findings do not fail the build, because a gate that
+  cries wolf gets ignored on the week it matters.
+- **DESIGN section 10.7** on what this can and cannot catch. Automation covers
+  dependencies; it will never report a break in a cryptographic primitive we implement
+  ourselves, and the document says so rather than implying coverage that does not exist.
+
+These are repository and process changes with no effect on the app, so the released
+build is byte-identical and the warrant canary does not need re-signing.
+
 ## [1.8.2] - 2026-07-26
 
 ### Added

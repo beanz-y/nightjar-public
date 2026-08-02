@@ -62,6 +62,25 @@ jobs:
       - name: Install deps
         run: npm ci
 
+      # Known advisories against the SHIPPED surface block a deploy, rather than
+      # waiting in an inbox for someone to notice. Two deliberate narrowings:
+      #
+      #   --omit=dev     only what reaches users. Dev-tree findings (the vitest and
+      #                  esbuild chain) do not ship, and failing on them trains
+      #                  everyone to ignore a red gate, which costs more than it buys.
+      #   --audit-level=high
+      #                  critical and high stop the release; moderate and low are
+      #                  reported and do not. Otherwise a moderate advisory in a
+      #                  transitive dependency would block an unrelated urgent fix,
+      #                  which is a worse security outcome than the advisory.
+      #
+      # This is one source, not two: npm audit and Dependabot both read the GitHub
+      # Advisory Database. It is a backstop for an alert that was missed, not
+      # independent confirmation, and it cannot see a fix that shipped without an
+      # advisory ever being filed. See SECURITY.md.
+      - name: Audit shipped dependencies
+        run: npm audit --omit=dev --audit-level=high
+
       - name: Typecheck (app + configs)
         run: npm run typecheck
 

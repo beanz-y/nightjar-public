@@ -1,0 +1,52 @@
+# Dependency update PRs. This is the "stay current" half; the ALERTING half is
+# Dependabot alerts plus Private Vulnerability Reporting, which are repository
+# settings rather than a file, and have to be switched on in the GitHub UI.
+#
+# Why bother when the production surface is seven packages: because the point is to
+# never be far from current. A security fix you can take as a patch bump is a
+# same-day deploy; the same fix three majors behind is a migration done under
+# pressure, which is exactly when mistakes get made.
+version: 2
+updates:
+  # The app itself. Grouped so a quiet week is ONE pull request rather than nine,
+  # because a noisy bot is an ignored bot, and an ignored bot will be ignored on the
+  # week it is carrying the update that matters.
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      # The shipped surface, kept on its own so it is never buried under tooling
+      # churn. These are the packages that end up in the bundle users run, and the
+      # crypto ones are load-bearing.
+      production:
+        patterns:
+          - '@noble/*'
+          - '@scure/*'
+          - jsqr
+          - react
+          - react-dom
+      # Everything else moves together.
+      tooling:
+        patterns:
+          - '*'
+        exclude-patterns:
+          - '@noble/*'
+          - '@scure/*'
+          - jsqr
+          - react
+          - react-dom
+
+  # The release workflow pins every action to a full commit SHA, which is the right
+  # thing to do and also means those pins never move on their own. Dependabot bumps
+  # them while KEEPING them SHA-pinned, so this is how a pinned action gets security
+  # fixes at all.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns:
+          - '*'
