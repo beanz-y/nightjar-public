@@ -34,6 +34,13 @@ name: release
 on:
   push:
     branches: [main]
+  # Pull requests run the GATE ONLY (the release job is guarded below), so a
+  # dependency-bump PR is built and tested before anyone merges it, and can never
+  # reach a deploy. Added after a Dependabot PR was built by a second, unpinned
+  # pipeline: validation and deployment must be separable, or the only way to
+  # learn a bump breaks the build is to ship it.
+  pull_request:
+    branches: [main]
   workflow_dispatch:
 
 permissions:
@@ -42,8 +49,9 @@ permissions:
 
 # Two rapid pushes must deploy IN ORDER: a stale build landing last would leave
 # production mismatching the newest Rekor entry and the canary's attested hash.
+# Keyed by ref so a PR's gate run cannot queue behind (or cancel) a real release.
 concurrency:
-  group: nightjar-release
+  group: nightjar-release-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
@@ -106,6 +114,31 @@ jobs:
   release:
     needs: gate
     runs-on: ubuntu-latest
+    # THREE independent guards on the only step that can touch production. Each one
+    # alone would have prevented the incident that motivated them (an automated
+    # dependency PR reaching a live deploy); together they mean a deploy takes a
+    # deliberate human action by design, not by luck.
+    #
+    #  1. `push` only, so a pull_request run can build and test but never deploy.
+    #  2. `main` only, so a workflow_dispatch aimed at a branch cannot ship that
+    #     branch. This job has no branch check of its own otherwise, and dispatch
+    #     accepts any ref.
+    #  3. Never for a bot actor. Dependabot merges, auto-merge rules and any future
+    #     automation are excluded by identity rather than by hoping the other two
+    #     hold. `github.actor` is who triggered the run, so a human merging a
+    #     Dependabot PR is still a human deploy, which is the intent.
+    if: >-
+      github.event_name == 'push' &&
+      github.ref == 'refs/heads/main' &&
+      github.actor != 'dependabot[bot]' &&
+      !endsWith(github.actor, '[bot]')
+    # Fourth guard, and the strongest, but it only works once configured: create an
+    # environment called `production` in repository settings and add a required
+    # reviewer. GitHub then PAUSES this job until a human approves it, and the
+    # Cloudflare credentials below are scoped to that environment rather than being
+    # readable by every workflow run. Nothing else here can enforce that; see
+    # SECURITY.md and DESIGN 10.1.
+    environment: production
     # Job-level permissions (these REPLACE the workflow-level block, so id-token
     # must be repeated for cosign): contents:write lets the final step create the
     # version tag + GitHub Release. The gate job keeps the read-only default.

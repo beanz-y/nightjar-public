@@ -1168,7 +1168,29 @@ fail-closed verification tool that exists.
 Model A: CI builds the artifact in the digest-pinned container, logs its hash to
 Rekor, and `wrangler deploy`s *that same* artifact, so the audited, logged, and
 served bytes are one by construction, and each deploy is a distinct, CI-recorded
-event rather than an in-place edit. Honest limit: this constrains a lazy operator
+event rather than an in-place edit.
+
+> **Model A holds only while CI is the ONLY way to deploy, and that is an operator
+> obligation, not something the code can enforce.** The host's own git-build
+> integration must stay disconnected. It has been connected once by accident, and
+> the failure mode is worth recording rather than rediscovering: it clones the
+> repository, builds in *its* environment rather than the digest-pinned container,
+> and deploys the result, producing no manifest, no release hash, no signature and
+> no Rekor entry. That build happened to FAIL, which is the lucky outcome. Had it
+> succeeded it would have served bytes the transparency chain never saw, while the
+> About screen and the canary went on attesting the hash of the last CI build, so a
+> reader who rebuilt from source and compared would have been checking against an
+> artifact nobody was being served. The verifiability claim in this section would
+> have been silently false, with nothing in the app able to detect it.
+>
+> Guards now in place, in the order they bite: the release job runs only on a
+> `push` to `main`, only for a non-bot actor, and only after a required reviewer
+> approves the `production` environment; pull requests run the test gate but can
+> never reach a deploy; and the public hostname is declared in `wrangler.jsonc`
+> rather than left in dashboard state, because the same incident removed the custom
+> domain along with the configuration. None of this constrains a compelled
+> operator, per the honest limit below. It constrains ACCIDENTS, which turned out
+> to be the realistic threat to this property. Honest limit: this constrains a lazy operator
 and outside tamperers, but buys ~nothing against a compelled operator, who owns
 the same Worker + edge that serves the assets and can mutate responses or deploy
 off-pipeline, since it controls the edge. Show the release **version tag** and the operator's

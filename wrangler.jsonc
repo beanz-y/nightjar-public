@@ -31,6 +31,14 @@
     { "tag": "v1", "new_sqlite_classes": ["Directory", "Inbox"] }
   ],
 
+  // The public hostname, declared HERE rather than only in the dashboard. Anything
+  // this file does not state is liable to be reconciled away on deploy, which is
+  // the same reason `observability` is pinned below, and it is not hypothetical:
+  // a deploy from a second pipeline once took the custom domain with it and the
+  // hostname stopped resolving. Declaring it makes every deploy ASSERT the domain
+  // instead of leaving it to whatever the dashboard happened to hold.
+  "routes": [{ "pattern": "nightjar.chat", "custom_domain": true }],
+
   // Workers Logs invocation logging is OFF by design. The auto-generated invocation
   // log records the request URL, client IP, geo, and TLS fingerprint for every
   // connection: metadata a privacy-first messenger deliberately does not retain.

@@ -11,6 +11,32 @@ release tags cut by the deploy pipeline. Dates are the tag dates.
 
 ## [Unreleased]
 
+### Fixed
+- **Closed an accidental second way to deploy.** The host's own git-build integration
+  had been connected alongside the release pipeline. It builds outside the pinned
+  container and produces no release hash, no signature and no transparency-log entry,
+  so a deploy through it would have served code the verification chain never saw while
+  the app carried on attesting the previous build's hash. It is disconnected, and the
+  release job now refuses to run except on a push to the main branch, by a person
+  rather than a bot, after an approval. Pull requests are built and tested but can
+  never deploy. The public hostname is also now declared in the deploy config instead
+  of living only in dashboard settings, because the same incident removed it.
+
+### Changed
+- **Cleared every open dependency advisory** (one critical, six high, three moderate),
+  by moving the test tooling forward: Vitest 2 to 4, the Cloudflare Workers test pool
+  0.8 to 0.20, and Wrangler with its types alongside. All of them were in the test and
+  build tooling, none in anything users run, so the shipped code was never affected. They
+  were worth clearing anyway: a Security tab that is permanently red is one nobody reads
+  on the day it matters.
+- The upgrade is **provably invisible in the released app**. Every one of the seven
+  production dependencies is byte-identical (same version, same integrity hash), and the
+  release hash of the built artifact is unchanged, so this needs no canary re-sign. The
+  hash was recorded before the upgrade and compared after, rather than assumed.
+- Vitest 4 reworked how test pools are wired, so the Workers integration is now a Vite
+  plugin instead of a config wrapper, and the app project asks for Node types explicitly
+  where Vitest 2 used to supply them by accident. Neither changes what is tested.
+
 ### Added
 - **A private way to report a security problem.** [SECURITY.md](SECURITY.md) documents
   GitHub Private Vulnerability Reporting as the preferred route, with `admin@nightjar.chat`
@@ -21,8 +47,10 @@ release tags cut by the deploy pipeline. Dates are the tag dates.
   Reports about the documentation are explicitly welcome: for this project a claim the
   code cannot support is a real issue.
 - **Alerting for the dependencies we ship.** A `dependabot.yml` for weekly grouped
-  updates, including the SHA-pinned release workflow actions, which otherwise never move
-  at all. The release gate now runs `npm audit --omit=dev --audit-level=high`, so a known
+  updates, including the SHA-pinned release workflow actions and the digest-pinned build
+  container, neither of which moves on its own. That pinning is what makes a rebuild
+  byte-identical, and the price of it is that a Node or Debian fix never arrives unless
+  a person bumps the pin, with nothing to remind them. Now something does. The release gate now runs `npm audit --omit=dev --audit-level=high`, so a known
   critical or high advisory against something that reaches users stops a deploy rather
   than waiting in an inbox. Dev-only findings do not fail the build, because a gate that
   cries wolf gets ignored on the week it matters.

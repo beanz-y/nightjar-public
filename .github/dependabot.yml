@@ -50,3 +50,13 @@ updates:
       actions:
         patterns:
           - '*'
+
+  # The reproducible-build container is pinned to an image DIGEST, which is what makes
+  # a rebuild byte-identical. The cost of that guarantee is that the pin never moves,
+  # so a Node or Debian security fix does not reach the build unless a person bumps it,
+  # and nothing would otherwise remind anyone to. This is that reminder. Take the PR
+  # deliberately: it changes the artifact, so it needs a release and a canary re-sign.
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
