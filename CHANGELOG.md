@@ -21,6 +21,11 @@ release tags cut by the deploy pipeline. Dates are the tag dates.
   rather than a bot, after an approval. Pull requests are built and tested but can
   never deploy. The public hostname is also now declared in the deploy config instead
   of living only in dashboard settings, because the same incident removed it.
+- **The deploy now uses the project's own pinned tooling.** It previously asked a
+  third-party action to fetch its own copy of the deploy tool at a hardcoded version,
+  which drifted from the one in the lockfile and broke the release outright. There is
+  now one version instead of two, taken from the same audited lockfile that built and
+  hashed the release, and one less third party holding the deployment credential.
 
 ### Changed
 - **Cleared every open dependency advisory** (one critical, six high, three moderate),

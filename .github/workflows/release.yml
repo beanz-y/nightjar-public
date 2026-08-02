@@ -209,19 +209,29 @@ jobs:
       - name: Install deps for the Worker bundle
         run: npm ci
 
+      # Deploy with the project's OWN wrangler, the one `npm ci` just installed from
+      # the committed lockfile. This used to go through cloudflare/wrangler-action
+      # with a hardcoded `wranglerVersion`, and that pin is what broke this step: it
+      # asked the action to install a wrangler DIFFERENT from the lockfile's, into a
+      # tree that already had the lockfile's, and npm refused on a peer conflict.
+      #
+      # Two versions of the same tool in one job was the actual bug, so the fix is to
+      # have exactly one. It also suits Model A better: the bytes are deployed by the
+      # same audited, lockfile-pinned toolchain that built and hashed them, rather
+      # than by something fetched at deploy time. And it takes a third-party action
+      # off the one step that holds the Cloudflare credential, which after an
+      # accidental second pipeline reached production is a trade worth making.
+      #
+      # `npx --no` will NOT reach the network: it runs the local binary or fails.
+      # wrangler reads both credentials from the environment natively.
+      # No build here: `deploy` uploads the already-built ./dist assets + the Worker.
+      # keep_vars:true (wrangler.jsonc) preserves dashboard vars/secrets
+      # (ADMIN_TOKEN, VAPID_JWK, VAPID_SUBJECT, CANARY_JSON).
       - name: Deploy the exact hashed artifact (Model A)
-        uses: cloudflare/wrangler-action@9681c2997648301493e78cacbfb790a9f19c833f # v3.9.0
-        with:
-          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          # Pin wrangler to the project's major version: wrangler-action's default
-          # (3.90.0) predates wrangler.jsonc support and fails with "Missing
-          # entry-point" because it never reads the `main` field.
-          wranglerVersion: '4.35.0'
-          # No build here: wrangler deploy uploads the already-built ./dist assets
-          # + the Worker. keep_vars:true (wrangler.jsonc) preserves dashboard
-          # vars/secrets (ADMIN_TOKEN, VAPID_JWK, CANARY_JSON).
-          command: deploy
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: npx --no wrangler deploy
 
       # No tag on a main push, so publish the transparency artifacts to the run
       # instead of a GitHub Release. Rekor (append-only) is the real anchor; these
