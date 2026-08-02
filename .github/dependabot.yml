@@ -6,28 +6,48 @@
 # never be far from current. A security fix you can take as a patch bump is a
 # same-day deploy; the same fix three majors behind is a migration done under
 # pressure, which is exactly when mistakes get made.
+#
+# THE ORGANISING RULE: group patch and minor, never group majors.
+#
+# Every group below is scoped to `update-types: [minor, patch]`. A major that would
+# otherwise match a group therefore matches NO group, and Dependabot opens it as its
+# own pull request. That is deliberate, and it is the difference between a queue you
+# can act on and one you stop reading:
+#
+#   - Patch and minor arrive batched and boring. These are the ones that carry the
+#     security fixes, and they should be cheap to take.
+#   - Majors arrive alone, each judged on its own terms. A crypto-core rewrite and a
+#     UI framework rewrite must never share a pull request, because the only possible
+#     verdict on that pull request is "no".
 version: 2
 updates:
-  # The app itself. Grouped so a quiet week is ONE pull request rather than nine,
-  # because a noisy bot is an ignored bot, and an ignored bot will be ignored on the
-  # week it is carrying the update that matters.
   - package-ecosystem: npm
     directory: /
     schedule:
       interval: weekly
-    open-pull-requests-limit: 5
+    # Raised from the default 5: majors now arrive individually, so the queue is
+    # wider by design and a real one must not be crowded out by a cap.
+    open-pull-requests-limit: 10
     groups:
-      # The shipped surface, kept on its own so it is never buried under tooling
-      # churn. These are the packages that end up in the bundle users run, and the
-      # crypto ones are load-bearing.
-      production:
+      # The crypto core, alone. These implement the protocol; a major here is a
+      # migration measured against the pinned known-answer tests (if a single output
+      # byte moved, every existing session breaks and cannot be recovered), so it is
+      # never allowed to arrive attached to anything else.
+      crypto:
         patterns:
           - '@noble/*'
           - '@scure/*'
+        update-types: [minor, patch]
+      # The rest of what users actually run.
+      runtime:
+        patterns:
           - jsqr
           - react
           - react-dom
-      # Everything else moves together.
+        update-types: [minor, patch]
+      # Build and test tooling. A major here (a compiler or a bundler) changes the
+      # emitted bytes, so it means a new release hash, a canary re-sign and a fresh
+      # reproducibility check. That is a decision, not a batch.
       tooling:
         patterns:
           - '*'
@@ -37,11 +57,13 @@ updates:
           - jsqr
           - react
           - react-dom
+        update-types: [minor, patch]
 
   # The release workflow pins every action to a full commit SHA, which is the right
   # thing to do and also means those pins never move on their own. Dependabot bumps
   # them while KEEPING them SHA-pinned, so this is how a pinned action gets security
-  # fixes at all.
+  # fixes at all. Same rule: majors alone, so the action that signs into the
+  # transparency log is never waved through alongside a checkout bump.
   - package-ecosystem: github-actions
     directory: /
     schedule:
@@ -50,13 +72,25 @@ updates:
       actions:
         patterns:
           - '*'
+        update-types: [minor, patch]
 
   # The reproducible-build container is pinned to an image DIGEST, which is what makes
   # a rebuild byte-identical. The cost of that guarantee is that the pin never moves,
   # so a Node or Debian security fix does not reach the build unless a person bumps it,
   # and nothing would otherwise remind anyone to. This is that reminder. Take the PR
   # deliberately: it changes the artifact, so it needs a release and a canary re-sign.
+  #
+  # Majors are IGNORED here, on purpose. The build image should track a Node LTS line,
+  # and Dependabot offers whatever is newest regardless: it proposed Node 26 while 26
+  # was still Current (LTS from 2026-10-28) and while `.nvmrc` said 22, which would
+  # have split the container from the runtime the project pins. Moving major is a
+  # decision made by a person who also updates `.nvmrc` in the same commit. What this
+  # still delivers, which is the part that matters, is patch and minor security fixes
+  # within the pinned major.
   - package-ecosystem: docker
     directory: /
     schedule:
       interval: weekly
+    ignore:
+      - dependency-name: node
+        update-types: ['version-update:semver-major']
