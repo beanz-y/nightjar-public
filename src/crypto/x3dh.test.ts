@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { bytesToHex } from '@noble/hashes/utils'
+import { bytesToHex } from '@noble/hashes/utils.js'
 import { SPK_MAX_AGE_MS, TAG_IDKBIND, TAG_SPK } from './constants'
 import { type Identity, deriveUserId, generateIdentity } from './identity'
 import {

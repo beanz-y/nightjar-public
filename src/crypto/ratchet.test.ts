@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { bytesToHex } from '@noble/hashes/utils'
+import { bytesToHex } from '@noble/hashes/utils.js'
 import { MAX_SKIP } from './constants'
 import { generateIdentity } from './identity'
 import { type KeyPair, bytesEqual, utf8, x25519Public } from './primitives'

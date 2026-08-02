@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { bytesToHex, hexToBytes } from '@noble/hashes/utils'
+import { bytesToHex, hexToBytes } from '@noble/hashes/utils.js'
 import { AUTH_CHALLENGE_TTL_MS } from '../crypto/constants'
 import { deriveUserId, generateIdentity } from '../crypto/identity'
 import { buildChallenge, challengeSigningInput, verifyAndSignChallenge, verifyAuthResponse } from './auth'

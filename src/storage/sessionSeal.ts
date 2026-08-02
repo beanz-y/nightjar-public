@@ -26,7 +26,7 @@
 // ordering keep working on a row that will not open. Only {to, env, silent} is
 // sealed, which is the part that identifies a peer.
 
-import { bytesToHex } from '@noble/hashes/utils'
+import { bytesToHex } from '@noble/hashes/utils.js'
 import { INFO_SESSION, SESSION_FORMAT_VERSION, SESSION_SALT_BYTES } from '../crypto/constants'
 import {
   XCHACHA_KEY_BYTES,

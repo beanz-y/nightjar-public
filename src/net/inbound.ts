@@ -22,7 +22,7 @@
 //     redelivery. After POISON_MAX_ATTEMPTS it is marked seen and dropped, so a
 //     permanently-undecryptable envelope is not redelivered forever (DESIGN 5.3).
 
-import { bytesToHex } from '@noble/hashes/utils'
+import { bytesToHex } from '@noble/hashes/utils.js'
 import { POISON_MAX_ATTEMPTS } from '../crypto/constants'
 import { type Identity, deriveUserId } from '../crypto/identity'
 import { decodeMessage } from '../crypto/message'

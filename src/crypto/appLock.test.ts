@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { bytesToHex } from '@noble/hashes/utils'
+import { bytesToHex } from '@noble/hashes/utils.js'
 import { hash256 } from './primitives'
 import {
   type Argon2Kdf,

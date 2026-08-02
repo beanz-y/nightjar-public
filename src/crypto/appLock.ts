@@ -19,7 +19,7 @@
 // the WebAuthn calls live in the storage/UI layers. Argon2id is an injectable seam
 // so the UI can run it in a Web Worker and tests can stub it.
 
-import { argon2id } from '@noble/hashes/argon2'
+import { argon2id } from '@noble/hashes/argon2.js'
 import {
   INFO_LOCK_WRAP,
   LOCK_ARGON2_M_KIB,

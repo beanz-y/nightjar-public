@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { bytesToHex } from '@noble/hashes/utils'
+import { bytesToHex } from '@noble/hashes/utils.js'
 import { hash256 } from '../crypto/primitives'
 import { AppLockStore, AppLockedError } from './appLockStore'
 import { HistoryStore, type HistoryMessage } from './historyStore'

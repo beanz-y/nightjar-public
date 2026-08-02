@@ -17,7 +17,7 @@
 // that some row is a failed send) and keeping it out lets a status update avoid a
 // re-seal.
 
-import { bytesToHex } from '@noble/hashes/utils'
+import { bytesToHex } from '@noble/hashes/utils.js'
 import { HISTORY_FORMAT_VERSION, HISTORY_SALT_BYTES, INFO_HISTORY } from '../crypto/constants'
 import {
   XCHACHA_KEY_BYTES,

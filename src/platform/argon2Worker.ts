@@ -3,7 +3,7 @@
 // UI. Same-origin module worker; allowed under the strict CSP (default-src
 // 'self'). Input and output are structured-clone / transfer only.
 
-import { argon2id } from '@noble/hashes/argon2'
+import { argon2id } from '@noble/hashes/argon2.js'
 
 interface KdfRequest {
   pass: Uint8Array

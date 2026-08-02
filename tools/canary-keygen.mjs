@@ -9,7 +9,7 @@
 //     CANARY_PUBKEY_B64 (verifier -> `unconfigured`, benign) and re-enable with a
 //     fresh key later (DESIGN 10). Never keep a copy on the relay host.
 
-import { ed25519 } from '@noble/curves/ed25519'
+import { ed25519 } from '@noble/curves/ed25519.js'
 import { base64urlnopad } from '@scure/base'
 
 const priv = ed25519.utils.randomSecretKey()

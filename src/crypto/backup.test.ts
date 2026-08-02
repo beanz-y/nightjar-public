@@ -6,7 +6,7 @@
 // which is why this file's slowest test runs a real 64 MiB derivation.
 
 import { describe, expect, it } from 'vitest'
-import { bytesToHex } from '@noble/hashes/utils'
+import { bytesToHex } from '@noble/hashes/utils.js'
 import { PASSPHRASE_MIN_LENGTH } from './constants'
 import { generateIdentity } from './identity'
 import type { Contact } from '../trust/contactStore'

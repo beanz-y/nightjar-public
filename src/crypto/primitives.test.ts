@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { bytesToHex, hexToBytes, utf8ToBytes } from '@noble/hashes/utils'
+import { bytesToHex, hexToBytes, utf8ToBytes } from '@noble/hashes/utils.js'
 import {
   aeadOpen,
   aeadSeal,

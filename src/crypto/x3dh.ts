@@ -5,7 +5,7 @@
 // This module is transport-agnostic: the initiator produces an InitialHeader,
 // the responder consumes one. Moving them over the wire is P4.
 
-import { bytesToHex } from '@noble/hashes/utils'
+import { bytesToHex } from '@noble/hashes/utils.js'
 import { INFO_X3DH, VERSION, VERSION_FLOOR } from './constants'
 import { type Identity, verifyIdkbind } from './identity'
 import {

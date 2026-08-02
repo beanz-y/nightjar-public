@@ -22,7 +22,7 @@
 // minutes; the payload is size- and shape-checked before anything is trusted,
 // and the identity bytes go through the fail-closed deserializeIdentity.
 
-import { argon2id } from '@noble/hashes/argon2'
+import { argon2id } from '@noble/hashes/argon2.js'
 import {
   BACKUP_ARGON2_M_KIB,
   BACKUP_ARGON2_P,

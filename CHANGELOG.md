@@ -11,6 +11,8 @@ release tags cut by the deploy pipeline. Dates are the tag dates.
 
 ## [Unreleased]
 
+## [1.8.3] - 2026-08-02
+
 ### Fixed
 - **Closed an accidental second way to deploy.** The host's own git-build integration
   had been connected alongside the release pipeline. It builds outside the pinned
@@ -28,6 +30,17 @@ release tags cut by the deploy pipeline. Dates are the tag dates.
   hashed the release, and one less third party holding the deployment credential.
 
 ### Changed
+- **The cryptography libraries moved to their v2 line.** `@noble/curves`, `@noble/hashes`,
+  `@noble/ciphers` and `@scure/base` go from 1.x to 2.2.0, each carrying a spring 2026
+  upstream self-audit plus TypeScript and tree-shaking fixes. The only change the new
+  line demands of this codebase is explicit `.js` module paths in imports. The proof it
+  changes nothing on the wire: every pinned known-answer test passes unchanged (user ids,
+  safety numbers, X3DH secrets, ratchet message bytes, sealed history and backups), and
+  those tests exist precisely so that a primitive drifting by a single byte fails loudly
+  instead of silently stranding every existing session.
+- **The reproducible-build container moved from Node 22.16.0 to 22.23.2**, staying inside
+  the pinned LTS line, with the image digest re-pinned and `.nvmrc` moved in the same
+  commit so the container, the CI runners and local dev keep agreeing on one Node.
 - **Cleared every open dependency advisory** (one critical, six high, three moderate),
   by moving the test tooling forward: Vitest 2 to 4, the Cloudflare Workers test pool
   0.8 to 0.20, and Wrangler with its types alongside. All of them were in the test and
@@ -63,8 +76,9 @@ release tags cut by the deploy pipeline. Dates are the tag dates.
   dependencies; it will never report a break in a cryptographic primitive we implement
   ourselves, and the document says so rather than implying coverage that does not exist.
 
-These are repository and process changes with no effect on the app, so the released
-build is byte-identical and the warrant canary does not need re-signing.
+The repository and process changes here shipped byte-identical builds when they first
+landed. The library and container upgrades do change the built app, so this release
+carries a new release hash and the warrant canary is re-signed for it.
 
 ## [1.8.2] - 2026-07-26
 

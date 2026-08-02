@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it } from 'vitest'
-import { bytesToHex } from '@noble/hashes/utils'
+import { bytesToHex } from '@noble/hashes/utils.js'
 import { POISON_MAX_ATTEMPTS } from '../crypto/constants'
 import { type Identity, generateIdentity } from '../crypto/identity'
 import { encodeDeleteMessage, encodeTextMessage, newMsgId } from '../crypto/message'

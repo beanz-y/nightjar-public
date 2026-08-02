@@ -4,11 +4,11 @@
 // @noble is the SOLE X25519/Ed25519 provider (DESIGN 8.1, P0): we do not mix in
 // WebCrypto for curve ops, to avoid a two-provider divergence edge case.
 
-import { ed25519, x25519 } from '@noble/curves/ed25519'
-import { sha256, sha512 } from '@noble/hashes/sha2'
-import { hkdf } from '@noble/hashes/hkdf'
-import { hmac } from '@noble/hashes/hmac'
-import { xchacha20poly1305 } from '@noble/ciphers/chacha'
+import { ed25519, x25519 } from '@noble/curves/ed25519.js'
+import { sha256, sha512 } from '@noble/hashes/sha2.js'
+import { hkdf } from '@noble/hashes/hkdf.js'
+import { hmac } from '@noble/hashes/hmac.js'
+import { xchacha20poly1305 } from '@noble/ciphers/chacha.js'
 import { base32 } from '@scure/base'
 
 const TEXT = new TextEncoder()

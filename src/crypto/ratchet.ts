@@ -15,7 +15,7 @@
 // Atomic persistence and the single-writer lock are P3; wiring the initial
 // message + X3DH replay guard onto the wire is P4.
 
-import { bytesToHex, hexToBytes } from '@noble/hashes/utils'
+import { bytesToHex, hexToBytes } from '@noble/hashes/utils.js'
 import { INFO_DR_ROOT, INFO_MSG_KEY, MAX_SKIP, SKIPPED_KEY_EXPIRY_MS, VERSION } from './constants'
 import {
   type KeyPair,

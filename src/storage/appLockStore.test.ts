@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { bytesToHex } from '@noble/hashes/utils'
+import { bytesToHex } from '@noble/hashes/utils.js'
 import { type Argon2Kdf, AppLockAuthError } from '../crypto/appLock'
 import { hash256 } from '../crypto/primitives'
 import { MemoryKeyStore } from './keystore'

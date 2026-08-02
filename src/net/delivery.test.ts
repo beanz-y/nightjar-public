@@ -13,7 +13,7 @@
 // drive the client's own status path directly.
 
 import { beforeEach, describe, expect, it } from 'vitest'
-import { bytesToHex } from '@noble/hashes/utils'
+import { bytesToHex } from '@noble/hashes/utils.js'
 import { generateIdentity } from '../crypto/identity'
 import { hash256 } from '../crypto/primitives'
 import { AppLockStore } from '../storage/appLockStore'

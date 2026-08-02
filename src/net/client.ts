@@ -13,7 +13,7 @@
 //     relay should stop redelivering): it is acked like a duplicate.
 //   - One-time prekeys auto-replenish when the local stock runs low.
 
-import { bytesToHex, hexToBytes } from '@noble/hashes/utils'
+import { bytesToHex, hexToBytes } from '@noble/hashes/utils.js'
 import { type Identity, deriveUserId } from '../crypto/identity'
 import type { PushSubscriptionInfo } from '../platform'
 import { decodeMessage, encodeDeleteMessage, encodeTextMessage, newMsgId } from '../crypto/message'

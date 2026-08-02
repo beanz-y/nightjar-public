@@ -26,7 +26,7 @@ import {
 } from '../platform/webpush'
 import { biometricAvailable, enrollBiometric, unlockBiometric } from '../platform/webauthn'
 import { openBackup, parseBackupHeader, sealBackup } from '../crypto/backup'
-import { bytesToHex } from '@noble/hashes/utils'
+import { bytesToHex } from '@noble/hashes/utils.js'
 import { newMsgId } from '../crypto/message'
 import { createBackupKdf } from '../platform/backupKdf'
 import { AppLockStore, type EnrollMethod } from '../storage/appLockStore'

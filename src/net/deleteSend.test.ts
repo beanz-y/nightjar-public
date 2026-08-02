@@ -13,7 +13,7 @@
 // swallowed (the envelope stays queued) exactly as on a real dropped socket.
 
 import { beforeEach, describe, expect, it } from 'vitest'
-import { bytesToHex } from '@noble/hashes/utils'
+import { bytesToHex } from '@noble/hashes/utils.js'
 import { type Identity, generateIdentity } from '../crypto/identity'
 import { hash256 } from '../crypto/primitives'
 import { type FetchedBundle, OWN_BUNDLE_VERSION, buildOwnBundle } from '../crypto/prekeys'

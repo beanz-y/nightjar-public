@@ -14,7 +14,7 @@
 // exists only for tests and prints a loud warning; never use it for a real canary.
 
 import { fileURLToPath } from 'node:url'
-import { ed25519 } from '@noble/curves/ed25519'
+import { ed25519 } from '@noble/curves/ed25519.js'
 import { base64urlnopad } from '@scure/base'
 
 const TAG_CANARY = 'Nightjar-canary-v1'
