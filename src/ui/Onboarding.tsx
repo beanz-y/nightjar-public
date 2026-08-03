@@ -6,8 +6,10 @@
 // backup instead (P8), which replaces the freshly generated throwaway identity.
 
 import { useState } from 'react'
+import { LinkNewDevice } from './LinkNewDevice'
 import { QrScanner } from './QrScanner'
 import { RestoreScreen } from './RestoreScreen'
+import type { LinkState } from './useNightjar'
 
 interface Props {
   userId: string
@@ -15,15 +17,49 @@ interface Props {
   connected: boolean
   restoreBusy: boolean
   restoreError: string | null
+  linkState: LinkState
   onJoin: (input: string) => void
   onRestore: (file: File, passphrase: string) => void
+  /** Start showing a link code and listening for a transfer (Sesame B1). */
+  onStartLinking: () => { code: string; deviceId: string } | null
+  onCancelLinking: () => void
+  onLinkTransfer: (blob: Uint8Array) => Promise<boolean>
   onAbout: () => void
 }
 
-export function Onboarding({ userId, prefill, connected, restoreBusy, restoreError, onJoin, onRestore, onAbout }: Props) {
+export function Onboarding({
+  userId,
+  prefill,
+  connected,
+  restoreBusy,
+  restoreError,
+  linkState,
+  onJoin,
+  onRestore,
+  onStartLinking,
+  onCancelLinking,
+  onLinkTransfer,
+  onAbout,
+}: Props) {
   const [input, setInput] = useState(prefill)
   const [restoring, setRestoring] = useState(false)
   const [scanning, setScanning] = useState(false)
+  const [linkCode, setLinkCode] = useState<{ code: string; deviceId: string } | null>(null)
+
+  if (linkCode) {
+    return (
+      <LinkNewDevice
+        code={linkCode.code}
+        deviceId={linkCode.deviceId}
+        linkState={linkState}
+        onTransfer={onLinkTransfer}
+        onCancel={() => {
+          setLinkCode(null)
+          onCancelLinking()
+        }}
+      />
+    )
+  }
 
   if (restoring) {
     return (
@@ -96,7 +132,23 @@ export function Onboarding({ userId, prefill, connected, restoreBusy, restoreErr
       <p className="mono break small yourid">{userId}</p>
 
       <p className="small">
-        Already have a Nightjar identity?{' '}
+        Already use Nightjar on another device?{' '}
+        <button
+          className="link"
+          disabled={!connected}
+          onClick={() => {
+            const started = onStartLinking()
+            if (started) setLinkCode(started)
+          }}
+        >
+          add this device to that account
+        </button>
+        . It joins the account you already have, so people reach you on both. It needs no invite, and it starts with
+        none of your existing messages.
+      </p>
+
+      <p className="small">
+        Lost the device you used before?{' '}
         <button className="link" onClick={() => setRestoring(true)}>
           restore from a backup file
         </button>

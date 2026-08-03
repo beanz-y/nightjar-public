@@ -1,10 +1,17 @@
-// Self-contained, dependency-free QR Code generator (BYTE mode, EC level M).
+// Self-contained, dependency-free QR Code generator (BYTE mode, EC level L or M).
 //
 // This file implements the QR encoding pipeline from scratch using only
 // standard JavaScript built-ins (no npm imports), so it is safe to run under a
-// strict Content-Security-Policy. It supports symbol versions 1..10, which at
-// error-correction level M comfortably covers any payload below ~180 bytes
-// (the intended use is short safety-number / invite URLs, always < 200 chars).
+// strict Content-Security-Policy. It supports every symbol version, 1 to 40,
+// which spans two quite different uses:
+//
+//   - a short code a human scans once (a safety number, an invite, a device
+//     link code): a few hundred bytes at EC level M, robust against a scuffed
+//     screen and an awkward angle;
+//   - a frame of an optical transfer stream (src/net/fountain.ts): up to about
+//     2.9 KB at level L, where density matters and robustness does not, because
+//     a frame that fails to decode is simply a dropped frame the next one
+//     repairs.
 //
 // Reference: ISO/IEC 18004 (QR Code). The structure mirrors the well-known
 // reference decomposition: bit stream assembly, Reed-Solomon error correction
@@ -25,33 +32,105 @@ interface VersionEcInfo {
   g2DataPerBlock: number
 }
 
-// EC level M, versions 1..10. Values are taken directly from the ISO/IEC 18004
-// error-correction characteristics table. Index 0 is unused (versions are
-// 1-based); we start the array at version 1.
-const VERSION_EC_M: Record<number, VersionEcInfo> = {
-  1: { ecPerBlock: 10, g1Blocks: 1, g1DataPerBlock: 16, g2Blocks: 0, g2DataPerBlock: 0 },
-  2: { ecPerBlock: 16, g1Blocks: 1, g1DataPerBlock: 28, g2Blocks: 0, g2DataPerBlock: 0 },
-  3: { ecPerBlock: 26, g1Blocks: 1, g1DataPerBlock: 44, g2Blocks: 0, g2DataPerBlock: 0 },
-  4: { ecPerBlock: 18, g1Blocks: 2, g1DataPerBlock: 32, g2Blocks: 0, g2DataPerBlock: 0 },
-  5: { ecPerBlock: 24, g1Blocks: 2, g1DataPerBlock: 43, g2Blocks: 0, g2DataPerBlock: 0 },
-  6: { ecPerBlock: 16, g1Blocks: 4, g1DataPerBlock: 27, g2Blocks: 0, g2DataPerBlock: 0 },
-  7: { ecPerBlock: 18, g1Blocks: 4, g1DataPerBlock: 31, g2Blocks: 0, g2DataPerBlock: 0 },
-  8: { ecPerBlock: 22, g1Blocks: 2, g1DataPerBlock: 38, g2Blocks: 2, g2DataPerBlock: 39 },
-  9: { ecPerBlock: 22, g1Blocks: 3, g1DataPerBlock: 36, g2Blocks: 2, g2DataPerBlock: 37 },
-  10: { ecPerBlock: 26, g1Blocks: 4, g1DataPerBlock: 43, g2Blocks: 1, g2DataPerBlock: 44 },
+/** The two error-correction levels this encoder offers.
+ *
+ *  M (~15% recoverable) is the default and what every human-facing code uses: a
+ *  safety number or an invite is scanned once, off a screen that may be scuffed
+ *  or at an angle, and robustness matters more than size.
+ *
+ *  L (~7%) exists for the optical transfer stream, where the tradeoff inverts.
+ *  There, a frame that fails to decode is not a failure at all: the fountain
+ *  layer treats it as a dropped frame and the next one repairs it. Spending
+ *  modules on error correction inside a frame buys nothing that another frame
+ *  does not buy more cheaply, so L carries more bytes per frame instead. */
+export type QrEcLevel = 'L' | 'M'
+
+// The two tables the ISO/IEC 18004 characteristics really come down to:
+// error-correction codewords per block, and blocks per symbol. Everything else
+// in that table (data codewords, the two block groups and their sizes) is
+// DERIVED below rather than transcribed, because eighty hand-copied rows is
+// eighty chances to introduce a typo that only shows up as an unscannable code
+// at one particular size. A test pins the derivation against the ten rows this
+// file used to carry by hand.
+// Index 0 is unused; versions are 1-based.
+const EC_PER_BLOCK: Record<QrEcLevel, number[]> = {
+  L: [
+    0, 7, 10, 15, 20, 26, 18, 20, 24, 30, 18, 20, 24, 26, 30, 22, 24, 28, 30, 28, 28, 28, 28, 30, 30, 26, 28, 30, 30,
+    30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30,
+  ],
+  M: [
+    0, 10, 16, 26, 18, 24, 16, 18, 22, 22, 26, 30, 22, 22, 24, 24, 28, 28, 26, 26, 26, 26, 28, 28, 28, 28, 28, 28, 28,
+    28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28,
+  ],
+}
+const EC_BLOCKS: Record<QrEcLevel, number[]> = {
+  L: [
+    0, 1, 1, 1, 1, 1, 2, 2, 2, 2, 4, 4, 4, 4, 4, 6, 6, 6, 6, 7, 8, 8, 9, 9, 10, 12, 12, 12, 13, 14, 15, 16, 17, 18, 19,
+    19, 20, 21, 22, 24, 25,
+  ],
+  M: [
+    0, 1, 1, 1, 2, 2, 4, 4, 4, 5, 5, 5, 8, 9, 9, 10, 10, 11, 13, 14, 16, 17, 17, 18, 20, 21, 23, 25, 26, 28, 29, 31, 33,
+    35, 37, 38, 40, 43, 45, 47, 49,
+  ],
 }
 
-const MIN_VERSION = 1
-const MAX_VERSION = 10
+/** Format-information value for each level (bits 3-4 of the format field). */
+const EC_FORMAT_BITS: Record<QrEcLevel, number> = { L: 0b01, M: 0b00 }
 
-/** Total number of data codewords available for a version at EC level M. */
+const MIN_VERSION = 1
+const MAX_VERSION = 40
+
+/**
+ * Codewords a symbol holds in total, from the module count.
+ *
+ * The alignment-pattern correction is the fiddly part: patterns overlap the
+ * timing rows, and the three that would collide with the finders are absent, so
+ * the subtraction is not simply "patterns times 25".
+ */
+function totalCodewords(version: number): number {
+  let bits = (16 * version + 128) * version + 64
+  if (version >= 2) {
+    const numAlign = Math.floor(version / 7) + 2
+    bits -= (25 * numAlign - 10) * numAlign - 55
+    if (version >= 7) bits -= 36 // the two version-information blocks
+  }
+  return Math.floor(bits / 8)
+}
+
+/**
+ * The block layout for one version and level, derived rather than transcribed.
+ *
+ * Blocks are as equal as they can be: the remainder is spread one codeword at a
+ * time over the LAST blocks, which is what the two "groups" in the published
+ * table are. So group 1 is the short blocks and group 2 the long ones, and a
+ * version whose data divides evenly simply has no group 2.
+ */
+function versionEcInfo(version: number, level: QrEcLevel): VersionEcInfo {
+  const ecPerBlock = EC_PER_BLOCK[level][version]
+  const blocks = EC_BLOCKS[level][version]
+  const raw = totalCodewords(version)
+  const shortBlocks = blocks - (raw % blocks)
+  const shortLen = Math.floor(raw / blocks)
+  const longBlocks = blocks - shortBlocks
+  return {
+    ecPerBlock,
+    g1Blocks: shortBlocks,
+    g1DataPerBlock: shortLen - ecPerBlock,
+    g2Blocks: longBlocks,
+    // Zero rather than a size nothing will read, so "no second group" is stated
+    // once instead of being implied by a block count somewhere else.
+    g2DataPerBlock: longBlocks === 0 ? 0 : shortLen - ecPerBlock + 1,
+  }
+}
+
+/** Total number of data codewords available for a version at a given level. */
 function dataCodewordCount(info: VersionEcInfo): number {
   return info.g1Blocks * info.g1DataPerBlock + info.g2Blocks * info.g2DataPerBlock
 }
 
 /** Byte-mode character-count indicator width in bits for a given version. */
 function charCountBits(version: number): number {
-  // Byte mode: 8 bits for versions 1..9, 16 bits for versions 10..26.
+  // Byte mode: 8 bits for versions 1..9, 16 bits for versions 10..40.
   return version <= 9 ? 8 : 16
 }
 
@@ -215,6 +294,7 @@ class QrSymbol {
   constructor(
     readonly version: number,
     private readonly codewords: number[],
+    private readonly level: QrEcLevel = 'M',
   ) {
     this.size = version * 4 + 17
     this.modules = Array.from({ length: this.size }, () => new Array<boolean>(this.size).fill(false))
@@ -375,8 +455,8 @@ class QrSymbol {
   // --- Format & version information ---------------------------------------
 
   private drawFormatBits(mask: number): void {
-    // EC level M is 0b00; combine with the 3-bit mask, then BCH(15,5).
-    const data = (0b00 << 3) | mask
+    // The level's 2-bit field, then the 3-bit mask, then BCH(15,5).
+    const data = (EC_FORMAT_BITS[this.level] << 3) | mask
     let rem = data
     for (let i = 0; i < 10; i++) {
       rem = (rem << 1) ^ ((rem >>> 9) * 0x537)
@@ -548,29 +628,38 @@ function alignmentPatternPositions(version: number): number[] {
   return result
 }
 
-/** Pick the smallest supported version whose EC-level-M capacity fits `byteLen`. */
-function chooseVersion(byteLen: number): { version: number; info: VersionEcInfo } {
+/** Pick the smallest version whose capacity at `level` fits `byteLen`. */
+function chooseVersion(byteLen: number, level: QrEcLevel): { version: number; info: VersionEcInfo } {
   for (let version = MIN_VERSION; version <= MAX_VERSION; version++) {
-    const info = VERSION_EC_M[version]
+    const info = versionEcInfo(version, level)
     const capacityBits = dataCodewordCount(info) * 8
     const neededBits = 4 + charCountBits(version) + byteLen * 8
     if (neededBits <= capacityBits) return { version, info }
   }
   throw new Error(
-    `text too long for QR versions ${MIN_VERSION}-${MAX_VERSION} at EC level M (${byteLen} bytes)`,
+    `too long for QR versions ${MIN_VERSION}-${MAX_VERSION} at EC level ${level} (${byteLen} bytes)`,
   )
 }
 
 /**
  * Encode `text` (ASCII/UTF-8, treated as bytes) as a QR matrix. Returns a
  * square, row-major boolean matrix where true = a dark module. No quiet zone
- * (the caller adds margin). Throws if the text is too long for the supported
- * versions.
+ * (the caller adds margin). Throws if the text is too long for any version.
  */
-export function qrMatrix(text: string): boolean[][] {
-  const bytes = Array.from(new TextEncoder().encode(text))
-  const { version, info } = chooseVersion(bytes.length)
-  const codewords = encodeData(bytes, version, info)
-  const symbol = new QrSymbol(version, codewords)
-  return symbol.modules
+export function qrMatrix(text: string, level: QrEcLevel = 'M'): boolean[][] {
+  const data = Array.from(new TextEncoder().encode(text))
+  const { version, info } = chooseVersion(data.length, level)
+  const codewords = encodeData(data, version, info)
+  return new QrSymbol(version, codewords, level).modules
 }
+
+/** The most bytes one symbol can carry at `level`. Callers sizing an optical
+ *  frame use this rather than guessing, so a change here cannot silently start
+ *  producing payloads that no version fits. */
+export function qrCapacityBytes(level: QrEcLevel = 'M', version: number = MAX_VERSION): number {
+  const bits = dataCodewordCount(versionEcInfo(version, level)) * 8 - 4 - charCountBits(version)
+  return Math.floor(bits / 8)
+}
+
+/** Exposed for the table-derivation regression test only. */
+export const __testVersionEcInfo = versionEcInfo

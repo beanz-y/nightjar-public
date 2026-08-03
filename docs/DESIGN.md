@@ -97,7 +97,9 @@ cryptographic code was written; the roadmap in section 12 tracks what has shippe
 
 1. **Metadata privacy against our own server** (who sends to whom, and when).
    Minimized (section 9), not eliminated.
-2. **Multi-device.** One device per identity in v1 (Sesame deferred).
+2. **Synced devices.** An account can now be read on several devices (3.1, 8.11),
+   but they are not kept in step: a device you add starts EMPTY, history moves
+   only by a deliberate transfer (8.3), and verification never syncs (6.2).
 3. **Large groups.** 1:1 only; small pairwise-fan-out groups are a v2 target.
 4. **Post-quantum.** Classical X25519 in v1, downgrade-protected (section 4.4) so
    a v2 PQXDH upgrade cannot be silently stripped.
@@ -112,7 +114,9 @@ cryptographic code was written; the roadmap in section 12 tracks what has shippe
    your device (section 8.5) but is per-device: it is not synced, no copy lives
    server-side, and the identity backup (section 8.3) does not carry it. A
    deliberate one-time move file (8.3) can carry it to a new device; nothing keeps
-   two devices' histories aligned afterward.
+   two devices' histories aligned afterward. Adding a device to an account (8.11)
+   does not change this: messages sent or received FROM THEN ON reach both, and
+   everything before is only on the device that was there.
 8. **Endpoint security.** A compromised device is outside the guarantees.
 9. **A trustless web client.** A PWA cannot prove to the user that the code it
    runs is honest (section 1.4). We do not pretend otherwise; we harden it,
@@ -134,6 +138,7 @@ cryptographic code was written; the roadmap in section 12 tracks what has shippe
 | Global passive network adversary | No (content) | Yes (out of scope for any practical messenger) | n/a |
 | Someone who obtains your move file (8.3) | **With the passphrase: everything.** The file holds your identity and every saved message; opening it makes them you on a new device, with your history and verified status, and your contacts get no signal. **Without the passphrase:** opening reduces to the generated ~100-bit passphrase (offline attack infeasible at that entropy, Argon2id-bound). The realistic failure is custody, not cracking: the file sits in a Downloads folder that often syncs to a cloud account, and the passphrase gets photographed or pasted into a synced note beside it. The file also has an **integrity** direction: one you did NOT create can contain messages that were never sent (nothing binds a row to a ratchet), so importing a stranger's file is importing their identity and their fabrications. | No new server-side observation; the file never touches the relay. | n/a |
 | Anyone who obtains your IDENTITY but not your history (a leaked identity backup and its passphrase, an imported move file) | **Your future messages, plus up to 50 of the last 48 hours from EACH contact.** The identity is what a session authenticates to, so they receive what is sent to you next. Since the retry-receipt (8.10) they can additionally ask each of your contacts to resend, and those devices answer automatically, without your device involved. The window and the per-message cap are the bound on this; each contact's device tells ITS user it resent messages and to whom, which is the only signal it happened. | Yes, as you (they hold the key the relay authenticates) | Yes: they can drain your undelivered mail |
+| Anyone who obtains your ACCOUNT KEY (a device you linked, or an image of one taken while unlocked) | **Your future messages on every conversation, and they can add further devices of their own.** The account key is what signs the device list, so whoever holds it can put a new device on the account and start receiving everything sent to you next. Your contacts get a "their devices changed" alert (8.11) and NOTHING else: your safety number does not change, because it covers the account, so the digits still match. Past messages are not exposed by this alone (a linked device starts empty), but the retry-receipt (8.10) lets them pull up to 50 of the last 48 hours from each contact. Removing the device does NOT undo it: removal is a routing change, not revocation, and the only real answer is to rotate the account key and re-verify with everyone. | Yes, as you | Yes, for anything routed to that device |
 | Thief of your unlocked device | Yes (it is your device) | Yes | n/a |
 | Thief / forensic image of your at-rest (locked or powered-off) device | **Message history, the contact list, the ratchet sessions, the send queue and the prekey privates are all encrypted at rest** behind the mandatory app-lock (section 8.5); reading any of it reduces to the unlock secret's strength (strong for a passphrase/biometric, **weak for a short PIN** against an offline brute-force of the image). BUT the **identity key stays unencrypted** (the app must route its own start-up before you unlock), so an image can still authenticate to the relay AS YOU: collect your undelivered mail, send messages your contacts' safety numbers accept as genuine, and read new first-contact conversations. | **Not from the local database, but yes by other means.** Nothing on disk names a peer any more (session rows are keyed by an opaque HMAC, 8.5). What remains is unattributable: message and session COUNTS, message lengths, and per-message arrival timestamps. The unsealed identity key, however, still lets an imager query the relay as you, so the social graph is reachable that way. See 8.5 for the full residue list. | n/a |
 
@@ -255,6 +260,34 @@ Two keypairs, generated on-device at first launch, never leaving in cleartext:
 truncated: a short id would be grindable to a routing-hijack collision, since
 7.3 authorizes by matching this hash). A separate display name is cosmetic. No
 passwords anywhere.
+
+### 3.1 Accounts and devices
+
+An account can be read on more than one device (section 8.11). That splits one
+key into two roles, without changing what either of them is:
+
+- the **account key** is the `IK_sig` above. It is what a safety number covers,
+  and `accountId = base32(SHA-256(account_key_pub))` is the id people exchange.
+  It is COPIED to each device the account adds.
+- a **device key** is that device's own `IK_sig`, and
+  `deviceId = base32(SHA-256(device_key_pub))` is what the relay authenticates
+  (7.3), what addresses that device's inbox, whose prekey bundle the Directory
+  serves, and what its ratchets run between.
+
+The first device on an account holds ONE key doing both jobs: its device key IS
+the account key, so its device id and account id are the same string. That is
+what keeps this invisible to everyone who never adds a device. Their id has not
+changed, their inbox has not moved, their safety numbers are the same digits, and
+a contact running any earlier build talks to them exactly as before.
+
+The honest cost of that choice: the first device cannot be removed from its own
+account, because its key is the account key. Retiring it means moving to a new
+device (8.3) or rotating the account key, which every contact must re-verify.
+
+Two different binding checks therefore exist and are deliberately not merged: a
+CONTACT binds an account key to an accountId, and a SESSION binds a device key to
+a deviceId. They are the same derivation over different keys, and the code keeps
+them as separate named operations so a call site has to say which one it means.
 
 ---
 
@@ -458,6 +491,27 @@ sort(IK_sig_a_pub, IK_sig_b_pub) ) )`, with `N_iter` and a displayed width of
 collision). SN covers `IK_sig` **only**, so the `idkbind` and `spk` signatures
 (section 4) must be verified on every bundle. Rendered as digit groups and a QR
 code for in-person comparison.
+
+**A safety number covers the ACCOUNT, not the machine in front of you.** The key
+it derives from is the account key (3.1), which every device on that account
+holds a copy of. Two consequences, and the second one is the uncomfortable one:
+
+- Adding a device does not change anybody's safety number. A contact who verified
+  you stays verified, with no re-check and no scary banner, which is the property
+  that makes multi-device usable at all.
+- A device of yours that somebody else got hold of shows that same matching safety
+  number. Verification answers "is this the person I think it is", never "how many
+  machines are they reading this on and are they all still theirs". The signal for
+  that is the device-list alert (8.11), and it is a different question.
+
+**Verification never syncs, deliberately.** Each device verifies for itself: a
+device you add starts with every contact UNVERIFIED and the comparison is redone
+there. Unlike Signal, nothing remote can mark a contact verified, not even another
+of your own devices, which keeps that forgery path off the board entirely. Be
+honest about what re-checking buys: the digits are identical on both devices, so
+it is performing the ritual again rather than new cryptographic evidence. What it
+produces is a LOCAL record on the device that did it, and that record is the thing
+no relay and no other device can forge.
 
 **Comparing by scan, and why the QR is not just the digits.** The digits can be
 compared by eye, or the other person's code can be scanned with the camera, which
@@ -684,6 +738,37 @@ The storage and the format are in place as groundwork, and **nothing publishes a
 roster yet**: every account today is a single device and reads as having no
 roster at all, which is exactly how an account that never links a second device
 will continue to read.
+
+The client side of that groundwork is in place too, and is worth stating because
+it fixes the vocabulary the rest of multi-device is built on. An **account** is a
+person: its key signs the roster, its id is what a conversation is filed under,
+and it is the key a safety number covers. A **device** is one of the things that
+person reads Nightjar on: its key is the credential the relay authenticates, its
+id addresses an inbox, and it is the key a ratchet session runs between. On an
+account's first device these are the same key, deliberately, and that single fact
+is what makes multi-device arrive without disturbing anybody: an existing user's
+account id, device id and user id are one id, so their inbox, their published
+prekeys, their sessions and above all their **safety numbers** are untouched, and
+nobody has to verify anybody again. The cost, stated where it will be looked for:
+a first device cannot be removed from its own account, because its device key is
+the account key; retiring it means moving to a new device (8.3) or rotating the
+account key, which is a re-verify event for every contact.
+
+Resolving where an account's devices are follows the same rule as everything else
+the relay says: believe nothing it cannot prove. A roster is used only if it
+verifies under an account key this device already holds, and only if its version
+is **higher than the highest already accepted for that account**. That second
+check is the one that binds. The Directory refusing to serve an older roster can
+be undone by whoever runs the Directory; it cannot make a client forget what it
+has already seen. A roster that fails either check is refused and the devices
+already known are kept, because failing closed here would mean failing to deliver.
+Any change to the set of devices an account claims raises an alert, since an
+operator cannot cause one: a roster is signed by the account key, so a new device
+is either a link that person really made or something that already holds their
+account key, and only they can tell which. A restored or moved device starts with
+no roster memory, and so has nothing to refuse a rollback against until it builds
+that memory up again, the same way it has no verification history for a contact
+it has not verified on that device.
 
 The **delivery indicator** (8.8) adds no storage class and no log. When a
 recipient's device acks an envelope, the relay already deletes it and records its
@@ -1045,6 +1130,21 @@ Honest posture, stated plainly:
   no socket while locked (8.5), so a message can sit at "sent" purely because the
   *recipient's* app is locked or closed. The indicator reflects devices and network
   state, not intent.
+- **With several of their devices, "delivered" means AT LEAST ONE of them acked.**
+  One message becomes one envelope per device (8.11), each with its own transport
+  id, and the first of them to be picked up moves the indicator. It is not a count
+  and it does not say which device, deliberately: the alternative would be
+  reporting on where somebody reads their messages, which is exactly the class of
+  fact this indicator exists not to leak. "Sent" likewise means at least one
+  envelope was durably queued; when only some of their devices could be reached the
+  app says so at the time, rather than encoding it in the tick.
+- **The map from an envelope back to a message is local.** Because the relay
+  speaks in transport ids and the user sees messages, a device that fanned one out
+  keeps a small table of "this envelope carried that message". It stores the
+  message's OPAQUE history key rather than the conversation and the message id, so
+  it reveals no more at rest than the delete tombstones already do (8.5), and it
+  ages out with the relay's own dedup memory: past that point the relay answers
+  "not delivered" about everything, so the question stops being askable.
 
 ### 8.9 Deleting a conversation (local, and honest about its edges)
 
@@ -1215,6 +1315,68 @@ Honest limits, all of them disclosed in the app as they happen:
   boot hydration already pay, but it is a cost a contact can ask this device to
   incur.
 
+### 8.11 Reading an account on more than one device
+
+An account (3.1) publishes a **device list**: an account-key-signed, monotonically
+versioned set of the devices it claims. The Directory holds it and serves it to
+anyone, and never authors it; the signature is the authorization, so a device that
+was linked can publish for its account even though the relay authenticates it as
+itself. Everything below the account layer is unchanged: X3DH, the Double Ratchet,
+the wire envelope, the outbox discipline and the session book are all exactly as
+they were, running between DEVICES.
+
+**Sending.** One message becomes one envelope per device on the recipient's list,
+each on its own ratchet session, plus a copy to the sender's own other devices so
+the conversation reads the same wherever it is opened. A recipient with no
+published list is addressed as a single device at its own id, which collapses the
+whole path back to precisely the one-envelope send it has always been. That is the
+property that keeps this safe for every conversation that exists today, and it is
+the first thing the tests assert.
+
+**Being sent to by an older build.** A sender that has never heard of device lists
+addresses one device, and that is most contacts for a long time. So a message
+carries a bit saying whether it was fanned out, and a device receiving one WITHOUT
+that bit passes a copy to its own siblings. Read the absence, not the presence: no
+claim means nobody promised the others got it. Session-only messages (8.7) are
+never passed on, because a forward would sit in an outbox until delivered, which is
+a durable record of the one kind that promised not to leave one.
+
+**Linking.** The new device shows a QR carrying its device key and a fresh 32-byte
+secret; an existing device photographs it, adds that device to the account's signed
+list, and sends the account key and contacts sealed under the scanned secret. The
+secret went screen to camera, so the relay never saw it: it both encrypts the
+transfer and proves the sender was standing in the room, with no key agreement and
+no prior registration. The transfer is offered optically first (a moving QR, so it
+never touches the network) and over the relay as a fallback for a device with no
+camera, where it is live-only and never queued, because parking an account key in a
+mail queue for the envelope TTL is a far worse exposure than asking both devices to
+be awake for a few seconds.
+
+Honest limits, none of them incidental:
+
+- **Optical hides the payload, not the event.** Adding the device publishes a list
+  and the new device registers itself, both over the relay, so the operator still
+  learns that an account gained a device and when.
+- **The optical channel is not confidential.** Any camera in the room can read the
+  screen, which is exactly why the payload stays sealed under the scanned secret
+  whichever way it travels, and why the linking code is the one QR in this app that
+  must not be photographed by anything else or passed on.
+- **A linked device starts empty**, and history moves later, if at all, by the
+  deliberate transfer of 8.3.
+- **Removal is not revocation.** A removed device still holds the account key and
+  could sign a list re-adding itself. Removing is the routine case (others stop
+  sending to it; it keeps what it had). For a device that is LOST, the honest answer
+  is account-key rotation, and every contact re-verifies.
+- **The rollback defence is the client's memory, not the server's.** The Directory
+  refuses an older version, but an operator owns the Directory. What binds is that
+  each device keeps a high-water mark per account and refuses anything not newer,
+  and every real change raises an alert the person has to judge, because an operator
+  cannot cause one: a list is signed by the account key, so a new device is either
+  one they added or something already holding that key.
+- **More devices cost more prekeys.** Each device vends its own one-time prekeys,
+  so depletion pressure multiplies with device count, and a dead device that is
+  never removed is a permanent tax on every send.
+
 ---
 
 ## 9. Metadata: the complete leak list and our honest posture
@@ -1238,6 +1400,13 @@ An operator who chooses to log, or anyone who can compel us, can learn:
   artifact either. The one addition is the catch-up query a returning sender makes,
   which tells the relay which of that sender's own recent envelope ids it is asking
   about, bounded per request (section 14).
+- **How many devices you read on, their ids, and when each was added.** The device
+  list (8.11) is signed by the account key but is served **in the clear**, to
+  anyone, because a sender has to learn where to send. So the operator learns an
+  account's device count and topology, watches it change over time, and sees the
+  extra edges: N devices means N envelopes per message, at one timestamp, to a
+  fixed set of inboxes, which is a fairly legible signal on its own. It also sees
+  the moment a link happens, even when the transfer itself went screen to camera.
 - **Presence** (persistent WebSocket).
 - **How many devices an account has, and when each was added** (7.5), for any
   account that publishes a device roster. The roster has to be readable by anyone
@@ -1610,7 +1779,16 @@ Native (Tauri) is **not** on the critical path; it is a demand-gated v2 (10.5).
    tradeoff explicit and point at the alternatives.
 3. Server-visible metadata (who/when, counts, presence, length) is minimized but
    not hidden (section 9).
-4. One device per identity; no multi-device.
+4. **An account can be read on several devices (8.11), and that widens the blast
+   radius in ways worth naming.** The account key is copied to each linked device,
+   so it now exists in as many places as there are devices, and anyone holding it
+   can add another (1.3). A safety number covers the account, so a device that is
+   no longer yours still shows your contacts matching digits (6.2); the only signal
+   is the device-list alert, which the person has to act on. Removal stops routing
+   but takes nothing away (8.11), so the real remedy for a lost device is
+   account-key rotation and re-verifying with everyone, which is not yet built.
+   Devices are not kept in step either: a new one starts empty, verification never
+   syncs, and history moves only by a deliberate transfer.
 5. 1:1 only; no groups.
 6. Classical crypto; not yet post-quantum (but downgrade-protected, 4.4).
 7. History is persisted on the device (section 8.5) but per-device: it is not
@@ -1679,13 +1857,13 @@ Native (Tauri) is **not** on the critical path; it is a demand-gated v2 (10.5).
 | Safety number | iterated SHA-512, `N_iter` = 5200, displayed width >= 120 bits, tag `"Nightjar-SN-v1"` | 6.2 |
 | Safety-number QR payload | `NJSN1:<40 digits>:<13-char base32 tag>`. Digits are the rendered safety number with spaces stripped (byte-identical to what the eye compares). Tag = `base32(SHA-256(domainSep("Nightjar-SNQR-v1", pairDigest, displayerIkSigPub))[0..8])`, which identifies the DISPLAYING device so a self-scan cannot pass as a peer scan (the safety number is symmetric, so digits alone cannot). Parser is total and fail-closed; a bare-digit payload from an older build is refused, not accepted. A match unlocks the confirmation but never verifies on its own; a mismatch writes nothing | 6.2 |
 | Verification withdrawal | user-initiated only, behind its own confirmation, never automatic and never scan-triggered; drops to `unverified` (never back to `invite`) and clears the verification timestamp, keeping the contact, their key, and the messages | 6.2 |
-| Delivery indicator | states: sending / sent / delivered / not sent. Both positive states are RELAY assertions (no peer signature). Stamped only on a positive signal, never inferred from a missing failure marker; monotonic (never downgrades). Sealed INSIDE the history record so at rest it reveals no direction or count. Live report is fire-and-forget to a connected sender (never stored, never queued); an offline sender catches up by asking which of its own ids the recipient's existing seen-id set holds, `MAX_DELIVERED_CHECK_IDS` = 64 per request, and only for messages newer than the seen-id TTL. No read receipts (non-goal 6 in 1.2) | 8.8, 7.5 |
+| Delivery indicator | states: sending / sent / delivered / not sent. Both positive states are RELAY assertions (no peer signature). Stamped only on a positive signal, never inferred from a missing failure marker; monotonic (never downgrades). Sealed INSIDE the history record so at rest it reveals no direction or count. Live report is fire-and-forget to a connected sender (never stored, never queued); an offline sender catches up by asking which of its own ids the recipient's existing seen-id set holds, `MAX_DELIVERED_CHECK_IDS` = 64 per request, and only for messages newer than the seen-id TTL. With several recipient devices "delivered" means at least one of them acked; the envelope-to-message map is a local table keyed by transport id holding the message's OPAQUE history key (no conversation, no message id, same at-rest exposure as a delete tombstone), written only in the multi-envelope case and pruned at the seen-id TTL. A copy to one of the SENDER's own devices is never tracked: it says nothing about the recipient. No read receipts (non-goal 6 in 1.2) | 8.8, 7.5 |
 | Argon2id (backup) | m = 64 MiB, t = 3, p = 1 (measured ~2.3 s desktop via `@noble/hashes`; 256 MiB was ~9 s and risks OOM in an iOS Safari worker; RFC 9106 constrained-env recommendation); 16-B salt; XChaCha20-Poly1305 body with the header as AAD; key+nonce via HKDF-SHA256 info `"Nightjar_Backup_v1"`; restore bounds m to [8 MiB, 256 MiB], t <= 6, p == 1 before running the KDF | 8.3 |
 | Passphrase floor | typed passphrases >= 12 chars (after NFC-trim); the offered generated passphrase is 20 base32 chars (~100 bits) | 8.3 |
 | Backup blob format | magic `"NJBK"`, format version `0x01`, then m/t/p/salt header, then AEAD body; download-only in v1 | 8.3 |
 | Move file format | magic `"NJMV"`, format version `0x01`, same m/t/p/salt header + AEAD body as the backup blob but key+nonce via HKDF info `"Nightjar_Move_v1"` (domain-separated from the backup); passphrase is generated-only (~100 bits) and canonicalized (NFC, lowercase, base32-alphabet only) before the KDF; payload cap 16 MiB (checked against file size before read, header before KDF, and before parse), <= 90000 messages, <= 1000 contacts, <= 200 deletion markers; refuse-over-cap, never truncate | 8.3 |
 | Portable history unit | `{ t: "njhist", hv: 1, messages: [...] }` embedded in the move payload; self-bounding (own row and total-text budgets, not the envelope's) and self-versioning so a future multi-device link reuses it without the passphrase envelope; per-row `kind` reserved | 8.3 |
-| Message payload format | magic `"NJM1"`, format version `0x01`, kind (`0x01` text / `0x02` delete / `0x03` session-refresh / `0x04` retry-request), 16-B content msgId, then (text) a flags byte (bit0 = ephemeral, other bits reserved) + utf8 body; the ratchet plaintext. A payload with no magic is legacy plain text; a magic-but-invalid/unknown-version/unknown-kind payload is clean-ignored (never thrown or rendered), which is exactly how kind `0x03` renders on every build: nothing, while the fresh session it rides still promotes. Kind `0x04` is the one control the receiver acts on, and reads as that same clean-ignored nothing on any build older than it (8.10). A `0x04` record carries no target, because a device that could not decrypt never learned a content id | 8.5, 8.10 |
+| Message payload format | magic `"NJM1"`, format version `0x01`, kind (`0x01` text / `0x02` delete / `0x03` session-refresh / `0x04` retry-request / `0x05` device hello / `0x06` sync-sent / `0x07` sync-delete / `0x08` sync-received / `0x09` sync-received-delete), 16-B content msgId, then (text) a flags byte (bit0 = ephemeral, **bit1 = fanned out to the recipient's whole device list**, other bits reserved) + utf8 body; the ratchet plaintext. Kinds `0x06`-`0x09` are accepted ONLY from a device of this same account, proven by that account's signed device list, because each of them writes into or deletes from local history; `0x08`/`0x09` additionally attribute an INBOUND message to a third party, so without that check anyone could put words in a contact's mouth. A payload with no magic is legacy plain text; a magic-but-invalid/unknown-version/unknown-kind payload is clean-ignored (never thrown or rendered), which is exactly how kind `0x03` renders on every build: nothing, while the fresh session it rides still promotes. Kind `0x04` is the one control the receiver acts on, and reads as that same clean-ignored nothing on any build older than it (8.10). A `0x04` record carries no target, because a device that could not decrypt never learned a content id | 8.5, 8.10 |
 | Content vs transport id | the 16-B content msgId lives inside the ratchet plaintext (history key / delete target); the relay-visible transport envelope id is separate (dedup/ack/outbox). A first-send text may reuse its content id as the transport id (brand-new, safe); a delete gets its own fresh transport id | 8.5 |
 | Delete-for-everyone | `delete{targetContentId}` (kind `0x02`) sent on the current session with its OWN fresh transport id; receiver removes only the compound (this peer, dir=in, target id), records a **tombstone** (opaque history key, TTL = envelope TTL 30 d) so a target arriving after its delete is suppressed; removal + tombstone ride the same tx as the ratchet advance. A still-outboxed target is cancelled, not chased. Best-effort, honest-client-dependent; UI says "delete sent" | 8.6 |
 | Session-only (ephemeral) | NJM1 text with flags bit0 set; **never** sealed to history on either device (send-side seal skipped, receive-side persist gate fails closed). RAM-only, cleared on reload/lock. Delivered EXACTLY like any message (same outbox + ack + retransmit, so a session-establishing initial is reliable); it removes only the persistent history row and leaves no EXTRA at-rest trace (the unencrypted session state any message updates still keys on the peer + stamps the send time). Encrypted identically in transit; does not hide relay metadata or the push nudge; off-the-record courtesy, not a guarantee; delete-for-everyone hidden on ephemeral bubbles; rendered live in other open **unlocked** tabs via a same-origin render `BroadcastChannel` (render-only, never leaves the browser, closed while locked), so the remaining miss is only a tab closed/locked/reloaded at arrival | 8.7 |
@@ -1693,6 +1871,11 @@ Native (Tauri) is **not** on the critical path; it is a demand-gated v2 (10.5).
 | App-lock + at-rest data | random 32-B **LDK** wraps all local at-rest data; the LDK is never stored unwrapped, only wrapped per method: passphrase/PIN via `HKDF(Argon2id(secret, 64 MiB/t3/p1, 16-B salt), 16-B salt, "Nightjar_LockWrap_v1")`, biometric via `HKDF(prfSecret, 16-B salt, same info)`, each `XChaCha20-Poly1305(kek, LDK)` with the method kind bound in the AAD. Mandatory; >=1 knowledge factor; PIN min 6 digits (disclosed weak). Sub-keys `HKDF(LDK, "Nightjar_HistBody_v1" / "Nightjar_HistIndex_v1" / "Nightjar_Contacts_v1" / "Nightjar_SessBody_v1" / "Nightjar_SessIndex_v1" / "Nightjar_Prekeys_v1")`, derived once per unlock and overwritten (best-effort) on lock | 8.5 |
 | History at rest | per-message record in the sessions IndexedDB; the **whole message** (content id, peer, direction, ts, text) sealed with XChaCha20-Poly1305 under key+nonce = HKDF(history-body sub-key, **fresh 16-B per-record salt**, info `"Nightjar_History_v1"`); IndexedDB key = `hex(HMAC(history-index sub-key, peer‖dir‖id))` (opaque: the DB reveals no peer, direction, timestamp or content). What it DOES still reveal is the NUMBER of stored messages (one row each) and each message's approximate length (ciphertext is unpadded, 9), plus a plaintext `failed` flag marking a permanently failed send; AAD binds that storage key + a history-format version; written in the same tx as the ratchet advance + dedup marker. Contacts/pending/aliases sealed under the contacts sub-key with a fresh 16-B salt | 8.5 |
 | Sessions + send queue at rest | the ratchet **SessionBook** is sealed with XChaCha20-Poly1305 under key+nonce = HKDF(session-body sub-key, **fresh 16-B per-record salt**, info `"Nightjar_Session_v1"`), at IndexedDB key `hex(HMAC(session-index sub-key, peerId))` (opaque: the DB names no peer). The AAD binds that storage key + a session-format version and is rebuilt from the peer the CALLER asked for, never from a field in the value, so a row moved into another peer's slot cannot authenticate. A row that exists but will not open is a distinct outcome from "no session", routed away from the poison counter. Outbox rows seal `{to, env, silent}` and keep `id` + `createdAt` in cleartext (neither names anyone; both are AAD-bound) so the retry horizon and oldest-first flush survive an unopenable row, which is reported rather than skipped. Prekey privates sealed under the prekeys sub-key. Migration: ONE IndexedDB transaction, no await inside, marker `meta.sealVersion` written in that same transaction, so an abort leaves the store byte-identical and the next unlock retries | 8.5 |
+| Account vs device id | `accountId = base32(SHA-256(account_key_pub))` is the id people exchange and what a safety number covers; `deviceId = base32(SHA-256(device_key_pub))` is what the relay authenticates and what addresses an inbox. On an account's FIRST device the two keys are the same key, so the two ids are the same string, which is what leaves every existing user untouched. Contacts bind an account key to an accountId; sessions bind a device key to a deviceId; the two checks are separate named operations so no call site can conflate them | 3.1, 8.11 |
+| Device list (roster) | account-key-signed, monotonically versioned, held by the Directory and served to anyone; the Directory NEVER authors one and authorizes a publish by the SIGNATURE, not the caller (a linked device authenticates as itself). Signed bytes are canonical and length-framed, never JSON, under their own `TAG_ROSTER` domain separation (the account key also signs auth challenges and prekeys, so without its own tag one use would be an oracle for another), with the accountId inside the signature so a list cannot be transplanted between accounts. `MAX_DEVICES_PER_ACCOUNT` = 8. Server monotonicity is LIVENESS only: the binding defence is each client's per-account high-water mark, which refuses a version not strictly newer (equal is refused too). Every real change raises a sticky alert. Verified under a key the device already holds (its own, or the contact's recorded key); on ANY failure it keeps the last good list rather than failing closed, because failing closed here means failing to deliver | 8.11 |
+| Device link code | `NJLC` ‖ version ‖ device signing key (32 B) ‖ fresh single-use secret (32 B), base64url, shown as a QR by the device being added. The device id is NOT carried, it is DERIVED from the key, so a tampered code cannot name one device while carrying another's key. The one QR in this app that is secret-bearing | 8.11 |
+| Device link transfer | `NJLK` ‖ version ‖ transfer id (16 B) ‖ index ‖ count ‖ per-chunk salt (16 B) ‖ AEAD, header as AAD, key+nonce = HKDF(scanned secret, salt, `"Nightjar_Link_v1"`). Each chunk sealed INDEPENDENTLY, so reorder/duplicate/drop can only fail to complete, and splicing two transfers is refused (the transfer id is in the AAD). Chunk size is a property of the TRANSPORT: the relay path cuts at 32 KiB to stay inside its envelope cap, the optical path seals ONE unit. Carries the account key, contacts and nicknames, and **no trust field at all** (6.2). Relay delivery is LIVE-ONLY and never queued (an account key must not sit in a 30-day mail queue); the sender must be registered, the recipient need not be | 8.11 |
+| Optical stream | fountain-coded frames as base64url TEXT in QR version 40 at EC level L (~2.1 KB payload per frame). Frames MUST be text: a camera-side decoder returns a string, and the native `BarcodeDetector` exposes only `rawValue` read as UTF-8, so binary would survive the pure-JS fallback and be mangled on the fast native path. Frames `0..K-1` ARE the raw blocks (a clean capture costs exactly K), later frames are XORs of a subset derived from `sha256(transferId ‖ seq)` so both sides agree with nothing shared but the header, and roughly one frame in eight covers a SINGLE block (belief propagation cannot start without one, so a receiver joining late could otherwise never decode). NO cryptography in this layer: it carries already-sealed bytes, so a wrong reassembly simply fails the AEAD above it | 8.11 |
 | Version octet | starts at `0x01` (classical X25519) | 4.4 |
 | Reproducible build inputs | digest-pinned container (Node + OS + arch), committed lockfile (`npm ci`), no build-time dynamic values (`__APP_VERSION__` injected, never a clock). *`SOURCE_DATE_EPOCH`/`strip-nondeterminism` are inert here (vite emits no timestamps; the manifest hashes content only) and kept only as documented no-ops* | 10.1, P7 |
 | Release hash | `sha256(manifest.txt)`; `manifest.txt` = each `dist/` file as `<sha256-hex>  <relpath>\n`, byte-sorted, LF (one recipe: `scripts/release-hash.mjs` == the pure-shell pipeline). Hashes the **build output**, so the honest claim is "rebuild and diff", not "diff the served bytes" | 10.1, P7 |

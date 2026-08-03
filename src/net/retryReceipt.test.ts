@@ -45,8 +45,8 @@ const stubKdf = (s: Uint8Array, salt: Uint8Array) => hash256(new Uint8Array([...
  *  reach `recoverContact`: they are triggered by a decrypted envelope, and there is
  *  no public seam for "a message just arrived that could not be read". */
 interface Internals {
-  maybeRequestRetry(peer: string): Promise<void>
-  honorRetryRequest(peer: string): Promise<void>
+  maybeRequestRetry(peer: string, toDevice?: string): Promise<void>
+  honorRetryRequest(peer: string, toDevice?: string): Promise<void>
   collectResendable(peer: string, now: number): Promise<Array<{ id: string; text: string; ts: number }>>
 }
 
@@ -252,6 +252,48 @@ describe('retry-receipt: answering a request (the bound that holds)', () => {
     expect(h.honored).toEqual([])
   })
 
+  it('sends the resend to the device that asked, not to the account', async () => {
+    // Once a contact reads on more than one device, the device that could not
+    // decrypt is the one that needs the messages back. Answering the ACCOUNT would
+    // deliver them to their first device, which was probably never broken, and the
+    // asking device would sit there having been told nothing.
+    const h = await harness()
+    const laptop = await makePeerBundle() // the contact's SECOND device
+    await h.seedSession(peer, bundle)
+    await h.seedSession(laptop.id, laptop.bundle)
+    await h.known(peer)
+    await h.seedRow(peer.userId, idOf(1))
+
+    await h.client.honorRetryRequest(peer.userId, laptop.id.userId)
+
+    const out = await h.queued()
+    expect(out).toHaveLength(1)
+    expect(out[0].to).toBe(laptop.id.userId)
+    expect(out[0].to).not.toBe(peer.userId)
+    // The user is still told about the PERSON: which of their machines asked is
+    // not something worth putting on screen.
+    expect(h.honored).toEqual([{ peer: peer.userId, count: 1 }])
+  })
+
+  it('bounds the resend per person, not per device', async () => {
+    // Otherwise somebody reading on three devices could pull three times the cap by
+    // asking from each in turn, and that cap is precisely what limits what a stolen
+    // identity is worth.
+    const h = await harness()
+    const laptop = await makePeerBundle()
+    await h.seedSession(peer, bundle)
+    await h.seedSession(laptop.id, laptop.bundle)
+    await h.known(peer)
+    await h.seedRow(peer.userId, idOf(1))
+
+    await h.client.honorRetryRequest(peer.userId, peer.userId)
+    expect(await h.queued()).toHaveLength(1)
+    // A second device of the SAME person, asking immediately afterwards.
+    await h.client.honorRetryRequest(peer.userId, laptop.id.userId)
+    expect(await h.queued()).toHaveLength(1)
+    expect(h.honored).toHaveLength(1)
+  })
+
   it('reports even when there was nothing to send, so an ask is never invisible', async () => {
     const h = await harness()
     await h.seedSession(peer, bundle)
@@ -286,6 +328,22 @@ describe('retry-receipt: asking for a resend', () => {
     const state = await h.contacts.getRetryState(peer.userId)
     expect(state.attempts).toBe(1)
     expect(typeof state.askedAt).toBe('number')
+  })
+
+  it('asks the device whose messages will not open, while throttling per person', async () => {
+    // The mirror of the answering side: the ask is addressed to a machine and
+    // bounded by a person, so a contact with three broken sessions is asked once.
+    const h = await harness()
+    const laptop = await makePeerBundle()
+    await h.seedSession(peer, bundle)
+    await h.seedSession(laptop.id, laptop.bundle)
+    await h.known(peer)
+
+    await h.client.maybeRequestRetry(peer.userId, laptop.id.userId)
+    const out = await h.queued()
+    expect(out).toHaveLength(1)
+    expect(out[0].to).toBe(laptop.id.userId)
+    expect(h.asked).toEqual([peer.userId])
   })
 
   it('does not ask the same contact twice inside the window', async () => {

@@ -25,7 +25,7 @@
 // is still enforced one layer up by the inbound processor / client holding the
 // per-peer lock.
 
-import { ENVELOPE_TTL_MS, SESSION_SEAL_VERSION, TOMBSTONE_TTL_MS } from '../crypto/constants'
+import { ENVELOPE_TTL_MS, SEEN_ID_TTL_MS, SESSION_SEAL_VERSION, TOMBSTONE_TTL_MS } from '../crypto/constants'
 import type { RatchetSnapshot } from '../crypto/ratchet'
 import type { SessionSealer } from './sessionSeal'
 
@@ -59,6 +59,16 @@ export interface OutboxEntry {
   /** A delete-for-everyone control (P10d) is delivered WITHOUT a push nudge so it
    *  never notifies the recipient. Persisted so retransmits stay silent too. */
   silent?: boolean
+  /** The logical message this envelope carries (Sesame). One message becomes one
+   *  envelope PER DEVICE of the recipient, so the entry id (which must be unique
+   *  in this outbox) can no longer double as the content id the way it did when
+   *  there was exactly one. Absent on a control, which carries no content. */
+  contentId?: string
+  /** The conversation this envelope belongs to (Sesame). `to` is a DEVICE now,
+   *  while history and the UI are filed by ACCOUNT, so the two are recorded
+   *  separately. Absent when they are the same, which is every single-device
+   *  recipient. */
+  account?: string
 }
 
 /** One persisted message (P10c). The WHOLE message (id, peer, dir, ts, text) is
@@ -117,6 +127,35 @@ export interface PendingOutbox {
  *  is the opaque HMAC storage key of (peer, 'in', targetContentId). */
 export interface HistoryDelete {
   key: string
+}
+
+/**
+ * What one extra envelope of a fanned-out message was carrying (Sesame).
+ *
+ * A message to a recipient reading on several devices becomes several envelopes,
+ * each with its own transport id, all standing for ONE saved message. The relay
+ * then reports delivery against a transport id, and the catch-up asks the relay
+ * about transport ids, while everything the user sees is keyed by the message.
+ * Without a way back from one to the other, a delivery indicator for anybody who
+ * has linked a device would simply stop working.
+ *
+ * `key` is the OPAQUE history key of the message the envelope carries, which is
+ * the same HMAC the tombstones store is keyed by. Storing that rather than the
+ * conversation and the message id keeps the at-rest exposure of this table
+ * identical to the one already accepted for tombstones: a count of envelopes in
+ * flight and their timestamps, attributable to nobody (DESIGN 8.5).
+ *
+ * Only ever written for a message that became MORE than one envelope. A single
+ * recipient device still uses the message's own id as its transport id, so
+ * nothing is stored and that path is byte-for-byte what it always was.
+ */
+export interface SentRef {
+  /** The transport (envelope) id this row is keyed by. */
+  id: string
+  /** Opaque history key of the message it carries. */
+  key: string
+  /** When it was queued, for TTL pruning. */
+  ts: number
 }
 
 
@@ -188,6 +227,18 @@ export interface SessionStore {
    *  destroyed without a trace, and a throw would take the whole connect path down
    *  because of one bad row. */
   pendingOutbox(): Promise<PendingOutbox>
+
+  // --- delivery back-references (Sesame) ---------------------------------
+  /** Record what a fanned-out copy's transport id stands for. Best-effort by
+   *  contract: this drives a delivery indicator, never message handling. */
+  putSentRef(id: string, key: string, ts: number): Promise<void>
+  /** The back-reference for one transport id, or null (the single-device case,
+   *  where the transport id already IS the message id). */
+  getSentRef(id: string): Promise<SentRef | null>
+  /** Every back-reference, for the reconnect catch-up. Bounded by the TTL sweep. */
+  listSentRefs(): Promise<SentRef[]>
+  /** Drop one, once its message is known to have arrived. */
+  removeSentRef(id: string): Promise<void>
 
   // --- history (P10c) ----------------------------------------------------
   /** Every persisted record across all peers (boot hydration). Opaque; the caller
@@ -272,6 +323,7 @@ export class MemorySessionStore implements SessionStore {
   private readonly outbox = new Map<string, OutboxEntry>()
   private readonly history = new Map<string, HistoryRecord>() // opaque storage key -> record
   private readonly tombstones = new Map<string, number>() // opaque history key -> tombstoned-at ms
+  private readonly sentRefs = new Map<string, { key: string; ts: number }>() // transport id -> opaque history key
 
   async loadBook(peerId: string): Promise<SessionBook | null> {
     const b = this.books.get(peerId)
@@ -382,6 +434,23 @@ export class MemorySessionStore implements SessionStore {
     return { entries: [...this.outbox.values()].map(clone).sort((a, b) => a.createdAt - b.createdAt), unreadable: [] }
   }
 
+  async putSentRef(id: string, key: string, ts: number): Promise<void> {
+    this.sentRefs.set(id, { key, ts })
+  }
+
+  async getSentRef(id: string): Promise<SentRef | null> {
+    const r = this.sentRefs.get(id)
+    return r ? { id, key: r.key, ts: r.ts } : null
+  }
+
+  async listSentRefs(): Promise<SentRef[]> {
+    return [...this.sentRefs.entries()].map(([id, r]) => ({ id, key: r.key, ts: r.ts }))
+  }
+
+  async removeSentRef(id: string): Promise<void> {
+    this.sentRefs.delete(id)
+  }
+
   async historyLoadAll(): Promise<HistoryRecord[]> {
     return [...this.history.values()].map(clone)
   }
@@ -415,6 +484,7 @@ export class MemorySessionStore implements SessionStore {
   async historyClear(): Promise<void> {
     this.history.clear()
     this.tombstones.clear()
+    this.sentRefs.clear()
   }
 
   async hasTombstone(key: string): Promise<boolean> {
@@ -443,6 +513,12 @@ export class MemorySessionStore implements SessionStore {
     for (const [key, ts] of this.tombstones) {
       if (now - ts > TOMBSTONE_TTL_MS) this.tombstones.delete(key)
     }
+    // Delivery back-references die with the relay's own dedup memory: past that
+    // bound it answers "not delivered" about everything, so keeping one would
+    // mean asking a question that can no longer be answered, forever.
+    for (const [id, r] of this.sentRefs) {
+      if (now - r.ts > SEEN_ID_TTL_MS) this.sentRefs.delete(id)
+    }
     return { seen, failures }
   }
 
@@ -454,6 +530,7 @@ export class MemorySessionStore implements SessionStore {
     this.outbox.clear()
     this.history.clear()
     this.tombstones.clear()
+    this.sentRefs.clear()
   }
 }
 
@@ -467,6 +544,7 @@ const FAILURES = 'failures'
 const OUTBOX = 'outbox'
 const HISTORY = 'history'
 const TOMBSTONES = 'tombstones'
+const SENTREFS = 'sentrefs'
 const META = 'meta'
 const SEAL_MARKER = 'sealVersion'
 // STANDING RULE: any change to the ON-DISK shape of SESSIONS or OUTBOX needs its own
@@ -479,7 +557,7 @@ const SEAL_MARKER = 'sealVersion'
 // nonce twice: catastrophic, and far worse than whatever the change was fixing.
 // `onblocked` below rejects the new tab's open, and `onversionchange` makes the old
 // tab step aside, which together make the overlap impossible rather than unlikely.
-const DB_VERSION = 7
+const DB_VERSION = 8
 
 // A delete-for-everyone inside a receive transaction: remove the target history
 // row and record its tombstone, both keyed by the same opaque history key. The
@@ -595,6 +673,12 @@ export class IdbSessionStore implements SessionStore {
           // empty store; the actual sealing happens in migrateToSealed after unlock,
           // because the Local Data Key does not exist yet at this point.
           if (!db.objectStoreNames.contains(META)) db.createObjectStore(META)
+          // v7 -> v8 (Sesame): `sentrefs` maps one fanned-out copy's transport id
+          // back to the opaque history key of the message it carries. New empty
+          // store, nothing to migrate: a device that upgrades mid-flight simply has
+          // no back-reference for whatever was already queued, and those messages
+          // keep the delivery state they already had.
+          if (!db.objectStoreNames.contains(SENTREFS)) db.createObjectStore(SENTREFS)
           // v2 -> v3: a v2 `sessions` value was a bare RatchetSnapshot; wrap each
           // as a one-session book so a pre-P5 conversation is not lost. (Prod has
           // none yet: the only durable sessions before P5 were isolated dev
@@ -930,9 +1014,11 @@ export class IdbSessionStore implements SessionStore {
   // (since the reset discards the LDK) as rows nothing could ever open or attribute
   // again. DESIGN 8.5 says that reset erases the saved history, so it must.
   async historyClear(): Promise<void> {
-    await this.tx([HISTORY, TOMBSTONES], 'readwrite', (t) => {
+    await this.tx([HISTORY, TOMBSTONES, SENTREFS], 'readwrite', (t) => {
       t.objectStore(HISTORY).clear()
       t.objectStore(TOMBSTONES).clear()
+      // They point into the history being erased, so they go with it.
+      t.objectStore(SENTREFS).clear()
       return null
     })
   }
@@ -940,6 +1026,42 @@ export class IdbSessionStore implements SessionStore {
   async hasTombstone(key: string): Promise<boolean> {
     const v = await this.tx<unknown>(TOMBSTONES, 'readonly', (t) => t.objectStore(TOMBSTONES).get(key))
     return v !== undefined
+  }
+
+  async putSentRef(id: string, key: string, ts: number): Promise<void> {
+    await this.tx(SENTREFS, 'readwrite', (t) => t.objectStore(SENTREFS).put({ key, ts }, id))
+  }
+
+  async getSentRef(id: string): Promise<SentRef | null> {
+    const v = await this.tx<unknown>(SENTREFS, 'readonly', (t) => t.objectStore(SENTREFS).get(id))
+    const r = v as { key?: unknown; ts?: unknown } | undefined
+    if (!r || typeof r.key !== 'string' || typeof r.ts !== 'number') return null
+    return { id, key: r.key, ts: r.ts }
+  }
+
+  async listSentRefs(): Promise<SentRef[]> {
+    const db = await this.open()
+    return new Promise((resolve, reject) => {
+      const t = db.transaction(SENTREFS, 'readonly')
+      const out: SentRef[] = []
+      const cur = t.objectStore(SENTREFS).openCursor()
+      cur.onsuccess = () => {
+        const c = cur.result
+        if (!c) return
+        const r = c.value as { key?: unknown; ts?: unknown }
+        if (r && typeof r.key === 'string' && typeof r.ts === 'number') {
+          out.push({ id: String(c.key), key: r.key, ts: r.ts })
+        }
+        c.continue()
+      }
+      t.oncomplete = () => resolve(out)
+      t.onabort = () => reject(t.error)
+      t.onerror = () => reject(t.error)
+    })
+  }
+
+  async removeSentRef(id: string): Promise<void> {
+    await this.tx(SENTREFS, 'readwrite', (t) => t.objectStore(SENTREFS).delete(id))
   }
 
   async tombstoneKeys(): Promise<string[]> {
@@ -950,7 +1072,7 @@ export class IdbSessionStore implements SessionStore {
   async pruneExpired(now: number): Promise<{ seen: number; failures: number }> {
     const db = await this.open()
     return new Promise((resolve, reject) => {
-      const t = db.transaction([SEEN, FAILURES, TOMBSTONES], 'readwrite')
+      const t = db.transaction([SEEN, FAILURES, TOMBSTONES, SENTREFS], 'readwrite')
       let seen = 0
       let failures = 0
       const sweep = (store: IDBObjectStore, expired: (v: unknown) => boolean, bump: () => void) => {
@@ -981,6 +1103,14 @@ export class IdbSessionStore implements SessionStore {
         (v) => typeof v === 'number' && now - v > TOMBSTONE_TTL_MS,
         () => {},
       )
+      // Delivery back-references die with the relay's own dedup memory: past that
+      // bound it answers "not delivered" about everything, so keeping one would
+      // mean asking a question that can no longer be answered, forever.
+      sweep(
+        t.objectStore(SENTREFS),
+        (v) => typeof v === 'object' && v !== null && now - (v as { ts: number }).ts > SEEN_ID_TTL_MS,
+        () => {},
+      )
       t.oncomplete = () => resolve({ seen, failures })
       t.onabort = () => reject(t.error)
       t.onerror = () => reject(t.error)
@@ -988,7 +1118,7 @@ export class IdbSessionStore implements SessionStore {
   }
 
   async wipeAll(): Promise<void> {
-    await this.tx([SESSIONS, SEEN, REPLAY, FAILURES, OUTBOX, HISTORY, TOMBSTONES, META], 'readwrite', (t) => {
+    await this.tx([SESSIONS, SEEN, REPLAY, FAILURES, OUTBOX, HISTORY, TOMBSTONES, SENTREFS, META], 'readwrite', (t) => {
       t.objectStore(SESSIONS).clear()
       t.objectStore(SEEN).clear()
       t.objectStore(REPLAY).clear()
@@ -996,6 +1126,9 @@ export class IdbSessionStore implements SessionStore {
       t.objectStore(OUTBOX).clear()
       t.objectStore(HISTORY).clear()
       t.objectStore(TOMBSTONES).clear()
+      // The back-references go with the history they point into: keeping them
+      // would leave rows naming messages that no longer exist.
+      t.objectStore(SENTREFS).clear()
       // An empty store is trivially sealed, so the marker is SET rather than
       // cleared: leaving it unset would make the next unlock run a migration over
       // nothing, and leaving a stale marker after a wipe would be a lie about rows

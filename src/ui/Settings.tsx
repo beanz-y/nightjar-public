@@ -8,6 +8,7 @@ import type { Identity } from '../crypto/identity'
 import type { CanaryResult } from '../verify/canary'
 import { About } from './About'
 import { BackupPanel } from './BackupPanel'
+import { type DeviceRow, DevicesPanel } from './DevicesPanel'
 import { MovePanel } from './MovePanel'
 import { DownloadIcon, ShieldCheckIcon } from './icons'
 import { NotifySettings } from './NotifySettings'
@@ -15,7 +16,7 @@ import { QrCode } from './QrCode'
 import { type TimeFormat, setTimeFormat, useTimeFormat } from './timePref'
 import type { NotifyState } from './useNightjar'
 
-type Mode = 'menu' | 'mycode' | 'backup' | 'move' | 'about'
+type Mode = 'menu' | 'mycode' | 'backup' | 'move' | 'devices' | 'about'
 
 type Prepared =
   | { ok: true; messages: number; contacts: number; unreadable: number; orphaned: number; bytes: number }
@@ -34,6 +35,11 @@ interface Props {
   onPrepareMove: () => Promise<Prepared | null>
   onCreateMove: (passphrase: string) => Promise<boolean>
   onEraseDevice: () => Promise<void>
+  onListDevices: () => Promise<DeviceRow[]>
+  onRemoveDevice: (deviceId: string) => Promise<boolean>
+  onAuthorizeDevice: (codeText: string) => Promise<{ deviceId: string; secret: Uint8Array } | null>
+  onSealLink: (secret: Uint8Array) => Promise<Uint8Array | null>
+  onSendLinkOverRelay: (deviceId: string, secret: Uint8Array) => Promise<boolean>
   onEnableNotifications: () => void
   onDisableNotifications: () => void
   onAddBiometric: () => void
@@ -54,6 +60,11 @@ export function Settings({
   onPrepareMove,
   onCreateMove,
   onEraseDevice,
+  onListDevices,
+  onRemoveDevice,
+  onAuthorizeDevice,
+  onSealLink,
+  onSendLinkOverRelay,
   onEnableNotifications,
   onDisableNotifications,
   onAddBiometric,
@@ -91,6 +102,20 @@ export function Settings({
           onErase={onEraseDevice}
           moveExported={moveExported}
           moveProgress={moveProgress}
+          onClose={() => setMode('menu')}
+        />
+      </section>
+    )
+  }
+  if (mode === 'devices') {
+    return (
+      <section className="sheet">
+        <DevicesPanel
+          onList={onListDevices}
+          onRemove={onRemoveDevice}
+          onAuthorize={onAuthorizeDevice}
+          onSeal={onSealLink}
+          onSendOverRelay={onSendLinkOverRelay}
           onClose={() => setMode('menu')}
         />
       </section>
@@ -177,6 +202,16 @@ export function Settings({
         <span>
           <span className="tile-title">Back up identity</span>
           <span className="tile-sub muted small">Save your identity + contacts under a passphrase.</span>
+        </span>
+      </button>
+
+      <button className="tile" onClick={() => setMode('devices')}>
+        <span className="tile-icon" aria-hidden="true">
+          <ShieldCheckIcon />
+        </span>
+        <span>
+          <span className="tile-title">Your devices</span>
+          <span className="tile-sub muted small">See what can read your messages, and link another device.</span>
         </span>
       </button>
 

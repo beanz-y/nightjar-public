@@ -169,18 +169,28 @@ export function isRosterNewer(candidate: DeviceRoster, knownVersion: number | nu
   return knownVersion === null || candidate.version > knownVersion
 }
 
-/** What changed between two verified rosters for the same account, for the alert a
- *  contact must see. A device appearing is the event that matters: the operator
- *  cannot cause it, so it is either a link the account really made or a device
- *  that already holds the account key, and only the user can tell which. */
+/** What changed between the devices last known for an account and the devices it
+ *  now claims, for the alert a contact must see. A device APPEARING is the event
+ *  that matters: an operator cannot cause it, because a roster is signed by the
+ *  account key, so it is either a link that account really made or something that
+ *  already holds their account key, and only the person can tell which.
+ *
+ *  Takes id lists rather than rosters because ids are what a client keeps: a
+ *  device id is the hash of its key, and the bundle fetch that reaches a device
+ *  already refuses a key that does not hash to the id asked for. */
 export function rosterDiff(
-  before: DeviceRoster | null,
-  after: DeviceRoster,
+  before: readonly string[] | null,
+  after: readonly string[],
 ): { added: string[]; removed: string[] } {
-  const had = new Set(before?.devices.map((d) => d.deviceId) ?? [])
-  const has = new Set(after.devices.map((d) => d.deviceId))
+  const had = new Set(before ?? [])
+  const has = new Set(after)
   return {
     added: [...has].filter((id) => !had.has(id)),
     removed: [...had].filter((id) => !has.has(id)),
   }
+}
+
+/** The device ids a verified roster claims, in the order it lists them. */
+export function rosterDeviceIds(roster: DeviceRoster): string[] {
+  return roster.devices.map((d) => d.deviceId)
 }

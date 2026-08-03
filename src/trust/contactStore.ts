@@ -10,7 +10,8 @@
 //   1. Key <-> userId binding. A fetched or received IK_sig MUST hash to the
 //      userId we expected, or the directory served a substituted key (the cheap
 //      key-swap attack of 6.1). The client (send) and inbound (receive) enforce
-//      deriveUserId(key) == peerId BEFORE any DH; this module re-checks it when
+//      that binding BEFORE any DH, at the DEVICE level, since that is what a
+//      session runs between (Sesame); this module re-checks the ACCOUNT one when
 //      recording a contact. A stored key that ever disagreed with a presented one
 //      hashing to the SAME userId would be a hash collision or local corruption,
 //      and we fail closed on it (`conflict`).
@@ -24,7 +25,7 @@
 // to come); this module is the durable trust STATE and the binding checks.
 
 import { ENVELOPE_TTL_MS, INVITE_TTL_MS, MAX_RETRY_LEDGER } from '../crypto/constants'
-import { deriveUserId } from '../crypto/identity'
+import { accountIdOf } from '../crypto/identity'
 import { openBlob, sealBlob } from '../crypto/appLock'
 import { b64decode, b64encode } from '../wire/codec'
 import type { AppLockStore } from '../storage/appLockStore'
@@ -65,6 +66,9 @@ const ALIASES_KEY = 'aliases.v1'
 const DISMISSED_KEY = 'contacts.dismissed.v1'
 /** Per-peer retry-receipt throttling (8.10). Sealed like the others. */
 const RETRY_KEY = 'contacts.retry.v1'
+/** Known device rosters, per account (Sesame). Sealed like the others: it is a
+ *  list of which contacts have how many devices. */
+const ROSTERS_KEY = 'contacts.rosters.v1'
 /** Peers owed a session-refresh ping after a move (Phase D, 8.3), drained by the
  *  client once the post-move re-registration succeeds. Durable so a crash between
  *  the move and the first connect cannot lose the list.
@@ -128,6 +132,14 @@ interface RetryState {
   askedAt?: number
   attempts?: number
   honoredAt?: number
+}
+
+/** The last device roster this device accepted for an account (Sesame). */
+export interface KnownRoster {
+  /** The highest version ever accepted. Never decreases; that is the point. */
+  version: number
+  /** Device ids only. See the note where these are read for why no keys. */
+  devices: string[]
 }
 
 /** Trust work that failed transiently and must not be lost (P8): an inviter pin
@@ -310,7 +322,10 @@ export class ContactStore {
      *  same lock as the write, for the same reason `relayDriven` is. */
     refuseIfDismissedAfter?: number,
   ): Promise<boolean> {
-    if (deriveUserId(ikSig) !== peerId) throw new Error('contacts: IK_sig does not match peer id')
+    // An ACCOUNT binding (Sesame): a contact record is about a person, so the key
+    // it stores is their account key, which is also the key their safety number
+    // covers. Devices are bound separately, where a session is opened.
+    if (accountIdOf(ikSig) !== peerId) throw new Error('contacts: IK_sig does not match peer id')
     const encoded = b64encode(ikSig)
     return this.mutateWithDismissals((map, dismissals) => {
       if (relayDriven && dismissals[peerId]?.auto) return false // deleted here; do not resurrect
@@ -497,6 +512,76 @@ export class ContactStore {
     })
   }
 
+  // --- known device rosters (Sesame) --------------------------------------
+  //
+  // What this device has been told about an account's devices, and the highest
+  // roster version it has ever accepted for them. The version is the part that
+  // matters: the Directory refusing to go backwards only keeps an honest server
+  // honest, so the binding rollback defence is that a client never accepts a
+  // roster below the highest it has already seen (src/crypto/roster.ts).
+  //
+  // Only ids are kept, never keys. A device id IS the hash of its key, and the
+  // bundle fetch that reaches a device already refuses a key that does not hash
+  // to the id asked for, so caching keys here would add a second copy of
+  // something already bound and a second thing to keep in step.
+
+  private async loadRosters(): Promise<Record<string, KnownRoster>> {
+    const bytes = await this.getSealed(ROSTERS_KEY, ROSTERS_KEY)
+    if (!bytes) return {}
+    const m = JSON.parse(decoder.decode(bytes)) as Record<string, KnownRoster>
+    if (!m || typeof m !== 'object') return {}
+    const out: Record<string, KnownRoster> = {}
+    for (const [account, r] of Object.entries(m)) {
+      if (!r || typeof r.version !== 'number' || !Array.isArray(r.devices)) continue
+      if (r.devices.some((d) => typeof d !== 'string')) continue
+      out[account] = { version: r.version, devices: [...r.devices] }
+    }
+    return out
+  }
+
+  /** What this device last accepted for `accountId`, or null if it has never seen
+   *  a roster for them. Fail-OPEN, like the other consulting reads: an unreadable
+   *  blob must not break addressing. The cost is that a rollback could go
+   *  unnoticed while the blob is unreadable, which is strictly better than the app
+   *  being unable to send at all, and the roster still has to verify. */
+  async getKnownRoster(accountId: string): Promise<KnownRoster | null> {
+    try {
+      return (await this.loadRosters())[accountId] ?? null
+    } catch {
+      return null
+    }
+  }
+
+  /** Every roster this device has accepted, for the device-to-account lookup a
+   *  receiver needs (Sesame). Fail-OPEN like the single-account read above. */
+  async listKnownRosters(): Promise<Record<string, KnownRoster>> {
+    try {
+      return await this.loadRosters()
+    } catch {
+      return {}
+    }
+  }
+
+  /** Record an accepted roster. The caller has already verified the signature and
+   *  checked the version against `getKnownRoster`; this only stores the result. */
+  async putKnownRoster(accountId: string, roster: KnownRoster): Promise<void> {
+    await this.lock.withLock(CONTACTS_LOCK, async () => {
+      let readOk = true
+      let map: Record<string, KnownRoster> = {}
+      try {
+        map = await this.loadRosters()
+      } catch {
+        readOk = false
+      }
+      map[accountId] = { version: roster.version, devices: [...roster.devices] }
+      if (Object.keys(map).length === 0) {
+        if (readOk) await this.store.delete(ROSTERS_KEY)
+      } else {
+        await this.putSealed(ROSTERS_KEY, ROSTERS_KEY, encoder.encode(JSON.stringify(map)))
+      }
+    })
+  }
+
   // --- post-move refresh list (Phase D, 8.3) ------------------------------
 
   /** Peers still owed a post-move session-refresh ping, oldest first. Fail-OPEN:
@@ -596,6 +681,7 @@ export class ContactStore {
       await this.store.delete(DISMISSED_KEY)
       await this.store.delete(RETRY_KEY)
       await this.store.delete(MOVE_REFRESH_KEY)
+      await this.store.delete(ROSTERS_KEY)
     })
   }
 
@@ -606,7 +692,7 @@ export class ContactStore {
   async replaceAllFromBackup(contacts: Contact[]): Promise<void> {
     const map: Record<string, Contact> = {}
     for (const c of contacts) {
-      if (deriveUserId(b64decode(c.ikSig, 32)) !== c.peerId) continue
+      if (accountIdOf(b64decode(c.ikSig, 32)) !== c.peerId) continue
       map[c.peerId] = { ...c }
     }
     await this.lock.withLock(CONTACTS_LOCK, async () => {
@@ -624,6 +710,13 @@ export class ContactStore {
       // An identity backup carries no refresh list; a stale one belongs to whoever
       // was on this device before.
       await this.store.delete(MOVE_REFRESH_KEY)
+      // Known device rosters go too, and with them the highest version this device
+      // had accepted for each contact. That is an honest cost of restoring rather
+      // than an oversight: a device with no memory has nothing to refuse a rollback
+      // against, and will accept whatever roster it is served first, exactly as it
+      // accepts a contact's key on first contact. It rebuilds as contacts are
+      // re-fetched.
+      await this.store.delete(ROSTERS_KEY)
     })
   }
 
@@ -662,7 +755,7 @@ export class ContactStore {
   ): Promise<void> {
     const map: Record<string, Contact> = {}
     for (const c of contacts) {
-      if (deriveUserId(b64decode(c.ikSig, 32)) !== c.peerId) continue
+      if (accountIdOf(b64decode(c.ikSig, 32)) !== c.peerId) continue
       map[c.peerId] = { ...c }
     }
     await this.lock.withLock(CONTACTS_LOCK, async () => {
@@ -675,6 +768,10 @@ export class ContactStore {
       // Nor a refresh list from a crashed earlier import; the caller writes the
       // real one immediately after this returns.
       await this.store.delete(MOVE_REFRESH_KEY)
+      // Known rosters do not ride a move either. The move file's format is fixed
+      // and does not carry them, so a moved device starts with no roster memory and
+      // therefore no rollback history, the same as a restored one.
+      await this.store.delete(ROSTERS_KEY)
       if (Object.keys(aliases).length === 0) {
         await this.store.delete(ALIASES_KEY)
       } else {
@@ -689,6 +786,46 @@ export class ContactStore {
       } else {
         await this.putSealed(DISMISSED_KEY, DISMISSED_KEY, encoder.encode(JSON.stringify(Object.fromEntries(rows))))
       }
+    })
+  }
+
+  /**
+   * Adopt the contacts a link transfer carried (Sesame B1).
+   *
+   * Every one is recorded as UNVERIFIED, whatever the sending device thought.
+   * That is the deliberate difference from `replaceAllForMove`, which keeps
+   * verification because a move replaces a device; a link adds one, and a device
+   * earns its own verification by a human comparing safety numbers on it. Nothing
+   * remote can mark a contact verified here, not even another of your own devices.
+   *
+   * Blind overwrites, like the move variant, so re-running an interrupted link
+   * converges without having to read what a previous attempt left behind.
+   */
+  async replaceAllForLink(
+    contacts: Array<{ peerId: string; ikSig: string }>,
+    aliases: Record<string, string>,
+  ): Promise<void> {
+    const now = Date.now()
+    const map: Record<string, Contact> = {}
+    for (const c of contacts) {
+      try {
+        if (accountIdOf(b64decode(c.ikSig, 32)) !== c.peerId) continue
+      } catch {
+        continue
+      }
+      map[c.peerId] = { peerId: c.peerId, ikSig: c.ikSig, trust: 'unverified', firstSeen: now, verifiedAt: null }
+    }
+    await this.lock.withLock(CONTACTS_LOCK, async () => {
+      await this.write(map)
+      // A freshly linked device has no history of its own for any of these.
+      await this.store.delete(PENDING_KEY)
+      await this.store.delete(RETRY_KEY)
+      await this.store.delete(MOVE_REFRESH_KEY)
+      await this.store.delete(DISMISSED_KEY)
+      await this.store.delete(ROSTERS_KEY)
+      const kept = Object.entries(aliases).filter(([peer]) => map[peer] !== undefined)
+      if (kept.length === 0) await this.store.delete(ALIASES_KEY)
+      else await this.putSealed(ALIASES_KEY, ALIASES_KEY, encoder.encode(JSON.stringify(Object.fromEntries(kept))))
     })
   }
 

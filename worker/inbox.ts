@@ -20,18 +20,22 @@ import {
   SEEN_ID_TTL_MS,
 } from '../src/crypto/constants'
 import { type AuthChallenge, verifyAuthResponse } from '../src/wire/auth'
-import { type WireEnvelope, type WireFetchedBundle, b64decode, decodeEnvelope } from '../src/wire/codec'
+import { type WireDeviceRoster, type WireEnvelope, type WireFetchedBundle, b64decode, decodeEnvelope } from '../src/wire/codec'
 import { buildChallenge } from '../src/wire/auth'
 import type {
   AckMsg,
   ClientMessage,
   DeliveredCheckMsg,
   FetchBundleMsg,
+  FetchRosterMsg,
   PresenceMsg,
   PublishBundleMsg,
+  PublishRosterMsg,
   PushSubscribeMsg,
   PushUnsubscribeMsg,
+  RegisterDeviceMsg,
   RegisterMsg,
+  SendLinkMsg,
   SendMsg,
   ServerMessage,
 } from '../src/wire/messages'
@@ -40,6 +44,10 @@ import { type Env, DirectoryError, USER_ID_RE, callDO, directoryStub, httpOrigin
 
 /** Reject a ciphertext larger than this (defensive; a text message is tiny). */
 const MAX_CIPHERTEXT_BYTES = 64 * 1024
+/** Reject a link chunk larger than this. Its plaintext is capped client-side at
+ *  LINK_MAX_CHUNK_BYTES; this is that plus base64 expansion and the header, and
+ *  it bounds what one relayed chunk can cost before anything looks at it. */
+const MAX_LINK_CHUNK_CHARS = 64 * 1024
 /** How often the purge alarm runs while the queue is non-empty. */
 const CLEANUP_INTERVAL_MS = 24 * 60 * 60 * 1000
 
@@ -102,6 +110,7 @@ export class Inbox {
     if (path === '/connect') return this.handleConnect(req)
     if (path === '/deliver') return this.handleDeliver(req)
     if (path === '/delivered') return this.handleDelivered(req)
+    if (path === '/deliverLink') return this.handleDeliverLink(req)
     if (path === '/seenCheck') return this.handleSeenCheck(req)
     return new Response('not found', { status: 404 })
   }
@@ -232,6 +241,14 @@ export class Inbox {
         return this.doMintInvite(ws, userId, msg.reqId)
       case 'inviteRedemptions':
         return this.doInviteRedemptions(ws, userId, msg.reqId)
+      case 'publishRoster':
+        return this.doPublishRoster(ws, msg)
+      case 'fetchRoster':
+        return this.doFetchRoster(ws, msg)
+      case 'registerDevice':
+        return this.doRegisterDevice(ws, userId, msg)
+      case 'sendLink':
+        return this.doSendLink(ws, userId, msg)
       case 'send':
         return this.doSend(ws, userId, msg)
       case 'ack':
@@ -265,6 +282,81 @@ export class Inbox {
       const r = await callDO<{ opkCount: number }>(directoryStub(this.env), '/register', {
         userId,
         inviteCode: msg.inviteCode,
+        bundle: msg.bundle,
+        now: Date.now(),
+      })
+      const att = ws.deserializeAttachment() as Attachment | null
+      if (att) ws.serializeAttachment({ ...att, registered: true })
+      this.sendTo(ws, { t: 'registered', reqId: msg.reqId, opkCount: r.opkCount })
+    } catch (e) {
+      this.replyError(ws, e, msg.reqId)
+    }
+  }
+
+  // Roster ops (Sesame). Both are forwarded WITHOUT the authenticated user id,
+  // unlike every other directory op here, and that is the point rather than an
+  // oversight. A roster is authorized by the account signature it carries, which
+  // the Directory verifies; the caller is irrelevant, because a linked device
+  // authenticates as ITSELF and must still be able to publish for its account.
+  // Nothing is revealed by fetching one either: the Directory serves rosters to
+  // anyone, since a sender has to learn where a recipient's devices are.
+  private async doPublishRoster(ws: WebSocket, msg: PublishRosterMsg): Promise<void> {
+    try {
+      const r = await callDO<{ version: number }>(directoryStub(this.env), '/publishRoster', { roster: msg.roster })
+      this.sendTo(ws, { t: 'rosterPublished', reqId: msg.reqId, version: r.version })
+    } catch (e) {
+      this.replyError(ws, e, msg.reqId)
+    }
+  }
+
+  private async doFetchRoster(ws: WebSocket, msg: FetchRosterMsg): Promise<void> {
+    try {
+      const r = await callDO<{ roster: WireDeviceRoster | null }>(directoryStub(this.env), '/fetchRoster', {
+        accountId: msg.accountId,
+      })
+      this.sendTo(ws, { t: 'roster', reqId: msg.reqId, accountId: msg.accountId, roster: r.roster })
+    } catch (e) {
+      this.replyError(ws, e, msg.reqId)
+    }
+  }
+
+  /** Relay one link chunk to a device being linked (Sesame). Gated on the SENDER
+   *  being registered, like ordinary sending, so an unregistered stranger cannot
+   *  spray chunks at arbitrary inboxes. The recipient need not be registered:
+   *  a device being linked has not published anything yet, which is the whole
+   *  reason this path exists. */
+  private async doSendLink(ws: WebSocket, userId: string, msg: SendLinkMsg): Promise<void> {
+    const att = ws.deserializeAttachment() as Attachment | null
+    if (!att?.registered) {
+      this.sendTo(ws, { t: 'error', code: 'not_registered', msg: 'register before linking', reqId: msg.reqId })
+      return
+    }
+    if (!USER_ID_RE.test(msg.to)) {
+      this.sendTo(ws, { t: 'error', code: 'bad_to', msg: 'bad device id', reqId: msg.reqId })
+      return
+    }
+    if (typeof msg.chunk !== 'string' || msg.chunk.length === 0 || msg.chunk.length > MAX_LINK_CHUNK_CHARS) {
+      this.sendTo(ws, { t: 'error', code: 'bad_chunk', msg: 'bad link chunk', reqId: msg.reqId })
+      return
+    }
+    try {
+      await callDO(inboxStub(this.env, msg.to), '/deliverLink', { from: userId, chunk: msg.chunk })
+      this.sendTo(ws, { t: 'sent', id: msg.reqId })
+    } catch (e) {
+      this.replyError(ws, e, msg.reqId)
+    }
+  }
+
+  /** Register the asking socket as a device of the account it names (Sesame).
+   *  `userId` here is the DEVICE id the challenge proved, and it is what gets
+   *  registered; the account id is a claim, checked against that account's signed
+   *  roster by the Directory. Marks the socket registered on success, exactly as
+   *  ordinary registration does, since that flag is what gates sending. */
+  private async doRegisterDevice(ws: WebSocket, userId: string, msg: RegisterDeviceMsg): Promise<void> {
+    try {
+      const r = await callDO<{ opkCount: number }>(directoryStub(this.env), '/registerDevice', {
+        deviceId: userId,
+        accountId: msg.accountId,
         bundle: msg.bundle,
         now: Date.now(),
       })
@@ -425,6 +517,35 @@ export class Inbox {
       return json({ code: 'bad_from', msg: 'bad reporter user id' }, 400)
     }
     for (const ws of this.authedSockets()) this.sendTo(ws, { t: 'delivered', id, from: by })
+    return json({ ok: true })
+  }
+
+  /**
+   * Hand a link chunk to a live socket of this inbox, or fail (Sesame).
+   *
+   * Nothing is stored and nothing is queued, which is the point. A link payload
+   * carries the account's private key sealed under a secret that never crossed
+   * the network, and parking that in a queue for the envelope TTL would be a far
+   * worse exposure than asking both devices to be awake for the seconds the
+   * ceremony takes. Both devices are in the same room by construction, so "the
+   * other device is not connected" is a fixable, honest failure.
+   */
+  private async handleDeliverLink(req: Request): Promise<Response> {
+    const body = (await req.json()) as { from?: unknown; chunk?: unknown }
+    const from = body.from
+    const chunk = body.chunk
+    if (typeof from !== 'string' || !USER_ID_RE.test(from)) {
+      return json({ code: 'bad_from', msg: 'bad sender id' }, 400)
+    }
+    if (typeof chunk !== 'string' || chunk.length === 0 || chunk.length > MAX_LINK_CHUNK_CHARS) {
+      return json({ code: 'bad_chunk', msg: 'bad link chunk' }, 400)
+    }
+    let delivered = 0
+    for (const ws of this.authedSockets()) {
+      this.sendTo(ws, { t: 'linkChunk', from, chunk })
+      delivered++
+    }
+    if (delivered === 0) return json({ code: 'not_connected', msg: 'that device is not connected' }, 409)
     return json({ ok: true })
   }
 

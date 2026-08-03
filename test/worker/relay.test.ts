@@ -1,11 +1,12 @@
 import { SELF, env, runInDurableObject } from 'cloudflare:test'
 import { describe, expect, it, vi } from 'vitest'
 import { MAX_DELIVERED_CHECK_IDS, MAX_PUSH_SUBS } from '../../src/crypto/constants'
-import { type Identity, generateIdentity } from '../../src/crypto/identity'
+import { type Identity, deviceIdOf, generateIdentity } from '../../src/crypto/identity'
 import { utf8 } from '../../src/crypto/primitives'
 import { OWN_BUNDLE_VERSION, buildOwnBundle, generateSignedPrekey, verifyFetchedBundle } from '../../src/crypto/prekeys'
 import { initRatchetInitiator, initRatchetResponder, ratchetDecrypt, ratchetEncrypt } from '../../src/crypto/ratchet'
 import { x3dhInitiate, x3dhRespond } from '../../src/crypto/x3dh'
+import { signRoster } from '../../src/crypto/roster'
 import { verifyAndSignChallenge } from '../../src/wire/auth'
 import {
   type WireEnvelope,
@@ -14,6 +15,7 @@ import {
   decodeFetchedBundle,
   decodeInitialHeader,
   decodeMessageHeaderWire,
+  encodeDeviceRoster,
   encodeInitialHeader,
   encodeMessageHeaderWire,
   encodePublishedBundle,
@@ -823,5 +825,81 @@ describe('SPK rotation through the directory (P8)', () => {
 
     conn.close()
     aliceConn.close()
+  })
+})
+
+describe('device rosters over the socket (Sesame)', () => {
+  it('publishes and serves a roster, and answers null for an account without one', async () => {
+    const alice = generateIdentity()
+    const conn = await connectAndAuth(alice)
+    expect((await register(conn, ownBundleFor(alice), await adminInvite())).t).toBe('registered')
+
+    // Before publishing anything, an account is the single device it already is.
+    const emptyReq = nextReq()
+    conn.send({ t: 'fetchRoster', reqId: emptyReq, accountId: alice.userId })
+    const none = (await conn.waitFor('roster')) as Extract<ServerMessage, { t: 'roster' }>
+    expect(none.roster).toBeNull()
+
+    const laptop = generateIdentity()
+    const devices = [alice, laptop].map((d) => ({
+      deviceId: deviceIdOf(d.ikSig.publicKey),
+      dkSigPub: d.ikSig.publicKey,
+      addedAt: Date.now(),
+    }))
+    const roster = signRoster(alice.userId, 1, devices, alice.ikSig.privateKey)
+    const pubReq = nextReq()
+    conn.send({ t: 'publishRoster', reqId: pubReq, roster: encodeDeviceRoster(roster) })
+    const published = (await conn.waitFor('rosterPublished')) as Extract<ServerMessage, { t: 'rosterPublished' }>
+    expect(published.version).toBe(1)
+
+    const getReq = nextReq()
+    conn.send({ t: 'fetchRoster', reqId: getReq, accountId: alice.userId })
+    const got = (await conn.waitFor('roster')) as Extract<ServerMessage, { t: 'roster' }>
+    expect(got.roster).toEqual(encodeDeviceRoster(roster))
+    conn.close()
+  })
+
+  it('refuses a roster the account did not sign, over the socket like anywhere else', async () => {
+    const alice = generateIdentity()
+    const conn = await connectAndAuth(alice)
+    expect((await register(conn, ownBundleFor(alice), await adminInvite())).t).toBe('registered')
+
+    const impostor = generateIdentity()
+    const forged = signRoster(
+      alice.userId,
+      1,
+      [{ deviceId: deviceIdOf(alice.ikSig.publicKey), dkSigPub: alice.ikSig.publicKey, addedAt: Date.now() }],
+      impostor.ikSig.privateKey,
+    )
+    const reqId = nextReq()
+    conn.send({ t: 'publishRoster', reqId, roster: encodeDeviceRoster(forged) })
+    const err = await conn.waitFor('error')
+    expect(err.code).toBe('bad_roster')
+    conn.close()
+  })
+
+  it('lets a device publish for its account even though it authenticates as itself', async () => {
+    // The case that made caller-based authorization wrong: a linked device is not
+    // the account, and still has to be able to update the account's roster.
+    const alice = generateIdentity()
+    const other = generateIdentity()
+    const aliceConn = await connectAndAuth(alice)
+    const otherConn = await connectAndAuth(other)
+    expect((await register(aliceConn, ownBundleFor(alice), await adminInvite())).t).toBe('registered')
+    expect((await register(otherConn, ownBundleFor(other), await adminInvite())).t).toBe('registered')
+
+    const roster = signRoster(
+      alice.userId,
+      1,
+      [{ deviceId: deviceIdOf(alice.ikSig.publicKey), dkSigPub: alice.ikSig.publicKey, addedAt: Date.now() }],
+      alice.ikSig.privateKey,
+    )
+    // Sent on a socket authenticated as somebody else entirely.
+    const reqId = nextReq()
+    otherConn.send({ t: 'publishRoster', reqId, roster: encodeDeviceRoster(roster) })
+    const published = (await otherConn.waitFor('rosterPublished')) as Extract<ServerMessage, { t: 'rosterPublished' }>
+    expect(published.version).toBe(1)
+    aliceConn.close()
+    otherConn.close()
   })
 })

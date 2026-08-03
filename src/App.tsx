@@ -38,6 +38,7 @@ export function App() {
     removedPeer,
     moveExported,
     moveProgress,
+    linkState,
     actions,
   } = useNightjar()
   const canary = useCanary()
@@ -148,8 +149,12 @@ export function App() {
                 connected={connected}
                 restoreBusy={restoreBusy}
                 restoreError={restoreError}
+                linkState={linkState}
                 onJoin={actions.join}
                 onRestore={actions.restoreFromBackup}
+                onStartLinking={actions.startLinking}
+                onCancelLinking={actions.cancelLinking}
+                onLinkTransfer={actions.openOpticalLink}
                 onAbout={() => setAbout(true)}
               />
             )}

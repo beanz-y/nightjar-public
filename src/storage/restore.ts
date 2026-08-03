@@ -46,6 +46,49 @@ import { PREKEYS_KEY } from './prekeyStore'
 import type { SessionStore } from './sessionStore'
 
 export const RESTORE_PENDING_KEY = 'restore.pending.v1'
+
+/**
+ * Join an account as an additional device (Sesame B1).
+ *
+ * Unlike every other stager in this file, this one KEEPS the device identity it
+ * finds. That is the difference between linking and restoring, and it is the
+ * whole point: a restore replaces a device, so it writes a new identity and the
+ * identity write is the commit point; a link ADDS a device, so this device stays
+ * itself and merely gains an account key alongside.
+ *
+ * Which means the commit-point invariant does not apply here and must not be
+ * imitated: there is nothing to roll back to, because nothing is destroyed.
+ * Everything below is a blind overwrite of state this device does not yet have,
+ * so a crash part-way leaves a device that is simply not linked yet, and the user
+ * runs the ceremony again with a fresh code.
+ *
+ * Contacts arrive with NO trust and are recorded as unverified, because a device
+ * earns its own verification (DESIGN 6.2). This is enforced by the link decoder,
+ * which does not carry a trust field at all, and again here by the trust value
+ * this passes.
+ */
+export async function stageLink(deps: LinkDeps, payload: LinkStagePayload): Promise<void> {
+  await deps.lock.withLock(IDENTITY_LOCK, async () => {
+    // The account key first: it is what makes this device part of the account, and
+    // a device holding contacts of an account it cannot sign for is the one
+    // half-linked state worth avoiding.
+    await deps.saveAccountKey(payload.accountKeyPriv)
+    await deps.contacts.replaceAllForLink(payload.contacts, payload.aliases)
+  })
+}
+
+/** What `stageLink` needs, kept narrow so it is trivially testable. */
+export interface LinkDeps {
+  lock: Lock
+  contacts: ContactStore
+  saveAccountKey: (privateKey: Uint8Array) => Promise<void>
+}
+
+export interface LinkStagePayload {
+  accountKeyPriv: Uint8Array
+  contacts: Array<{ peerId: string; ikSig: string }>
+  aliases: Record<string, string>
+}
 const IDENTITY_LOCK = 'nightjar-identity'
 /** Rows per durable import transaction: large enough to amortize commit cost,
  *  small enough that progress is visible and memory stays flat. */

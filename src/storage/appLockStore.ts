@@ -30,6 +30,7 @@ import {
   wrapKnowledge,
 } from '../crypto/appLock'
 import {
+  INFO_ACCOUNT,
   INFO_CONTACTS,
   INFO_HISTORY_BODY,
   INFO_HISTORY_INDEX,
@@ -224,6 +225,10 @@ export class AppLockStore {
   }
   prekeysKey(): Uint8Array {
     return this.cachedSubKey(INFO_PREKEYS)
+  }
+  /** Seals the account key on a device that was linked into an account (Sesame). */
+  accountKey(): Uint8Array {
+    return this.cachedSubKey(INFO_ACCOUNT)
   }
 
   /** Re-wrap the LDK under a new knowledge secret (change PIN/passphrase). Must be

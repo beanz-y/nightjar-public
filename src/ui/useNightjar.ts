@@ -26,6 +26,10 @@ import {
 } from '../platform/webpush'
 import { biometricAvailable, enrollBiometric, unlockBiometric } from '../platform/webauthn'
 import { openBackup, parseBackupHeader, sealBackup } from '../crypto/backup'
+import { type LinkPayload, openLink } from '../crypto/link'
+import { ed25519Public } from '../crypto/primitives'
+import { newLinkCode, parseLinkCode } from '../trust/linkCode'
+import { clearAccountKey, loadAccountKey, saveAccountKey } from '../storage/accountKeyStore'
 import { type OpenedMove, encodeMovePayload, openMove, parseMoveHeader, sealMove } from '../crypto/move'
 import { bytesToHex } from '@noble/hashes/utils.js'
 import { newMsgId } from '../crypto/message'
@@ -44,6 +48,7 @@ import {
   RESTORE_PENDING_KEY,
   clearPendingRestore,
   pendingRestore,
+  stageLink,
   stageMove,
   stageRestoreEnrolled,
 } from '../storage/restore'
@@ -56,6 +61,10 @@ import {
 } from '../trust/inviteArtifact'
 
 export type Phase = 'loading' | 'evicted' | 'enroll' | 'locked' | 'onboarding' | 'ready' | 'error'
+
+/** 'waiting' = a code is on screen and a transfer is being listened for;
+ *  'joining' = one arrived and opened, and this device is joining the account. */
+export type LinkState = 'idle' | 'waiting' | 'joining' | 'done'
 
 /** Lock the app after this long hidden (idle). */
 const IDLE_LOCK_MS = 5 * 60 * 1000
@@ -187,6 +196,8 @@ export function useNightjar() {
   const [lockMethods, setLockMethods] = useState<Array<'pass' | 'pin' | 'bio'>>([])
   const [bioAvailable, setBioAvailable] = useState(false)
   const [restorePending, setRestorePending] = useState(false)
+  /** Where this device is in the ceremony of joining an account (Sesame). */
+  const [linkState, setLinkState] = useState<LinkState>('idle')
   /** The peer of the most recent FULL delete, local or from a sibling tab. The
    *  conversation pane keeps its own `selected` state, which no cross-tab event can
    *  reach, so without this a sibling tab keeps the deleted chat open and typing in
@@ -211,6 +222,11 @@ export function useNightjar() {
   const [moveProgress, setMoveProgress] = useState<{ done: number; total: number } | null>(null)
   const [moveExported, setMoveExported] = useState(false)
   const pushKeyRef = useRef<string | null>(null)
+  /** The single-use secret from the code this device is currently showing (Sesame).
+   *  RAM only, deliberately: it opens a payload carrying the account key, so a
+   *  reload means showing a fresh code rather than leaving it on disk. */
+  const linkSecretRef = useRef<Uint8Array | null>(null)
+  const linkStopRef = useRef<(() => void) | null>(null)
   const teardownRef = useRef<(() => void) | null>(null)
   const lockNowRef = useRef<() => void>(() => {})
   const contactsGenRef = useRef(0)
@@ -353,6 +369,11 @@ export function useNightjar() {
   const teardownLive = useCallback(() => {
     teardownRef.current?.()
     teardownRef.current = null
+    // A ceremony in progress dies with the client that was listening for it. The
+    // secret goes too: it is single-use, and the next attempt shows a fresh code.
+    linkStopRef.current?.()
+    linkStopRef.current = null
+    linkSecretRef.current = null
     // Close the cross-tab channel BEFORE clearing the client: a locked/torn-down tab
     // must hold no plaintext and must stop receiving sibling render events.
     crossTabRef.current?.close()
@@ -375,6 +396,13 @@ export function useNightjar() {
       stores.sessions.useSealer(new SessionSealer(stores.appLock))
       await stores.sessions.migrateToSealed()
       const prekeys = new PrekeyStore(stores.keys, stores.lock, stores.appLock)
+      // The account key, on a device that was linked into an existing account
+      // (Sesame). Null on a first device, which IS its own account and derives it.
+      // Deliberately not caught: loadAccountKey fails CLOSED, because "no account
+      // key" and "an account key this device cannot read" mean opposite things, and
+      // starting up as an account of one when the truth is the second would have
+      // this device signing device lists that contradict its own account.
+      const accountKey = await loadAccountKey(stores.keys, stores.appLock)
       const client = new NightjarClient(
         id,
         stores.sessions,
@@ -387,6 +415,14 @@ export function useNightjar() {
             appendMessage(from, m)
             broadcast({ kind: 'append', peer: from, msg: m })
             void listContacts().catch(() => {})
+          },
+          onSyncedSent: (accountId, msg) => {
+            // Something this account sent from another of its devices. It is OUR
+            // message in THAT conversation, so it renders as an outbound bubble
+            // rather than as a message from the device that relayed it.
+            const m: Message = { id: msg.id, dir: 'out', text: msg.text, ts: msg.ts }
+            appendMessage(accountId, m)
+            broadcast({ kind: 'append', peer: accountId, msg: m })
           },
           onDelete: (from, id) => {
             // Delete-for-everyone from a peer (P10d): drop the bubble. The stored
@@ -440,6 +476,19 @@ export function useNightjar() {
             // after the connect-time refresh already ran; re-read so it appears now.
             if (mountedRef.current) void listContacts().catch(() => {})
           },
+          onDevicesChanged: (accountId, change) => {
+            // A contact's set of devices changed. This is a SECURITY notice, not a
+            // status line, because an operator cannot cause it: a device list is
+            // signed by the account key, so it is either a device that person
+            // really linked or something already holding their account key, and
+            // only they can tell which. Sticky, and never auto-dismissed.
+            const who = accountId === liveRef.current?.client.account.accountId ? 'your account' : `${accountId.slice(0, 12)}…`
+            const parts: string[] = []
+            if (change.added.length > 0) parts.push(`added ${change.added.length} device(s)`)
+            if (change.removed.length > 0) parts.push(`removed ${change.removed.length} device(s)`)
+            const detail = `${who} ${parts.join(' and ')}. If that was not expected, check with them in person before sending anything sensitive.`
+            setSecurityNotices((prev) => (prev.includes(detail) ? prev : [...prev, detail]))
+          },
           onConnection: (up) => {
             if (!mountedRef.current) return
             setConnected(up)
@@ -459,6 +508,7 @@ export function useNightjar() {
           },
         },
         stores.history,
+        accountKey ?? undefined,
       )
       liveRef.current = { client, identity: id }
       setIdentity(id)
@@ -799,6 +849,11 @@ export function useNightjar() {
       // Prekey privates go with them (sealed since P11), and the flag makes the next
       // connect re-register a fresh set, exactly as a restore does.
       await stores.keys.delete(PREKEYS_KEY)
+      // The account key is sealed under the key being discarded here, so it is
+      // unrecoverable ciphertext from this moment and must go with the rest. A
+      // linked device that resets its lock stops being part of the account and has
+      // to be linked again, which is the honest consequence of losing the secret.
+      await clearAccountKey(stores.keys)
       await stores.keys.put(RESTORE_PENDING_KEY, Uint8Array.from([1]))
       // A pending move-refresh list would re-add (via first-contact recording) the
       // very contacts this reset just wiped. It dies with them inside
@@ -1209,6 +1264,7 @@ export function useNightjar() {
       await stores.keys.delete(PREKEYS_KEY).catch(() => {})
       await stores.keys.delete(RESTORE_PENDING_KEY).catch(() => {})
       await stores.keys.delete(IDENTITY_KEY).catch(() => {})
+      await clearAccountKey(stores.keys).catch(() => {})
       await stores.appLock.reset().catch(() => {})
       await stores.sentinel.unmark().catch(() => {})
       try {
@@ -1297,6 +1353,195 @@ export function useNightjar() {
     }
   }, [])
 
+  // --- linking another device (Sesame B1) ----------------------------------
+
+  /**
+   * Join the account the transfer came from: keep this device's own identity, take
+   * the account key and the contacts, then register as a device of that account.
+   *
+   * The order is not interchangeable. The account key is stored first because a
+   * device holding contacts of an account it cannot sign for is the one half-linked
+   * state worth avoiding, and registration comes last because the relay only
+   * accepts it once the account's published list names this device, which the
+   * OTHER device did before it sent any of this.
+   */
+  const completeLink = useCallback(async (payload: LinkPayload): Promise<void> => {
+    const stores = storesRef.current
+    const live = liveRef.current
+    if (!stores || !live) return
+    linkStopRef.current?.()
+    linkStopRef.current = null
+    setLinkState('joining')
+    try {
+      await stageLink(
+        {
+          lock: stores.lock,
+          contacts: stores.contacts,
+          saveAccountKey: (priv) => saveAccountKey(stores.keys, stores.appLock, priv),
+        },
+        { accountKeyPriv: payload.accountKeyPriv, contacts: payload.contacts, aliases: payload.aliases },
+      )
+      live.client.setAccountKey({
+        privateKey: payload.accountKeyPriv,
+        publicKey: ed25519Public(payload.accountKeyPriv),
+      })
+      await live.client.registerAsDevice(payload.accountId)
+      linkSecretRef.current = null
+      if (!mountedRef.current) return
+      setRegistered(true)
+      await listContacts()
+      setAliases(await live.client.listAliases())
+      setLinkState('done')
+      setPhase('ready')
+      // Both halves of the truth, in the order that matters to the user.
+      setNotice(
+        'this device is now part of your account. It starts with no messages, and every contact shows as unverified until you compare safety numbers here: a verification belongs to the device that did it.',
+      )
+    } catch (e) {
+      setLinkState('idle')
+      linkSecretRef.current = null
+      setNotice(`could not finish linking this device: ${String(e instanceof Error ? e.message : e)}`)
+    }
+  }, [listContacts])
+
+  /**
+   * The NEW device's half: show a code, and take whatever arrives that opens
+   * under it.
+   *
+   * The secret inside the code never crosses the network, so a payload that opens
+   * under it proves the sender was the device that photographed this screen. That
+   * is the entire authentication of the ceremony in both directions, which is why
+   * the secret lives in RAM only: a reload means showing a fresh code rather than
+   * leaving a key-bearing value on disk.
+   */
+  const startLinking = useCallback((): { code: string; deviceId: string } | null => {
+    const live = liveRef.current
+    if (!live) return null
+    linkStopRef.current?.()
+    const { code, parsed } = newLinkCode(live.identity.ikSig.publicKey)
+    linkSecretRef.current = parsed.secret
+    setLinkState('waiting')
+    linkStopRef.current = live.client.awaitLinkPayload(parsed.secret, (payload) => {
+      void completeLink(payload)
+    })
+    return { code, deviceId: parsed.deviceId }
+  }, [completeLink])
+
+  const cancelLinking = useCallback(() => {
+    linkStopRef.current?.()
+    linkStopRef.current = null
+    linkSecretRef.current = null
+    setLinkState('idle')
+  }, [])
+
+  /** Open a transfer caught by the camera under the code this device is showing.
+   *  Returns whether it opened; a failure is surfaced and the user starts over. */
+  const openOpticalLink = useCallback(
+    async (blob: Uint8Array): Promise<boolean> => {
+      const secret = linkSecretRef.current
+      if (!secret) return false
+      let payload: LinkPayload
+      try {
+        payload = openLink([blob], secret)
+      } catch (e) {
+        // The only honest reading of this: what was on that screen was not meant
+        // for this device, or was not a device transfer at all.
+        setNotice(
+          `that transfer did not open with this device's code (${String(e instanceof Error ? e.message : e)}). Start again with a fresh code.`,
+        )
+        return false
+      }
+      await completeLink(payload)
+      return true
+    },
+    [completeLink],
+  )
+
+  /**
+   * The EXISTING device's half: read the code, put the new device on this
+   * account's published list, and hand back what it needs to send the transfer.
+   *
+   * Authorizing comes first because it is what lets the new device register at
+   * all: it consumes no invite, and the signed list stands in for one.
+   */
+  const authorizeNewDevice = useCallback(
+    async (codeText: string): Promise<{ deviceId: string; secret: Uint8Array } | null> => {
+      const live = liveRef.current
+      if (!live) return null
+      setNotice(null)
+      try {
+        const parsed = parseLinkCode(codeText)
+        if (parsed.deviceId === live.client.deviceId) {
+          setNotice('that is this device\'s own code')
+          return null
+        }
+        await live.client.authorizeDevice(parsed.deviceId, parsed.dkSigPub)
+        return { deviceId: parsed.deviceId, secret: parsed.secret }
+      } catch (e) {
+        setNotice(`could not add that device: ${String(e instanceof Error ? e.message : e)}`)
+        return null
+      }
+    },
+    [],
+  )
+
+  /** Seal the transfer for a screen (preferred: it never reaches the network). */
+  const sealLinkTransfer = useCallback(async (secret: Uint8Array): Promise<Uint8Array | null> => {
+    const live = liveRef.current
+    if (!live) return null
+    try {
+      return await live.client.sealLinkForOptical(secret)
+    } catch (e) {
+      setNotice(`could not prepare the transfer: ${String(e instanceof Error ? e.message : e)}`)
+      return null
+    }
+  }, [])
+
+  /** Send the transfer over the relay instead. Live-only and never stored, but the
+   *  relay does carry it, which is why this is the fallback and not the default. */
+  const sendLinkOverRelay = useCallback(async (deviceId: string, secret: Uint8Array): Promise<boolean> => {
+    const live = liveRef.current
+    if (!live) return false
+    try {
+      await live.client.sendLinkPayload(deviceId, secret)
+      return true
+    } catch (e) {
+      const msg = String(e instanceof Error ? e.message : e)
+      setNotice(
+        msg.includes('not_connected')
+          ? 'the other device is not connected right now. Both devices have to be open at the same time for this, so leave it on the linking screen and try again.'
+          : `could not send the transfer: ${msg}`,
+      )
+      return false
+    }
+  }, [])
+
+  const listDevices = useCallback(async () => {
+    const live = liveRef.current
+    if (!live) return []
+    try {
+      return await live.client.listDevices()
+    } catch (e) {
+      setNotice(`could not read your device list: ${String(e instanceof Error ? e.message : e)}`)
+      return []
+    }
+  }, [])
+
+  const removeDevice = useCallback(async (deviceId: string): Promise<boolean> => {
+    const live = liveRef.current
+    if (!live) return false
+    try {
+      await live.client.removeDevice(deviceId)
+      setNotice(
+        'that device is off your list, so nothing further will be sent to it. It keeps the messages it already had, and this is not the same as taking away what it knows: for a device you have lost, treat the account as compromised.',
+      )
+      return true
+    } catch (e) {
+      setNotice(`could not remove that device: ${String(e instanceof Error ? e.message : e)}`)
+      return false
+    }
+  }, [])
+
   const enableNotifications = useCallback(async () => {
     const live = liveRef.current
     if (!live) return
@@ -1355,7 +1600,16 @@ export function useNightjar() {
     removedPeer,
     moveProgress,
     moveExported,
+    linkState,
     actions: {
+      startLinking,
+      cancelLinking,
+      openOpticalLink,
+      authorizeNewDevice,
+      sealLinkTransfer,
+      sendLinkOverRelay,
+      listDevices,
+      removeDevice,
       enrollLock,
       makeBiometricMethod,
       unlock,

@@ -77,3 +77,99 @@ describe('qrMatrix', () => {
     expect(size).toBeGreaterThan(21)
   })
 })
+
+// --- versions beyond 10, and EC level L (optical transfer) -----------------
+//
+// The characteristics table is now DERIVED rather than transcribed, so the two
+// things worth proving are that the derivation still reproduces the rows this
+// file used to carry by hand, and that what comes out actually scans. The second
+// is checked against jsQR, an independent decoder that is already a dependency,
+// which is a far better witness than any structural assertion could be.
+
+/** The exact table this file carried before the derivation replaced it. */
+const HAND_ENTERED_M: Record<number, [number, number, number, number, number]> = {
+  1: [10, 1, 16, 0, 0],
+  2: [16, 1, 28, 0, 0],
+  3: [26, 1, 44, 0, 0],
+  4: [18, 2, 32, 0, 0],
+  5: [24, 2, 43, 0, 0],
+  6: [16, 4, 27, 0, 0],
+  7: [18, 4, 31, 0, 0],
+  8: [22, 2, 38, 2, 39],
+  9: [22, 3, 36, 2, 37],
+  10: [26, 4, 43, 1, 44],
+}
+
+function render(m: boolean[][], scale = 3, quiet = 4): { data: Uint8ClampedArray; width: number; height: number } {
+  const size = m.length
+  const width = (size + quiet * 2) * scale
+  const data = new Uint8ClampedArray(width * width * 4).fill(255)
+  for (let y = 0; y < size; y++) {
+    for (let x = 0; x < size; x++) {
+      if (!m[y][x]) continue
+      for (let dy = 0; dy < scale; dy++) {
+        for (let dx = 0; dx < scale; dx++) {
+          const px = ((y + quiet) * scale + dy) * width + (x + quiet) * scale + dx
+          data[px * 4] = 0
+          data[px * 4 + 1] = 0
+          data[px * 4 + 2] = 0
+        }
+      }
+    }
+  }
+  return { data, width, height: width }
+}
+
+describe('symbol versions and error-correction levels', () => {
+  it('derives exactly the table this file used to carry by hand', async () => {
+    // The regression that matters: eighty transcribed rows would have been eighty
+    // chances at a typo that only shows up as one unscannable size.
+    const { __testVersionEcInfo } = (await import('./qr')) as unknown as {
+      __testVersionEcInfo: (v: number, l: 'L' | 'M') => Record<string, number>
+    }
+    for (const [version, [ec, g1b, g1d, g2b, g2d]] of Object.entries(HAND_ENTERED_M)) {
+      expect(__testVersionEcInfo(Number(version), 'M')).toEqual({
+        ecPerBlock: ec,
+        g1Blocks: g1b,
+        g1DataPerBlock: g1d,
+        g2Blocks: g2b,
+        g2DataPerBlock: g2d,
+      })
+    }
+  })
+
+  it('round-trips through an independent decoder at a range of sizes', async () => {
+    const jsQR = (await import('jsqr')).default
+    for (const [len, level] of [
+      [40, 'M'],
+      [300, 'M'],
+      [1200, 'L'],
+      [2000, 'L'],
+    ] as Array<[number, 'L' | 'M']>) {
+      const text = Array.from({ length: len }, (_, i) => String.fromCharCode(97 + (i % 26))).join('')
+      const img = render(qrMatrix(text, level))
+      const decoded = jsQR(img.data, img.width, img.height)
+      expect(decoded?.data).toBe(text)
+    }
+  })
+
+  it('reports a capacity that grows with version and is looser at level L', async () => {
+    const { qrCapacityBytes } = await import('./qr')
+    expect(qrCapacityBytes('L', 40)).toBeGreaterThan(qrCapacityBytes('M', 40))
+    expect(qrCapacityBytes('L', 40)).toBeGreaterThan(2900) // ~2.9 KB per frame
+    expect(qrCapacityBytes('M', 10)).toBeGreaterThan(180) // the old ceiling
+    for (let v = 2; v <= 40; v++) {
+      expect(qrCapacityBytes('L', v)).toBeGreaterThan(qrCapacityBytes('L', v - 1))
+    }
+  })
+
+  it('accepts a payload far past the old 180-byte ceiling', () => {
+    const long = 'y'.repeat(2500)
+    const m = qrMatrix(long, 'L')
+    // Comfortably past the old ceiling of version 10 (size 57), and it picks the
+    // SMALLEST version that fits rather than jumping straight to the largest.
+    expect(m.length).toBeGreaterThan(57)
+    expect(m.length).toBeLessThanOrEqual(177)
+    expect((m.length - 17) % 4).toBe(0) // a real version size
+  })
+})

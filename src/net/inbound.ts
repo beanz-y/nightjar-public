@@ -24,7 +24,7 @@
 
 import { bytesToHex } from '@noble/hashes/utils.js'
 import { POISON_MAX_ATTEMPTS } from '../crypto/constants'
-import { type Identity, deriveUserId } from '../crypto/identity'
+import { type Identity, deviceIdOf } from '../crypto/identity'
 import { decodeMessage } from '../crypto/message'
 import { deserializeRatchet, initRatchetResponder, pruneSkippedKeys, ratchetDecrypt, serializeRatchet } from '../crypto/ratchet'
 import { initialMessageId, x3dhRespond } from '../crypto/x3dh'
@@ -71,6 +71,17 @@ export interface InboundDeps {
    *  marker, so an acked message is always durably in history. Absent in tests
    *  and pre-P10 callers (persistence simply skipped). */
   history?: HistoryStore
+  /** Map a sending DEVICE to the account it belongs to (Sesame). Conversations
+   *  are filed by account while sessions run between devices, so history rows and
+   *  tombstones are keyed by what this returns rather than by the routing label.
+   *  Cache-only by contract: it runs inside the per-peer lock, so it must never
+   *  reach the network. Absent in tests and for single-device peers, where the two
+   *  ids are the same string anyway. */
+  accountOf?: (deviceId: string) => Promise<string>
+  /** This device's own account id (Sesame). Needed to tell a copy of one of YOUR
+   *  OWN messages, sent by another of your devices, from anything else: only a
+   *  device of this same account may write into your outbound history. */
+  selfAccountId?: string
 }
 
 const lockName = (peerId: string) => `nightjar-session:${peerId}`
@@ -189,27 +200,91 @@ async function planHistory(
   plaintext: Uint8Array,
 ): Promise<HistoryPlan> {
   if (!deps.history) return { kind: 'none' }
+  // The conversation this belongs to, which is a PERSON, not the device that
+  // happened to send it. For every single-device peer these are the same string.
+  const peer = deps.accountOf ? await deps.accountOf(from) : from
   const decoded = decodeMessage(plaintext)
   if (decoded.kind === 'text') {
     if (decoded.ephemeral) return { kind: 'none' }
     const id = bytesToHex(decoded.id)
-    const key = deps.history.storageKey(from, 'in', id)
+    const key = deps.history.storageKey(peer, 'in', id)
     // A delete-for-everyone for this id may have arrived first: suppress it.
     if (await deps.store.hasTombstone(key)) return { kind: 'suppress' }
-    return { kind: 'put', row: deps.history.seal({ id, peerId: from, dir: 'in', ts: deps.now, text: decoded.body }) }
+    return { kind: 'put', row: deps.history.seal({ id, peerId: peer, dir: 'in', ts: deps.now, text: decoded.body }) }
   }
   if (decoded.kind === 'legacy') {
     // Legacy (pre-P10) plain text has no content id; key the row on the transport
     // envelope id so a redelivery still upserts the same row. Legacy messages are
     // never a delete target (deletes only address NJM1 content ids), so no tombstone
     // check is needed.
-    return { kind: 'put', row: deps.history.seal({ id: seenId, peerId: from, dir: 'in', ts: deps.now, text: decoded.body }) }
+    return { kind: 'put', row: deps.history.seal({ id: seenId, peerId: peer, dir: 'in', ts: deps.now, text: decoded.body }) }
+  }
+  if (decoded.kind === 'syncSent') {
+    // A copy of something this ACCOUNT sent, from one of its own devices, so the
+    // conversation shows the same thing everywhere you read it.
+    //
+    // Only ever accepted from a device of this same account. Anyone else offering
+    // one is trying to write into your outbound history, which would put words in
+    // your mouth in a conversation with somebody else; it is dropped. That check
+    // is the whole security of this record, since everything else about it (who it
+    // is addressed to, when it was written) is the sender's word.
+    if (!deps.selfAccountId || peer !== deps.selfAccountId) return { kind: 'none' }
+    const id = bytesToHex(decoded.id)
+    const key = deps.history.storageKey(decoded.accountId, 'out', id)
+    if (await deps.store.hasTombstone(key)) return { kind: 'suppress' }
+    return {
+      kind: 'put',
+      row: deps.history.seal({
+        id,
+        peerId: decoded.accountId,
+        dir: 'out',
+        // The ORIGINAL time, not now: a copy stamped on arrival would sort to
+        // whenever this device happened to be switched on.
+        ts: decoded.ts,
+        text: decoded.body,
+      }),
+    }
+  }
+  if (decoded.kind === 'syncRecv') {
+    // A copy of something somebody ELSE sent this account, passed on by whichever
+    // of its devices the sender actually addressed (the forwarding fallback).
+    //
+    // Same self-only rule, and it carries even more weight here than for a sent
+    // copy: this record writes an INBOUND message attributed to a third party, so
+    // without the check anyone could put words in a contact's mouth. The device
+    // offering it must be one of this account's own, proven by a roster this
+    // account signed.
+    if (!deps.selfAccountId || peer !== deps.selfAccountId) return { kind: 'none' }
+    const id = bytesToHex(decoded.id)
+    const key = deps.history.storageKey(decoded.accountId, 'in', id)
+    if (await deps.store.hasTombstone(key)) return { kind: 'suppress' }
+    return {
+      kind: 'put',
+      row: deps.history.seal({
+        id,
+        peerId: decoded.accountId,
+        dir: 'in',
+        // When it reached the device that forwarded it, not now, so the two
+        // devices agree on where it sits in the conversation.
+        ts: decoded.ts,
+        text: decoded.body,
+      }),
+    }
+  }
+  if (decoded.kind === 'syncDelete' || decoded.kind === 'syncRecvDelete') {
+    // The same self-only rule the synced copies above obey, and for the same
+    // reason: without it anyone could delete messages out of your history. The
+    // two differ only in which side of the conversation they reach: a message
+    // this account sent, or one it received from the named account.
+    if (!deps.selfAccountId || peer !== deps.selfAccountId) return { kind: 'none' }
+    const dir = decoded.kind === 'syncDelete' ? 'out' : 'in'
+    return { kind: 'delete', key: deps.history.storageKey(decoded.accountId, dir, bytesToHex(decoded.id)) }
   }
   if (decoded.kind === 'delete') {
     // Remove the (inbound-from-this-peer) target and tombstone it. The compound key
     // (this peer AND dir='in' AND the target content id) means a delete from a peer
     // can only remove a message THEY sent us, never our own or another peer's.
-    return { kind: 'delete', key: deps.history.storageKey(from, 'in', bytesToHex(decoded.id)) }
+    return { kind: 'delete', key: deps.history.storageKey(peer, 'in', bytesToHex(decoded.id)) }
   }
   // A control that stores nothing (a retry-request, 8.10) or an unknown record from
   // a future build: clean-ignored either way. The persist gate names what it saves,
@@ -223,7 +298,13 @@ async function handleInitial(env: Envelope, from: string, deps: InboundDeps): Pr
   if (!ih) throw new Error('inbound: initial envelope missing its initial header')
   // Bind the relay's routing label to the cryptographic identity, so the session
   // is keyed consistently with the `from` that later normal messages use.
-  if (deriveUserId(ih.ikSigPub) !== from) {
+  // A DEVICE binding (Sesame): `from` is the relay's routing label, which is the
+  // id of the device that sent this, and a ratchet session runs between devices.
+  // The ACCOUNT binding is a separate check, made by the contact store below,
+  // against a different key. Spelled out because the two ids are the same string
+  // for a single-device account and the derivation is identical, so the only thing
+  // keeping them apart is saying which one is meant.
+  if (deviceIdOf(ih.ikSigPub) !== from) {
     throw new Error('inbound: initial header identity does not match sender')
   }
 

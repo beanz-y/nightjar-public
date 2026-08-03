@@ -52,6 +52,7 @@ export class Transport {
   private readonly sentWaiters = new Map<string, () => void>()
   private deliverHandler: ((from: string, envJson: unknown) => void) | null = null
   private deliveredHandler: ((id: string, from: string) => void) | null = null
+  private linkChunkHandler: ((chunk: string) => void) | null = null
   private closeHandler: (() => void) | null = null
   private sendErrorHandler: ((ref: string, code: string, msg: string) => void) | null = null
 
@@ -169,6 +170,12 @@ export class Transport {
       this.deliverHandler?.(msg.from, msg.env)
       return
     }
+    if (msg.t === 'linkChunk') {
+      // Unsolicited, and deliberately NOT an envelope: a link chunk is not a
+      // ratchet message and must never reach the inbound processor (Sesame).
+      this.linkChunkHandler?.(msg.chunk)
+      return
+    }
     if (msg.t === 'delivered') {
       // Unsolicited (no reqId): the recipient's inbox reporting that one of our
       // envelopes was picked up. Purely a UI hint.
@@ -241,6 +248,12 @@ export class Transport {
    *  picked up one of our envelopes). */
   onDelivered(handler: (id: string, from: string) => void): void {
     this.deliveredHandler = handler
+  }
+
+  /** Register the link-chunk handler ({t:'linkChunk'}: one sealed chunk of a
+   *  device transfer, Sesame). Never routed to the inbound processor. */
+  onLinkChunk(handler: (chunk: string) => void): void {
+    this.linkChunkHandler = handler
   }
 
   onClose(handler: () => void): void {

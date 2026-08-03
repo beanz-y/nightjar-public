@@ -250,6 +250,11 @@ export const INFO_CONTACTS = 'Nightjar_Contacts_v1'
 export const INFO_SESSION_BODY = 'Nightjar_SessBody_v1'
 export const INFO_SESSION_INDEX = 'Nightjar_SessIndex_v1'
 export const INFO_PREKEYS = 'Nightjar_Prekeys_v1'
+/** Sub-key sealing the ACCOUNT key on a linked device (Sesame). Its own sub-key,
+ *  not a reuse of the contacts one: the account key signs device rosters, so it
+ *  is the most consequential secret this device holds after its own identity, and
+ *  it should not share a key with a blob that is read on every contact lookup. */
+export const INFO_ACCOUNT = 'Nightjar_Account_v1'
 
 // Ratchet sessions + the send queue at rest (P11). Until this, the sessions store
 // was keyed by the peer's userId in CLEARTEXT with the serialized ratchet state
@@ -294,6 +299,34 @@ export const LOCK_PRF_INPUT = 'Nightjar-applock-prf-v1'
  *  and each of the sender's own, and each device holds its own prekey pool, so
  *  this bounds both the fan-out and what one account can make the Directory hold. */
 export const MAX_DEVICES_PER_ACCOUNT = 8
+
+// Linking a device (Sesame). A new device shows a code; the existing device
+// scans it and sends that device everything it needs to join the account.
+//
+// The code carries a fresh 32-byte SECRET, and that secret is what makes the
+// transfer safe: it never touches the relay (it goes screen to camera, in the
+// room), so it both encrypts the payload and proves the sender is whoever
+// scanned the code. That is why linking needs no passphrase and no key
+// agreement, and why the transfer can be sent before the new device has
+// registered anything at all.
+/** Code shown by the device being linked: magic, version, its signing key, the
+ *  secret. The device id is NOT in it, because a device id IS the hash of that
+ *  key; deriving it removes a whole class of mismatch by construction. */
+export const LINK_CODE_MAGIC = 'NJLC'
+export const LINK_CODE_VERSION = 0x01
+export const LINK_SECRET_BYTES = 32
+/** The transfer itself: one or more independently sealed chunks. */
+export const LINK_MAGIC = 'NJLK'
+export const LINK_FORMAT_VERSION = 0x01
+export const INFO_LINK = 'Nightjar_Link_v1'
+export const LINK_SALT_BYTES = 16
+/** Plaintext bytes per chunk. Sized so a chunk plus its base64 expansion stays
+ *  well inside the relay's 64 KiB ciphertext ceiling. */
+export const LINK_MAX_CHUNK_BYTES = 32 * 1024
+/** Chunks one transfer may have, and therefore its payload ceiling (2 MiB).
+ *  Bounded because a receiving device buffers a transfer before opening it. */
+export const LINK_MAX_CHUNKS = 64
+export const LINK_MAX_PAYLOAD_BYTES = LINK_MAX_CHUNKS * LINK_MAX_CHUNK_BYTES
 
 // Post-loss message recovery: the retry-receipt (DESIGN 8.10). When a session is
 // gone on one side only (a move, a restore, an evicted database), the other side

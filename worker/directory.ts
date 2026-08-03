@@ -21,7 +21,7 @@ import {
   TAG_SPK,
   VERSION_FLOOR,
 } from '../src/crypto/constants'
-import { deriveUserId } from '../src/crypto/identity'
+import { deriveUserId, deviceIdOf } from '../src/crypto/identity'
 import { domainSeparate, ed25519Verify, u32be, u64be } from '../src/crypto/primitives'
 import { type FetchedBundle, type SignedPrekey, verifyFetchedBundle } from '../src/crypto/prekeys'
 import { verifyRoster } from '../src/crypto/roster'
@@ -55,6 +55,14 @@ interface PublishBody {
 }
 interface PublishRosterBody {
   roster: WireDeviceRoster
+}
+interface RegisterDeviceBody {
+  /** Server-verified: the id of the socket that asked, never a body claim. */
+  deviceId: string
+  /** Claimed, and checked against that account's signed roster. */
+  accountId: string
+  bundle: WirePublishedBundle
+  now: number
 }
 interface FetchBody {
   fetcher: string
@@ -157,6 +165,8 @@ export class Directory {
           return json(this.inviteRedemptions((await req.json()) as { inviter: string }))
         case '/publishRoster':
           return json(this.publishRoster((await req.json()) as PublishRosterBody))
+        case '/registerDevice':
+          return json(this.registerDevice((await req.json()) as RegisterDeviceBody))
         case '/fetchRoster':
           return json(this.fetchRoster((await req.json()) as { accountId: string }))
         default:
@@ -414,21 +424,122 @@ export class Directory {
     }
     // Monotonic, and equal versions are refused for the same reason the client
     // refuses them: two different rosters at one version means something is wrong.
-    const current = this.sql.exec('SELECT version FROM rosters WHERE account_id = ?', roster.accountId).toArray()[0] as
-      | { version: number }
+    const current = this.sql.exec('SELECT version, blob FROM rosters WHERE account_id = ?', roster.accountId).toArray()[0] as
+      | { version: number; blob: string }
       | undefined
     if (current && roster.version <= current.version) {
       throw new DirectoryError('stale_roster', `roster version ${roster.version} does not follow ${current.version}`, 409)
     }
-    this.sql.exec(
-      'INSERT INTO rosters (account_id, version, blob, updated_at) VALUES (?, ?, ?, ?) ' +
-        'ON CONFLICT(account_id) DO UPDATE SET version = excluded.version, blob = excluded.blob, updated_at = excluded.updated_at',
-      roster.accountId,
-      roster.version,
-      JSON.stringify(body.roster),
-      Date.now(),
-    )
-    return { version: roster.version }
+    // Storing the new list and retiring the prekeys of devices it drops are one
+    // change, so they commit together: a crash between them would leave an account
+    // whose stored list disagrees with which of its devices are reachable.
+    return this.ctx.storage.transactionSync(() => {
+      this.sql.exec(
+        'INSERT INTO rosters (account_id, version, blob, updated_at) VALUES (?, ?, ?, ?) ' +
+          'ON CONFLICT(account_id) DO UPDATE SET version = excluded.version, blob = excluded.blob, updated_at = excluded.updated_at',
+        roster.accountId,
+        roster.version,
+        JSON.stringify(body.roster),
+        Date.now(),
+      )
+      this.dropUnlistedDevices(
+        roster.accountId,
+        current ? (JSON.parse(current.blob) as WireDeviceRoster) : null,
+        body.roster,
+      )
+      return { version: roster.version }
+    })
+  }
+
+  /**
+   * Register an additional DEVICE of an account (Sesame). A new device is not a
+   * new user, so it consumes no invite: the account already passed that gate, and
+   * charging an invite per device would make linking a laptop cost the same as
+   * bringing a person in.
+   *
+   * What replaces the invite is the roster. The account must already have
+   * published a signed roster listing this device, which only the account key can
+   * produce, so authorization comes from the account itself rather than from us.
+   *
+   * `deviceId` is the SERVER-VERIFIED id of the socket that asked, never a claim
+   * in the body, exactly as ordinary registration works. `accountId` IS a claim,
+   * and a false one fails immediately: an account that did not list this device
+   * has no roster entry for it, and the roster is signed.
+   */
+  private registerDevice(body: RegisterDeviceBody): { opkCount: number } {
+    const roster = this.sql.exec('SELECT blob FROM rosters WHERE account_id = ?', body.accountId).toArray()[0] as
+      | { blob: string }
+      | undefined
+    if (!roster) throw new DirectoryError('no_roster', 'that account has not listed any devices')
+    const listed = (JSON.parse(roster.blob) as WireDeviceRoster).devices.some((d) => d.deviceId === body.deviceId)
+    if (!listed) throw new DirectoryError('not_listed', 'that account has not listed this device')
+
+    const decoded = decodePublishedBundle(body.bundle)
+    if (decoded.opks.length > MAX_OPKS_PER_REQUEST) {
+      throw new DirectoryError('too_many_opks', 'one-time prekey batch too large')
+    }
+    // Same proof of possession ordinary registration demands: the id is the hash
+    // of the presented key, and the signed prekey verifies under it, so publishing
+    // a bundle requires the device's private half rather than just its public id
+    // (which the roster makes public to everyone).
+    if (deviceIdOf(decoded.ikSigPub) !== body.deviceId) {
+      throw new DirectoryError('bad_userid', 'device id does not match IK_sig public key')
+    }
+    if (decoded.version < VERSION_FLOOR) throw new DirectoryError('bad_version', 'version below floor')
+    try {
+      verifyFetchedBundle({ ...decoded, opk: null }, body.now)
+    } catch (e) {
+      throw new DirectoryError('bad_bundle', `bundle failed verification: ${String(e)}`)
+    }
+    const canon = encodePublishedBundle(decoded)
+    const existing = this.sql.exec('SELECT ik_sig_pub FROM users WHERE user_id = ?', body.deviceId).toArray()[0] as
+      | { ik_sig_pub: string }
+      | undefined
+    if (existing && existing.ik_sig_pub !== canon.ikSigPub) {
+      throw new DirectoryError('id_taken', 'device id already registered to a different key')
+    }
+
+    return this.ctx.storage.transactionSync(() => {
+      if (existing) {
+        // Re-registration by the same device: same hard invalidation ordinary
+        // re-registration performs, for the same reason (fresh private halves).
+        this.sql.exec('DELETE FROM opks WHERE user_id = ?', body.deviceId)
+        this.sql.exec('DELETE FROM vends WHERE target = ?', body.deviceId)
+        this.sql.exec('DELETE FROM vends WHERE fetcher = ?', body.deviceId)
+      } else {
+        this.sql.exec(
+          'INSERT INTO users (user_id, ik_sig_pub, ik_dh_pub, idkbind_sig, version, registered_at) VALUES (?, ?, ?, ?, ?, ?)',
+          body.deviceId,
+          canon.ikSigPub,
+          canon.ikDhPub,
+          canon.idkbindSig,
+          decoded.version,
+          body.now,
+        )
+      }
+      this.storeBundle(body.deviceId, canon)
+      return { opkCount: this.opkCount(body.deviceId) }
+    })
+  }
+
+  /** Drop the published prekeys of devices an account has just stopped listing, so
+   *  a device that was removed can no longer have NEW sessions opened to it. This
+   *  is the only part of removal a server can enforce, and it is worth saying what
+   *  it is not: sessions that already exist keep working, and a device that kept a
+   *  copy of the account key can sign itself back on. Removal is not revocation.
+   *
+   *  The account's own row is never dropped, whatever a roster says. It holds the
+   *  account key that every future roster is verified against, so deleting it
+   *  would leave the account unable to change its own device list ever again. */
+  private dropUnlistedDevices(accountId: string, before: WireDeviceRoster | null, after: WireDeviceRoster): void {
+    if (!before) return
+    const kept = new Set(after.devices.map((d) => d.deviceId))
+    for (const d of before.devices) {
+      if (kept.has(d.deviceId) || d.deviceId === accountId) continue
+      this.sql.exec('DELETE FROM spks WHERE user_id = ?', d.deviceId)
+      this.sql.exec('DELETE FROM opks WHERE user_id = ?', d.deviceId)
+      this.sql.exec('DELETE FROM vends WHERE target = ?', d.deviceId)
+    }
   }
 
   /** The account's current roster, or null if it has never published one (which

@@ -12,6 +12,7 @@
 // envelope; `ack`/`sent` are the two delivery-acknowledgement layers (DESIGN 7.2).
 
 import type {
+  WireDeviceRoster,
   WireFetchedBundle,
   WireEnvelope,
   WireOneTimePrekey,
@@ -59,6 +60,52 @@ export interface MintInviteMsg {
 export interface InviteRedemptionsMsg {
   t: 'inviteRedemptions'
   reqId: string
+}
+
+/** Publish this account's signed device roster (Sesame). The roster carries its
+ *  own authorization: it is signed by the account key, and the Directory verifies
+ *  that signature against the identity key registered for the account it names.
+ *  The CALLER is deliberately not the authorization, because a linked device
+ *  authenticates as itself and must still be able to update its account's roster. */
+export interface PublishRosterMsg {
+  t: 'publishRoster'
+  reqId: string
+  roster: WireDeviceRoster
+}
+
+/** One chunk of a link transfer, sent to a device being linked (Sesame).
+ *
+ *  Deliberately NOT an envelope, and deliberately NOT stored. A link payload
+ *  carries the account's private key, sealed under a secret that only travelled
+ *  screen to camera; parking that in a relay queue for up to thirty days would be
+ *  a worse exposure than requiring both devices to be awake for the few seconds
+ *  the ceremony takes. So this is delivered to a live socket or it fails, exactly
+ *  like the delivery note (DESIGN 7.5), and nothing is written down. */
+export interface SendLinkMsg {
+  t: 'sendLink'
+  reqId: string
+  to: string
+  /** One sealed chunk from src/crypto/link.ts, base64url. */
+  chunk: string
+}
+
+/** Register this device's prekey bundle as a device of `accountId` (Sesame).
+ *  Consumes no invite: a new device is not a new user. The account must already
+ *  have published a roster listing this device, which only its account key can
+ *  produce, so the roster is what authorizes this in an invite's place. */
+export interface RegisterDeviceMsg {
+  t: 'registerDevice'
+  reqId: string
+  accountId: string
+  bundle: WirePublishedBundle
+}
+
+/** Ask where an account's devices are. Answered with null for any account that
+ *  has never published a roster, which today is every account. */
+export interface FetchRosterMsg {
+  t: 'fetchRoster'
+  reqId: string
+  accountId: string
 }
 
 export interface SendMsg {
@@ -125,6 +172,10 @@ export type ClientMessage =
   | FetchBundleMsg
   | MintInviteMsg
   | InviteRedemptionsMsg
+  | PublishRosterMsg
+  | FetchRosterMsg
+  | RegisterDeviceMsg
+  | SendLinkMsg
   | SendMsg
   | AckMsg
   | DrainMsg
@@ -175,6 +226,30 @@ export interface InviteMsg {
   reqId: string
   code: string
   inviterFingerprint: string // base32 user id of the inviter (DESIGN 6.3)
+}
+
+/** A link chunk arriving at the device being linked. `from` is the server-verified
+ *  device that sent it, which is a routing fact only: what actually authenticates
+ *  the transfer is that it opens under the secret from the scanned code. */
+export interface LinkChunkMsg {
+  t: 'linkChunk'
+  from: string
+  chunk: string
+}
+
+export interface RosterPublishedMsg {
+  t: 'rosterPublished'
+  reqId: string
+  version: number
+}
+
+export interface RosterMsg {
+  t: 'roster'
+  reqId: string
+  accountId: string
+  /** null: this account has never published a roster, so it is the single device
+   *  at its own account id. Not an error, and the common case. */
+  roster: WireDeviceRoster | null
 }
 
 export interface RedemptionsMsg {
@@ -239,6 +314,9 @@ export type ServerMessage =
   | BundleMsg
   | InviteMsg
   | RedemptionsMsg
+  | RosterPublishedMsg
+  | RosterMsg
+  | LinkChunkMsg
   | DeliverMsg
   | SentMsg
   | DeliveredMsg

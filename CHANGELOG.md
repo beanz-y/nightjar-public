@@ -9,7 +9,91 @@ or the commit page on the repository host). The format is loosely based on
 [Keep a Changelog](https://keepachangelog.com/); version headings correspond to the
 release tags cut by the deploy pipeline. Dates are the tag dates.
 
-## [Unreleased]
+## [1.12.0] - 2026-08-03
+
+### Added
+- **Your account and your device are now two different things, and your first device is
+  both.** An account is you: it is what a conversation is filed under, and what a safety
+  number covers. A device is one of the things you read Nightjar on: it is what the
+  server authenticates, and what a conversation's encryption actually runs between. On
+  your first device these are the same key, on purpose, and that is what lets extra
+  devices arrive without disturbing anything: your id, your inbox, your conversations
+  and above all your safety numbers stay exactly as they are, and nobody has to verify
+  anybody again. The honest cost, in DESIGN 3.1: a first device cannot be removed from
+  its own account, because it IS the account. Retiring it means moving to a new device,
+  or changing your account key, which asks every contact to verify you again.
+- **The app can now be told where someone's devices are, and decide whether to believe
+  it.** A device list is used only if it is signed by that person's account key AND is
+  newer than the last one this app accepted for them. An old list served again is
+  refused, which matters because that is how a server would hide a device someone
+  removed: the signature on it is perfectly genuine, and only your app's memory can
+  catch it. Anything refused leaves the devices you already knew about in place, since
+  failing to deliver would be the worse outcome. Any change to someone's devices raises
+  an alert, because the server cannot cause one: a new device on someone's account is
+  either a device they really added, or something that already holds their account key,
+  and only they can tell you which.
+- **Add this device to an account you already use.** On a new device, choose it during
+  setup instead of entering an invite: it shows a code, you point your existing device
+  at that code, and your existing device hands over what the new one needs. It consumes
+  no invite, because being on your account's signed list is what authorizes it.
+- **The handover happens on screen, not over the network.** The code carries a
+  single-use secret, so the transfer is sealed under something the server has never
+  seen, and by default it travels as a moving code from one screen to the other camera,
+  so the server carries no part of it at all. If one of the devices has no camera there
+  is a fallback that sends it over the relay instead: still sealed under the scanned
+  code, delivered only while both devices are open, and never stored. What neither
+  option hides is that it HAPPENED, because adding the device publishes a list and the
+  new device registers itself. The payload is private; the event is not.
+- **Messages now go to every device someone reads on.** One message becomes one
+  delivery per device, each separately encrypted, and your own other devices get a copy
+  of what you send so a conversation reads the same wherever you open it. For anyone
+  who has not added a device, which is everyone until they do, this is byte for byte
+  the single delivery it always was.
+- **Messages from people running an older app still reach all your devices.** Their app
+  addresses one device and always will, so a message that arrives without a claim that
+  it went everywhere is passed on by the device that got it. Session-only messages are
+  never passed on, deliberately: they are the one kind that promises to be written down
+  nowhere, and a forward would sit in a queue until it was delivered.
+- **Deleting reaches everywhere too**, in both directions: deleting a message you sent
+  removes it from your other devices as well as asking theirs, and a delete you receive
+  is passed to your other devices the same way a message is.
+- **A devices screen, in Settings.** See what can read your messages, add another, or
+  remove one. Removing is described for what it is and not oversold: others stop
+  sending to that device, and it keeps everything it already had. It is not a way to
+  take anything back, and for a device that is LOST rather than finished with, the
+  honest position is that your account is compromised.
+
+### Changed
+- **"Delivered" now means at least one of their devices picked it up**, when someone
+  reads on more than one. It is not a count and it does not say which device, on
+  purpose: reporting where somebody reads their messages is exactly the kind of fact
+  this indicator exists not to leak.
+- **Asking a contact to resend messages you could not read is bounded per PERSON, and
+  answered to the DEVICE that asked.** Both halves matter: bounding per person is what
+  stops somebody reading on three devices pulling three times the limit, and that limit
+  is what caps what a stolen identity is worth; answering the asking device is what
+  gets the messages to the one that could not read them.
+
+### What this deliberately does not do
+- **A device you add starts empty.** Nothing you have already received moves to it.
+  Messages sent and received from then on reach both.
+- **Verification never syncs.** A new device shows every contact as unverified until
+  you compare safety numbers on THAT device. Nothing remote can mark a contact
+  verified, not even another of your own devices, and that is the point. Be clear about
+  what re-checking buys: the digits are identical on both devices, so it is performing
+  the ritual again rather than new proof. What it produces is a record on that device
+  that nothing remote can forge.
+- **Your safety numbers do not change when you add a device**, because they cover your
+  account rather than each machine. A contact who verified you stays verified with no
+  scary banner, which is what makes this usable. The same fact read the other way is
+  the uncomfortable one, and DESIGN 1.3 and 6.2 now say it plainly: a device of yours
+  that somebody else got hold of would still show your contacts matching digits. The
+  signal for that is the alert when someone's devices change, not the safety number.
+- **An app just restored from a backup, or moved to a new device, starts with no memory
+  of anyone's device lists**, so until it builds that memory up it has nothing to refuse
+  an out-of-date list against.
+- **More devices means more one-time keys used**, so a device left on an account and
+  never removed is a small permanent cost on every message sent to you.
 
 ## [1.11.0] - 2026-08-03
 

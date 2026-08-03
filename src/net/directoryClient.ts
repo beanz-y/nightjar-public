@@ -3,7 +3,15 @@
 // promise if the server returns an { t:'error' } with the same reqId.
 
 import type { FetchedBundle } from '../crypto/prekeys'
-import { type WirePublishedBundle, type WireSignedPrekey, type WireOneTimePrekey, decodeFetchedBundle } from '../wire/codec'
+import type { DeviceRoster } from '../crypto/roster'
+import {
+  type WireDeviceRoster,
+  type WirePublishedBundle,
+  type WireSignedPrekey,
+  type WireOneTimePrekey,
+  decodeDeviceRoster,
+  decodeFetchedBundle,
+} from '../wire/codec'
 import type { Transport } from './transport'
 
 function reqId(): string {
@@ -49,6 +57,43 @@ export class DirectoryClient {
     const r = await this.transport.request(id, { t: 'inviteRedemptions', reqId: id })
     if (r.t !== 'redemptions') throw new Error(`inviteRedemptions: unexpected ${r.t}`)
     return Array.isArray(r.joiners) ? r.joiners : []
+  }
+
+  /** Register this device's bundle as a device of `accountId` (Sesame). Consumes
+   *  no invite; the account's signed roster listing this device is what authorizes
+   *  it, so this fails until the linking device has published that roster. */
+  async registerDevice(accountId: string, bundle: WirePublishedBundle): Promise<number> {
+    const id = reqId()
+    const r = await this.transport.request(id, { t: 'registerDevice', reqId: id, accountId, bundle })
+    if (r.t !== 'registered') throw new Error(`registerDevice: unexpected ${r.t}`)
+    return r.opkCount
+  }
+
+  /** Publish this account's signed device roster (Sesame). The signature is the
+   *  authorization, so this works from any of the account's devices. */
+  async publishRoster(roster: WireDeviceRoster): Promise<number> {
+    const id = reqId()
+    const r = await this.transport.request(id, { t: 'publishRoster', reqId: id, roster })
+    if (r.t !== 'rosterPublished') throw new Error(`publishRoster: unexpected ${r.t}`)
+    return r.version
+  }
+
+  /** Where an account's devices are, or null if it has never published a roster
+   *  (every account today). Decoding is STRUCTURAL only: the relay is untrusted,
+   *  so a roster is not to be believed until `verifyRoster` has checked it under
+   *  an account key the caller already holds. A structurally broken answer
+   *  degrades to null, which the caller reads as "one device", rather than
+   *  throwing at a call site that only wanted an address. */
+  async fetchRoster(accountId: string): Promise<DeviceRoster | null> {
+    const id = reqId()
+    const r = await this.transport.request(id, { t: 'fetchRoster', reqId: id, accountId })
+    if (r.t !== 'roster') throw new Error(`fetchRoster: unexpected ${r.t}`)
+    if (!r.roster) return null
+    try {
+      return decodeDeviceRoster(r.roster)
+    } catch {
+      return null
+    }
   }
 
   /** Which of `ids` the recipient's inbox has recorded as picked up (delivery

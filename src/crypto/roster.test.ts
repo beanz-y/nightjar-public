@@ -12,6 +12,7 @@ import {
   type RosterDevice,
   RosterError,
   isRosterNewer,
+  rosterDeviceIds,
   rosterDiff,
   rosterSigningBytes,
   signRoster,
@@ -167,11 +168,18 @@ describe('rollback and change detection', () => {
   })
 
   it('reports what changed, which is what the contact has to be told', () => {
-    const phone = deviceFor(2)
-    const laptop = deviceFor(3)
-    const before = rosterOf([phone], 1)
-    expect(rosterDiff(before, rosterOf([phone, laptop], 2))).toEqual({ added: [laptop.deviceId], removed: [] })
-    expect(rosterDiff(before, rosterOf([laptop], 2))).toEqual({ added: [laptop.deviceId], removed: [phone.deviceId] })
-    expect(rosterDiff(null, before)).toEqual({ added: [phone.deviceId], removed: [] })
+    const phone = deviceFor(2).deviceId
+    const laptop = deviceFor(3).deviceId
+    expect(rosterDiff([phone], [phone, laptop])).toEqual({ added: [laptop], removed: [] })
+    expect(rosterDiff([phone], [laptop])).toEqual({ added: [laptop], removed: [phone] })
+    expect(rosterDiff([phone], [phone])).toEqual({ added: [], removed: [] })
+    // A first sighting is not a change: there is nothing it differs from.
+    expect(rosterDiff(null, [phone])).toEqual({ added: [phone], removed: [] })
+  })
+
+  it('reads the device ids out of a roster in the order it lists them', () => {
+    const a = deviceFor(2)
+    const b = deviceFor(3)
+    expect(rosterDeviceIds(rosterOf([a, b]))).toEqual([a.deviceId, b.deviceId])
   })
 })

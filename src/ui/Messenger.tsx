@@ -11,6 +11,7 @@ import type { Identity } from '../crypto/identity'
 import type { Contact } from '../trust/contactStore'
 import type { CanaryResult } from '../verify/canary'
 import { Conversation } from './Conversation'
+import type { DeviceRow } from './DevicesPanel'
 import { NewChat } from './NewChat'
 import { SafetyNumberView, TrustBadge } from './SafetyNumber'
 import { Settings } from './Settings'
@@ -60,6 +61,11 @@ interface Props {
     >
     createMove: (passphrase: string) => Promise<boolean>
     eraseThisDevice: () => Promise<void>
+    listDevices: () => Promise<DeviceRow[]>
+    removeDevice: (deviceId: string) => Promise<boolean>
+    authorizeNewDevice: (codeText: string) => Promise<{ deviceId: string; secret: Uint8Array } | null>
+    sealLinkTransfer: (secret: Uint8Array) => Promise<Uint8Array | null>
+    sendLinkOverRelay: (deviceId: string, secret: Uint8Array) => Promise<boolean>
     addBiometric: () => void
     removeBiometric: () => void
   }
@@ -197,6 +203,11 @@ export function Messenger({ identity, connected, removedPeer, contacts, aliases,
           onPrepareMove={actions.prepareMove}
           onCreateMove={actions.createMove}
           onEraseDevice={actions.eraseThisDevice}
+          onListDevices={actions.listDevices}
+          onRemoveDevice={actions.removeDevice}
+          onAuthorizeDevice={actions.authorizeNewDevice}
+          onSealLink={actions.sealLinkTransfer}
+          onSendLinkOverRelay={actions.sendLinkOverRelay}
           onEnableNotifications={actions.enableNotifications}
           onDisableNotifications={actions.disableNotifications}
           onAddBiometric={actions.addBiometric}

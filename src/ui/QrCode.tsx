@@ -1,8 +1,12 @@
 // Renders a QR matrix (src/ui/qr.ts) as a self-contained, crisp SVG. No external
 // libraries and no raster canvas, so it is safe under the strict CSP and scales
-// to any size. The payload here is never secret (a safety number derives from
-// PUBLIC identity keys; an invite URL is meant to be shared), so a display-only
-// QR leaks nothing.
+// to any size.
+//
+// Most of what this shows is public by construction: a safety number derives from
+// PUBLIC identity keys, and an invite URL is meant to be handed out. The device
+// LINKING code (Sesame) is the one exception and carries a single-use secret, so
+// the screen showing it is doing the same job a shared secret would, and the
+// caller says so on that screen. Nothing here writes anything down either way.
 
 import { useMemo } from 'react'
 import { qrMatrix } from './qr'
