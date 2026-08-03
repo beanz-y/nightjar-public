@@ -40,6 +40,28 @@ export function deriveUserId(ikSigPub: Uint8Array): string {
   return base32lower(hash256(ikSigPub))
 }
 
+// Multi-device (Sesame) names the two things this same derivation is used for.
+// They are deliberately separate exports over one implementation, because the
+// KEYS differ and confusing them is the easiest bug to write in this area:
+//
+//   - an ACCOUNT id is the hash of the account key, which is what a person IS.
+//     It is what a contact record binds, what a safety number covers, and what a
+//     conversation is filed under.
+//   - a DEVICE id is the hash of one device's own key. It is what the relay
+//     authenticates, what addresses an inbox, and what a ratchet session runs
+//     between.
+//
+// On an account's first device these are the SAME key, so the two ids are equal.
+// That is what lets an existing single-device user keep their id, their inbox and
+// their safety numbers when multi-device arrives, and it is exactly why a call
+// site must say which one it means.
+
+/** The id of an account, from its account key. Binds contacts and safety numbers. */
+export const accountIdOf = deriveUserId
+
+/** The id of one device, from that device's own key. Binds inboxes and sessions. */
+export const deviceIdOf = deriveUserId
+
 function bindIkDh(ikDhPub: Uint8Array, ikSigPriv: Uint8Array): Uint8Array {
   return ed25519Sign(domainSeparate(TAG_IDKBIND, ikDhPub), ikSigPriv)
 }

@@ -11,6 +11,13 @@ export const VERSION = 0x01
 export const TAG_IDKBIND = 'Nightjar-idkbind-v1'
 export const TAG_SPK = 'Nightjar-spk-v1'
 export const TAG_AUTH = 'Nightjar-auth-v1'
+/** Device roster (Sesame, multi-device). Its own tag is not housekeeping: on an
+ *  account's FIRST device the account key and the device key are the same key
+ *  (which is what lets existing users keep their id and their safety numbers), so
+ *  that one key signs auth challenges, signed prekeys AND rosters. Without a
+ *  distinct length-framed tag here, one of those uses would be an oracle for
+ *  another, which is the exact v0.1 bug the design caught on paper. */
+export const TAG_ROSTER = 'Nightjar-roster-v1'
 
 // KDF info strings, one per derivation, all versioned (DESIGN 4.2, 5.1).
 export const INFO_X3DH = 'Nightjar_X3DH_v1'
@@ -279,6 +286,14 @@ export const PIN_MIN_DIGITS = 6
 /** Fixed WebAuthn PRF evaluation input, pinned so the derived PRF secret is
  *  stable for a credential across unlocks. */
 export const LOCK_PRF_INPUT = 'Nightjar-applock-prf-v1'
+
+// Device roster (Sesame). An account's devices are listed in a roster signed by
+// the ACCOUNT key and served by the Directory to anyone who asks, so a sender
+// knows every device to fan a message out to.
+/** Devices one account may list. Every send fans out to each of a peer's devices
+ *  and each of the sender's own, and each device holds its own prekey pool, so
+ *  this bounds both the fan-out and what one account can make the Directory hold. */
+export const MAX_DEVICES_PER_ACCOUNT = 8
 
 // Post-loss message recovery: the retry-receipt (DESIGN 8.10). When a session is
 // gone on one side only (a move, a restore, an evicted database), the other side

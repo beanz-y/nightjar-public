@@ -22,7 +22,7 @@ import { MemorySentinel } from './persist'
 import { SessionSealer } from './sessionSeal'
 import { IdbSessionStore } from './sessionStore'
 import { IDENTITY_KEY } from './identityStore'
-import { MOVE_REFRESH_KEY, RESTORE_PENDING_KEY, stageMove } from './restore'
+import { RESTORE_PENDING_KEY, stageMove } from './restore'
 
 const stubKdf = (s: Uint8Array, salt: Uint8Array) => hash256(new Uint8Array([...s, ...salt]))
 const NOW = 1_700_000_000_000
@@ -93,10 +93,32 @@ describe('stageMove (Phase D)', () => {
     expect(dm!.hadSession).toBe(false)
 
     // The refresh list is every imported contact EXCEPT the dismissed one.
-    const refresh = JSON.parse(new TextDecoder().decode((await d.keys.get(MOVE_REFRESH_KEY))!)) as string[]
-    expect(refresh).toEqual([alice.peerId])
+    expect(await d.contacts.getMoveRefresh()).toEqual([alice.peerId])
+    // And it is SEALED. Stored in the clear it was a plaintext roster of everyone
+    // this device had just imported, sitting on disk precisely when a freshly
+    // moved device is most likely to be lost, which contradicted 8.5.
+    const raw = await d.keys.get('move.refresh.v1')
+    expect(raw).toBeTruthy()
+    expect(new TextDecoder().decode(raw!)).not.toContain(alice.peerId)
     void serializeIdentity // (imported for parity with the restore module's own use)
     void expectedUser
+  })
+
+  it('adopts a plaintext refresh list left by an older build, and re-seals it', async () => {
+    // A device that moved under 1.9.0 or 1.10.0 may still be holding an undrained
+    // list in the clear. Losing it would leave those contacts sending on dead
+    // sessions with no ping to fix them, which is the exact hole the list closes,
+    // so it is adopted rather than discarded.
+    const d = await device()
+    const alice = contactFor()
+    await d.keys.put('move.refresh.v1', new TextEncoder().encode(JSON.stringify([alice.peerId])))
+
+    expect(await d.contacts.getMoveRefresh()).toEqual([alice.peerId])
+
+    // Reading it once converts it, so the plaintext does not linger.
+    const raw = await d.keys.get('move.refresh.v1')
+    expect(new TextDecoder().decode(raw!)).not.toContain(alice.peerId)
+    expect(await d.contacts.getMoveRefresh()).toEqual([alice.peerId])
   })
 
   it('leaves NO identity when the history stage throws (crash-before-commit is recoverable)', async () => {

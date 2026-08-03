@@ -11,6 +11,37 @@ release tags cut by the deploy pipeline. Dates are the tag dates.
 
 ## [Unreleased]
 
+## [1.11.0] - 2026-08-03
+
+### Added
+- **Groundwork for using Nightjar on more than one device.** An account can now have
+  a signed list of its own devices, and the server can store one and hand it out, so
+  that whoever writes to you can reach every device you read on. Nothing publishes such
+  a list yet and nothing behaves differently: an account with no list reads as the
+  single device it already is, which is also how an account that never adds a second
+  device will keep reading. What landed is the format, the signature rules, and the
+  server side that refuses anything an account did not sign.
+- The parts that were worth getting right before anything depends on them, in DESIGN
+  7.5 and 9: the server can store a device list but can never write one, because it
+  holds no keys and checks every list against the identity key already registered for
+  that account. Its refusal to accept an older list only keeps an honest server honest;
+  what actually protects you is that your app remembers the newest list it has seen for
+  each contact and will not go backwards. The list holds no device names, because
+  anyone who might message you has to be able to read it, so naming a device would
+  publish that name. It does tell the server how many devices you have and when each
+  was added, which cannot be avoided if people are to reach them.
+
+### Fixed
+- **The list of contacts a moved device still needs to reach was stored unencrypted.**
+  After moving to a new device, the app keeps a short list of the contacts it still
+  owes a session-refresh ping, so a crash before the first connect cannot lose it. That
+  list was written beside the identity in plain text rather than with the rest of your
+  contact data, so a freshly moved device held a readable list of everyone you had
+  just imported until it finished draining. It is now encrypted like every other
+  contact blob, which makes DESIGN 8.5's statement that nothing stored names a contact
+  true again. A list left over in the clear by an earlier version is picked up and
+  re-encrypted the first time it is read, so no pending pings are lost.
+
 ## [1.10.0] - 2026-08-03
 
 ### Added

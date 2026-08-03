@@ -24,12 +24,15 @@ import {
 import { deriveUserId } from '../src/crypto/identity'
 import { domainSeparate, ed25519Verify, u32be, u64be } from '../src/crypto/primitives'
 import { type FetchedBundle, type SignedPrekey, verifyFetchedBundle } from '../src/crypto/prekeys'
+import { verifyRoster } from '../src/crypto/roster'
 import {
+  type WireDeviceRoster,
   type WireFetchedBundle,
   type WireOneTimePrekey,
   type WirePublishedBundle,
   type WireSignedPrekey,
   b64decode,
+  decodeDeviceRoster,
   decodePublishedBundle,
   decodeSignedPrekey,
   encodePublishedBundle,
@@ -49,6 +52,9 @@ interface PublishBody {
   spk: WireSignedPrekey
   opks: WireOneTimePrekey[]
   now: number
+}
+interface PublishRosterBody {
+  roster: WireDeviceRoster
 }
 interface FetchBody {
   fetcher: string
@@ -118,6 +124,12 @@ export class Directory {
         used_at INTEGER
       );
       CREATE INDEX IF NOT EXISTS idx_invites_inviter ON invites(inviter);
+      CREATE TABLE IF NOT EXISTS rosters (
+        account_id TEXT PRIMARY KEY,
+        version INTEGER NOT NULL,
+        blob TEXT NOT NULL,
+        updated_at INTEGER NOT NULL
+      );
     `)
   }
 
@@ -143,6 +155,10 @@ export class Directory {
           return json(this.isRegistered((await req.json()) as { userId: string }))
         case '/inviteRedemptions':
           return json(this.inviteRedemptions((await req.json()) as { inviter: string }))
+        case '/publishRoster':
+          return json(this.publishRoster((await req.json()) as PublishRosterBody))
+        case '/fetchRoster':
+          return json(this.fetchRoster((await req.json()) as { accountId: string }))
         default:
           return json({ code: 'not_found', msg: 'unknown directory op' }, 404)
       }
@@ -356,6 +372,74 @@ export class Directory {
   }
 
   // --- bundle fetch + OPK vend ------------------------------------------
+
+  // --- device rosters (Sesame) -------------------------------------------
+  //
+  // An account's roster says which devices are its own, so a sender knows every
+  // device to deliver a copy to. The Directory stores it and serves it; it can
+  // never author one, because it holds no account key.
+  //
+  // Authorization is the SIGNATURE, not the caller. That is deliberate: a linked
+  // device authenticates to the relay as ITSELF (its own device id), so requiring
+  // the caller to be the account would make every device but the first unable to
+  // publish. Anyone may relay a validly signed roster, and the worst they can do
+  // is publish one the account genuinely signed, no earlier than the account
+  // signed it, which is not an attack.
+  //
+  // The server checks the signature and monotonicity so a peer cannot publish
+  // rubbish for someone else, and so an account cannot be quietly rolled back
+  // here. That is a LIVENESS guarantee, not a security one: a hostile operator
+  // owns this code and can serve whatever it likes. The binding defence is the
+  // client's high-water mark (src/crypto/roster.ts isRosterNewer).
+  private publishRoster(body: PublishRosterBody): { version: number } {
+    // Shape first, signature below. A malformed roster is the caller's mistake, so
+    // it is a 400 rather than the 500 an unwrapped decode throw would produce.
+    let roster
+    try {
+      roster = decodeDeviceRoster(body.roster)
+    } catch (e) {
+      throw new DirectoryError('bad_roster', String(e instanceof Error ? e.message : e), 400)
+    }
+    // The account key is the identity key registered under the account id. On an
+    // account's first device those are the same key, which is what lets an
+    // existing single-device user become a one-device account with nothing moving.
+    const owner = this.sql.exec('SELECT ik_sig_pub FROM users WHERE user_id = ?', roster.accountId).toArray()[0] as
+      | { ik_sig_pub: string }
+      | undefined
+    if (!owner) throw new DirectoryError('not_registered', 'no such account')
+    try {
+      verifyRoster(roster, b64decode(owner.ik_sig_pub, 32), Date.now())
+    } catch (e) {
+      throw new DirectoryError('bad_roster', String(e instanceof Error ? e.message : e), 400)
+    }
+    // Monotonic, and equal versions are refused for the same reason the client
+    // refuses them: two different rosters at one version means something is wrong.
+    const current = this.sql.exec('SELECT version FROM rosters WHERE account_id = ?', roster.accountId).toArray()[0] as
+      | { version: number }
+      | undefined
+    if (current && roster.version <= current.version) {
+      throw new DirectoryError('stale_roster', `roster version ${roster.version} does not follow ${current.version}`, 409)
+    }
+    this.sql.exec(
+      'INSERT INTO rosters (account_id, version, blob, updated_at) VALUES (?, ?, ?, ?) ' +
+        'ON CONFLICT(account_id) DO UPDATE SET version = excluded.version, blob = excluded.blob, updated_at = excluded.updated_at',
+      roster.accountId,
+      roster.version,
+      JSON.stringify(body.roster),
+      Date.now(),
+    )
+    return { version: roster.version }
+  }
+
+  /** The account's current roster, or null if it has never published one (which
+   *  is every account until it links a second device). A null is not an error:
+   *  the caller treats the account as a single device at its account id. */
+  private fetchRoster(body: { accountId: string }): { roster: WireDeviceRoster | null } {
+    const row = this.sql.exec('SELECT blob FROM rosters WHERE account_id = ?', body.accountId).toArray()[0] as
+      | { blob: string }
+      | undefined
+    return { roster: row ? (JSON.parse(row.blob) as WireDeviceRoster) : null }
+  }
 
   private fetchBundle(body: FetchBody): { bundle: WireFetchedBundle | null; degraded: boolean } {
     const user = this.sql.exec('SELECT * FROM users WHERE user_id = ?', body.target).toArray()[0] as

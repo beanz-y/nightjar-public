@@ -41,7 +41,6 @@ import { type Sentinel, createSentinel, requestPersistentStorage } from '../stor
 import { PREKEYS_KEY, PrekeyStore } from '../storage/prekeyStore'
 import { type BackupPayload } from '../crypto/backup'
 import {
-  MOVE_REFRESH_KEY,
   RESTORE_PENDING_KEY,
   clearPendingRestore,
   pendingRestore,
@@ -320,22 +319,13 @@ export function useNightjar() {
   // Durable progress: the list is rewritten after every peer, so a mid-drain
   // crash resumes where it stopped. Permanent failures (peer unregistered, key
   // conflict) drop the peer; transient ones keep the rest for the next connect.
-  const drainMoveRefresh = useCallback(async (client: NightjarClient, keys: KeyStore): Promise<void> => {
+  const drainMoveRefresh = useCallback(async (client: NightjarClient, keys: KeyStore, contacts: ContactStore): Promise<void> => {
     if (drainingMoveRef.current) return
     drainingMoveRef.current = true
     try {
-      const raw = await keys.get(MOVE_REFRESH_KEY)
-      if (!raw) return
+      let list = await contacts.getMoveRefresh()
+      if (list.length === 0) return
       if (await pendingRestore(keys)) return // reregister not done; retried next connect
-      let list: string[]
-      try {
-        const parsed = JSON.parse(new TextDecoder().decode(raw)) as unknown
-        if (!Array.isArray(parsed) || parsed.some((p) => typeof p !== 'string')) throw new Error('shape')
-        list = parsed as string[]
-      } catch {
-        await keys.delete(MOVE_REFRESH_KEY).catch(() => {})
-        return
-      }
       while (list.length > 0) {
         const peer = list[0]
         try {
@@ -349,8 +339,7 @@ export function useNightjar() {
           if (!permanent) return // transient: keep the remainder for the next connect
         }
         list = list.slice(1)
-        if (list.length === 0) await keys.delete(MOVE_REFRESH_KEY)
-        else await keys.put(MOVE_REFRESH_KEY, new TextEncoder().encode(JSON.stringify(list)))
+        await contacts.setMoveRefresh(list) // empty deletes the blob
       }
     } catch {
       /* best-effort: retried on the next connect */
@@ -462,7 +451,7 @@ export function useNightjar() {
                 .catch(() => {})
             }
             void completeRestoreIfPending(client, stores.keys)
-              .then(() => drainMoveRefresh(client, stores.keys))
+              .then(() => drainMoveRefresh(client, stores.keys, stores.contacts))
               .catch(() => {})
             setRegistered(client.isRegistered)
             void listContacts().catch(() => {})
@@ -510,7 +499,7 @@ export function useNightjar() {
       setRegistered(authed.registered)
       if (authed.registered) {
         await completeRestoreIfPending(client, stores.keys)
-        void drainMoveRefresh(client, stores.keys)
+        void drainMoveRefresh(client, stores.keys, stores.contacts)
       }
       if (!mountedRef.current) return
       await listContacts()
@@ -811,9 +800,9 @@ export function useNightjar() {
       // connect re-register a fresh set, exactly as a restore does.
       await stores.keys.delete(PREKEYS_KEY)
       await stores.keys.put(RESTORE_PENDING_KEY, Uint8Array.from([1]))
-      // A pending move-refresh list would re-add (via first-contact recording)
-      // the very contacts this reset just wiped; it dies with them.
-      await stores.keys.delete(MOVE_REFRESH_KEY)
+      // A pending move-refresh list would re-add (via first-contact recording) the
+      // very contacts this reset just wiped. It dies with them inside
+      // wipeLocalData above, which is where it lives now that it is sealed (8.5).
       await stores.appLock.reset()
       // Tell any sibling tab still holding the old key to stop. This tab is on the
       // lock screen with no channel open, so it posts through a one-shot one.
@@ -1219,7 +1208,6 @@ export function useNightjar() {
       await stores.contacts.wipeLocalData().catch(() => {})
       await stores.keys.delete(PREKEYS_KEY).catch(() => {})
       await stores.keys.delete(RESTORE_PENDING_KEY).catch(() => {})
-      await stores.keys.delete(MOVE_REFRESH_KEY).catch(() => {})
       await stores.keys.delete(IDENTITY_KEY).catch(() => {})
       await stores.appLock.reset().catch(() => {})
       await stores.sentinel.unmark().catch(() => {})

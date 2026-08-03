@@ -664,9 +664,26 @@ Reuses Mirkwood's RFC 8291 (aes128gcm) + RFC 8292 (VAPID) sender.
 
 Public prekey bundles; transient undelivered ciphertext (deleted on ack, 30-day
 TTL); per-Inbox seen-id sets; a few push subscriptions per user; invite records;
-and, **only if the user opts in**, a passphrase-wrapped identity backup blob
-(8.3). No message content at rest, no delivery logs, no server-side read
-receipts, no address book. User ids are opaque full-width key hashes.
+signed device rosters (below); and, **only if the user opts in**, a
+passphrase-wrapped identity backup blob (8.3). No message content at rest, no
+delivery logs, no server-side read receipts, no address book. User ids are opaque
+full-width key hashes.
+
+A **device roster** is an account's own signed statement of which devices belong
+to it, so that a sender knows every device to deliver a copy to. The Directory
+stores one per account and serves it to anyone who asks. It cannot author one: a
+roster is signed by the account key, and the Directory holds no private keys, so
+it checks the signature against the identity key already registered for that
+account and refuses anything else, including a version older than the one it
+already has. That refusal is a **liveness** measure and not a security one, since
+a hostile operator owns this code; the binding defence is that each client keeps
+the highest roster version it has seen for a contact and refuses to go backwards.
+The roster deliberately carries **no device names**, because it is served in the
+clear to anyone who asks for the account; names stay local, like chat nicknames.
+The storage and the format are in place as groundwork, and **nothing publishes a
+roster yet**: every account today is a single device and reads as having no
+roster at all, which is exactly how an account that never links a second device
+will continue to read.
 
 The **delivery indicator** (8.8) adds no storage class and no log. When a
 recipient's device acks an envelope, the relay already deletes it and records its
@@ -841,7 +858,8 @@ Honest at-rest posture, stated plainly:
   enrolled method**. The UI labels the PIN accordingly and steers at-rest-sensitive
   users to a passphrase.
 - **What the lock covers, and the one thing it does not.** Sealed under the LDK:
-  message history, the contact list (with pending trust work and nicknames), the
+  message history, the contact list (with pending trust work, nicknames, deletion
+  markers, the recovery ledger of 8.10, and the post-move refresh list of 8.3), the
   **ratchet sessions**, the **send queue**, and the **prekey private halves**.
   Session rows are keyed by `hex(HMAC(session-index sub-key, peerId))`, so the
   database names nobody, and their values carry the ratchet state, so an image
@@ -1221,6 +1239,11 @@ An operator who chooses to log, or anyone who can compel us, can learn:
   which tells the relay which of that sender's own recent envelope ids it is asking
   about, bounded per request (section 14).
 - **Presence** (persistent WebSocket).
+- **How many devices an account has, and when each was added** (7.5), for any
+  account that publishes a device roster. The roster has to be readable by anyone
+  who might send to that account, so this is unavoidable rather than a choice: a
+  sender cannot deliver to a device it is not allowed to learn about. It carries
+  no device names for the same reason. No account publishes one yet.
 - **A recovery in progress** (8.10). A retry-request is a distinctively small
   envelope, and honoring one produces a burst of same-sized-ish envelopes back to
   the requester shortly after, all marked do-not-notify. The operator cannot read

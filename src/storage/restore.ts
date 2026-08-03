@@ -46,16 +46,11 @@ import { PREKEYS_KEY } from './prekeyStore'
 import type { SessionStore } from './sessionStore'
 
 export const RESTORE_PENDING_KEY = 'restore.pending.v1'
-/** Peers owed a session-refresh ping after a move (JSON string[]), drained by the
- *  client after the post-move re-registration succeeds. Durable so a crash
- *  between the move and the first connect cannot lose the list. */
-export const MOVE_REFRESH_KEY = 'move.refresh.v1'
 const IDENTITY_LOCK = 'nightjar-identity'
 /** Rows per durable import transaction: large enough to amortize commit cost,
  *  small enough that progress is visible and memory stays flat. */
 const MOVE_IMPORT_BATCH = 500
 
-const encoder = new TextEncoder()
 
 export interface RestoreDeps {
   keys: KeyStore
@@ -124,9 +119,11 @@ export async function stageMove(
     await deps.keys.put(RESTORE_PENDING_KEY, Uint8Array.from([1]))
     await deps.contacts.replaceAllForMove(payload.contacts, payload.aliases, payload.dismissals)
     // The refresh-ping list: every imported contact EXCEPT dismissed peers (a
-    // deleted conversation must not be re-established by the move itself).
+    // deleted conversation must not be re-established by the move itself). Sealed
+    // with the rest of the contact data, not left beside the identity in the
+    // clear: it is a roster of everyone just imported (8.5).
     const refresh = payload.contacts.map((c) => c.peerId).filter((p) => !payload.dismissals[p])
-    await deps.keys.put(MOVE_REFRESH_KEY, encoder.encode(JSON.stringify(refresh)))
+    await deps.contacts.setMoveRefresh(refresh)
     const total = payload.messages.length
     let done = 0
     while (payload.messages.length > 0) {

@@ -65,6 +65,18 @@ const ALIASES_KEY = 'aliases.v1'
 const DISMISSED_KEY = 'contacts.dismissed.v1'
 /** Per-peer retry-receipt throttling (8.10). Sealed like the others. */
 const RETRY_KEY = 'contacts.retry.v1'
+/** Peers owed a session-refresh ping after a move (Phase D, 8.3), drained by the
+ *  client once the post-move re-registration succeeds. Durable so a crash between
+ *  the move and the first connect cannot lose the list.
+ *
+ *  It lives HERE, sealed, rather than beside the identity in the raw key store,
+ *  because it is a list of contacts: written in the clear it was a plaintext
+ *  roster of everyone the new device had just imported, sitting on disk exactly
+ *  when a freshly-moved device is most likely to be lost or examined, and lasting
+ *  until the drain finished. That contradicted 8.5's promise that nothing stored
+ *  names a peer. The key name is unchanged, so `getSealed` adopts and re-seals a
+ *  plaintext list left by an older build on its first read. */
+const MOVE_REFRESH_KEY = 'move.refresh.v1'
 /** A dismissal expires with the relay-side invite record that motivates it, so the
  *  list cannot become a permanent record of everyone you ever deleted. */
 const DISMISSAL_TTL_MS = INVITE_TTL_MS
@@ -485,6 +497,32 @@ export class ContactStore {
     })
   }
 
+  // --- post-move refresh list (Phase D, 8.3) ------------------------------
+
+  /** Peers still owed a post-move session-refresh ping, oldest first. Fail-OPEN:
+   *  an unreadable list must not wedge the drain, and the cost of losing it is a
+   *  refresh ping that the user's own first message would send anyway. */
+  async getMoveRefresh(): Promise<string[]> {
+    try {
+      const bytes = await this.getSealed(MOVE_REFRESH_KEY, MOVE_REFRESH_KEY)
+      if (!bytes) return []
+      const list = JSON.parse(decoder.decode(bytes)) as unknown
+      if (!Array.isArray(list) || list.some((p) => typeof p !== 'string')) return []
+      return list as string[]
+    } catch {
+      return []
+    }
+  }
+
+  /** Replace the list (a blind overwrite, like the other move-staged blobs), or
+   *  delete it when empty. */
+  async setMoveRefresh(peerIds: string[]): Promise<void> {
+    await this.lock.withLock(CONTACTS_LOCK, async () => {
+      if (peerIds.length === 0) await this.store.delete(MOVE_REFRESH_KEY)
+      else await this.putSealed(MOVE_REFRESH_KEY, MOVE_REFRESH_KEY, encoder.encode(JSON.stringify(peerIds)))
+    })
+  }
+
   // --- chat aliases (local, cosmetic) -------------------------------------
   //
   // A per-device nickname for a peer, so a chat is identifiable by name instead
@@ -557,6 +595,7 @@ export class ContactStore {
       await this.store.delete(ALIASES_KEY)
       await this.store.delete(DISMISSED_KEY)
       await this.store.delete(RETRY_KEY)
+      await this.store.delete(MOVE_REFRESH_KEY)
     })
   }
 
@@ -582,6 +621,9 @@ export class ContactStore {
       // longer has: inheriting it would make the restored device believe it had
       // already asked contacts to resend, in the exact situation that needs asking.
       await this.store.delete(RETRY_KEY)
+      // An identity backup carries no refresh list; a stale one belongs to whoever
+      // was on this device before.
+      await this.store.delete(MOVE_REFRESH_KEY)
     })
   }
 
@@ -630,6 +672,9 @@ export class ContactStore {
       // Nor its recovery ledger: a move is the single most likely reason the new
       // device will need to ask everyone to resend (8.10), so it must start clean.
       await this.store.delete(RETRY_KEY)
+      // Nor a refresh list from a crashed earlier import; the caller writes the
+      // real one immediately after this returns.
+      await this.store.delete(MOVE_REFRESH_KEY)
       if (Object.keys(aliases).length === 0) {
         await this.store.delete(ALIASES_KEY)
       } else {

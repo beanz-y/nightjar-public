@@ -9,7 +9,9 @@
 // (signatures, bindings) stays in src/crypto and runs after decode.
 
 import { base64urlnopad } from '@scure/base'
+import { MAX_DEVICES_PER_ACCOUNT } from '../crypto/constants'
 import type { FetchedBundle, OneTimePrekey, SignedPrekey } from '../crypto/prekeys'
+import type { DeviceRoster } from '../crypto/roster'
 import type { InitialHeader } from '../crypto/x3dh'
 import type { MessageHeader } from '../crypto/ratchet'
 
@@ -161,6 +163,66 @@ export function decodePublishedBundle(w: WirePublishedBundle): PublishedBundle {
     idkbindSig: b64decode(w.idkbindSig, ED_SIG),
     spk: decodeSignedPrekey(w.spk),
     opks: w.opks.map(decodeOneTimePrekey),
+  }
+}
+
+// --- device roster (Sesame) ----------------------------------------------
+//
+// The roster crosses the wire and is stored by the Directory verbatim. Decoding
+// is strict about SHAPE only (widths, types, id format); the SIGNATURE and every
+// binding inside it are checked by verifyRoster, which both the client and the
+// Directory run. Decoding something is never a statement that it is genuine.
+
+export interface WireRosterDevice {
+  deviceId: string
+  dkSigPub: string
+  addedAt: number
+}
+
+export interface WireDeviceRoster {
+  accountId: string
+  version: number
+  devices: WireRosterDevice[]
+  sig: string
+}
+
+/** A user id is base32(SHA-256(key)): 52 lowercase base32 characters, never
+ *  truncated (DESIGN 3). Checked here so a malformed id is refused before it can
+ *  become a storage key or a routing label. */
+const USER_ID_RE = /^[a-z2-7]{52}$/
+
+function userId(s: unknown, what: string): string {
+  if (typeof s !== 'string' || !USER_ID_RE.test(s)) throw new Error(`wire: ${what} is not a user id`)
+  return s
+}
+
+export function encodeDeviceRoster(r: DeviceRoster): WireDeviceRoster {
+  return {
+    accountId: r.accountId,
+    version: r.version,
+    devices: r.devices.map((d) => ({
+      deviceId: d.deviceId,
+      dkSigPub: b64encode(d.dkSigPub),
+      addedAt: d.addedAt,
+    })),
+    sig: b64encode(r.sig),
+  }
+}
+
+export function decodeDeviceRoster(w: WireDeviceRoster): DeviceRoster {
+  if (!Array.isArray(w.devices)) throw new Error('wire: roster devices not an array')
+  // Bound the list before decoding it, so a hostile blob cannot make us allocate
+  // and hash an unbounded number of keys before verifyRoster gets to refuse it.
+  if (w.devices.length > MAX_DEVICES_PER_ACCOUNT) throw new Error('wire: roster lists too many devices')
+  return {
+    accountId: userId(w.accountId, 'roster.accountId'),
+    version: uint(w.version, 0xffffffff, 'roster.version'),
+    devices: w.devices.map((d) => ({
+      deviceId: userId(d.deviceId, 'roster.device.deviceId'),
+      dkSigPub: b64decode(d.dkSigPub, ED_PUB),
+      addedAt: uint(d.addedAt, Number.MAX_SAFE_INTEGER, 'roster.device.addedAt'),
+    })),
+    sig: b64decode(w.sig, ED_SIG),
   }
 }
 
