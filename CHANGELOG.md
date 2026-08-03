@@ -9,6 +9,41 @@ or the commit page on the repository host). The format is loosely based on
 [Keep a Changelog](https://keepachangelog.com/); version headings correspond to the
 release tags cut by the deploy pipeline. Dates are the tag dates.
 
+## [1.13.0] - 2026-08-03
+
+### Added
+- **Carry your saved messages to a device you have added.** A device you add starts with
+  none of them, deliberately, because nothing could backfill it without the relay holding
+  your history. This is the separate, deliberate act that hands them across afterwards,
+  and it happens entirely on screen: the device that wants the messages shows a code, the
+  device that has them photographs it, and then shows a moving code back. None of it goes
+  over the network, and there is no fallback that would. That is a choice: the bytes
+  would be sealed either way, but this can be everything you have ever kept in one go,
+  and asking the relay to carry that, even sealed, is a different promise from the one
+  made about what it ever holds.
+- **You choose how much to send, on real numbers.** Everything, or the last 90, 30 or 7
+  days, each shown with how many messages it is, how large, and roughly how long it will
+  take to hand over. Beyond a certain size it says so and asks for a shorter span rather
+  than starting something that will not finish, and it refuses over that limit rather
+  than quietly truncating: a cut-off history arrives looking complete, with an arbitrary
+  piece missing from the middle of a conversation and nothing on either device to say so.
+- Four things it will not do, all of them deliberate. It will not send to a device that
+  is not on your account, because a code proves somebody photographed a screen and not
+  whose screen it was. It will not accept messages belonging to a different account, for
+  the mirror of that reason. It will not bring back a message you had already deleted on
+  the receiving device, because the sending one may never have heard about that delete.
+  And it leaves out messages from people the receiving device does not hold as contacts,
+  since it would have no key for them and so no safety number to check them against.
+- Running it twice is safe and changes nothing, which is what makes it safe to retry one
+  that did not finish. Messages already on the receiving device are kept: this adds to
+  what is there rather than replacing it.
+
+### Changed
+- **Saying plainly that this is a copy and not a sync** (DESIGN 8.12). The two devices
+  agree about the past at the moment you do it, and nothing keeps them aligned
+  afterwards; messages from before you added a device still exist only where they
+  arrived.
+
 ## [1.12.2] - 2026-08-03
 
 ### Fixed

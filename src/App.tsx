@@ -39,6 +39,7 @@ export function App() {
     moveExported,
     moveProgress,
     linkState,
+    historyProgress,
     actions,
   } = useNightjar()
   const canary = useCanary()
@@ -174,6 +175,7 @@ export function App() {
                 lockMethods={lockMethods}
                 moveExported={moveExported}
                 moveProgress={moveProgress}
+                historyProgress={historyProgress}
                 actions={actions}
               />
             )}

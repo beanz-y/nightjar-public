@@ -8,7 +8,7 @@ import type { Identity } from '../crypto/identity'
 import type { CanaryResult } from '../verify/canary'
 import { About } from './About'
 import { BackupPanel } from './BackupPanel'
-import { type DeviceRow, DevicesPanel } from './DevicesPanel'
+import { type DeviceRow, DevicesPanel, type HistoryTransferProps } from './DevicesPanel'
 import { MovePanel } from './MovePanel'
 import { DownloadIcon, ShieldCheckIcon } from './icons'
 import { NotifySettings } from './NotifySettings'
@@ -40,6 +40,7 @@ interface Props {
   onAuthorizeDevice: (codeText: string) => Promise<{ deviceId: string; secret: Uint8Array } | null>
   onSealLink: (secret: Uint8Array) => Promise<Uint8Array | null>
   onSendLinkOverRelay: (deviceId: string, secret: Uint8Array) => Promise<boolean>
+  history: HistoryTransferProps
   onEnableNotifications: () => void
   onDisableNotifications: () => void
   onAddBiometric: () => void
@@ -65,6 +66,7 @@ export function Settings({
   onAuthorizeDevice,
   onSealLink,
   onSendLinkOverRelay,
+  history,
   onEnableNotifications,
   onDisableNotifications,
   onAddBiometric,
@@ -117,6 +119,7 @@ export function Settings({
           onSeal={onSealLink}
           onSendOverRelay={onSendLinkOverRelay}
           onErase={onEraseDevice}
+          history={history}
           onClose={() => setMode('menu')}
         />
       </section>

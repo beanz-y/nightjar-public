@@ -34,8 +34,10 @@ import {
   newMsgId,
 } from '../crypto/message'
 import type { HistoryUnitMessage } from '../crypto/historyUnit'
+import { openHistoryTransfer, sealHistoryTransfer } from '../crypto/historyTransfer'
 import {
   LINK_MAX_PAYLOAD_BYTES,
+  LINK_SECRET_BYTES,
   MAX_DELIVERED_CHECK_IDS,
   MAX_DEVICES_PER_ACCOUNT,
   MOVE_MAX_MESSAGES,
@@ -58,7 +60,7 @@ import { x3dhInitiate } from '../crypto/x3dh'
 import { type Contact, type ContactStore, type TrustLevel, KeyConflictError } from '../trust/contactStore'
 import type { InviteArtifact } from '../trust/inviteArtifact'
 import { currentSession, promoteSession, updateSession } from '../session/sessionBook'
-import type { DeliveryStatus, HistoryStore } from '../storage/historyStore'
+import type { DeliveryStatus, HistoryMessage, HistoryStore } from '../storage/historyStore'
 import type { Lock } from '../storage/lock'
 import type { PrekeyStore } from '../storage/prekeyStore'
 import type { HistoryRecord, OutboxEntry, SessionBook, SessionStore } from '../storage/sessionStore'
@@ -80,6 +82,10 @@ import { type AuthedInfo, Transport } from './transport'
 
 const sessionLock = (peerId: string) => `nightjar-session:${peerId}`
 const REPLENISH_LOCK = 'nightjar-opk-replenish'
+/** Rows sealed per durable write when importing saved messages: large enough to
+ *  amortize the commit, small enough that progress moves and memory stays flat.
+ *  Matches the move importer's batch for the same reasons. */
+const HISTORY_IMPORT_BATCH = 500
 
 /** An export refusal the UI words for the user (Phase D). The move must not
  *  proceed while sends are queued (they would cross as rows neither device will
@@ -1827,6 +1833,161 @@ export class NightjarClient {
   async sealLinkForOptical(secret: Uint8Array): Promise<Uint8Array> {
     const [only] = sealLink(await this.buildLinkPayload(), secret, LINK_MAX_PAYLOAD_BYTES)
     return only
+  }
+
+  // --- moving saved messages between this account's devices (DESIGN 8.12) ----
+
+  /**
+   * What a history transfer would carry if it were sent now, WITHOUT sealing
+   * anything: the counts and the sealed size, so the panel can show what each
+   * span of time costs before anyone commits to holding two devices together.
+   *
+   * `since` bounds it by message time. Everything the export path already refuses
+   * is refused here for the same reasons: a row whose delete arrived is not
+   * resurrected, a row that will not open is counted rather than skipped
+   * silently, and a row whose peer this device holds no contact for is left out,
+   * because the receiving device would have nothing to bind it to.
+   */
+  async prepareHistoryTransfer(since = 0): Promise<{
+    messages: HistoryUnitMessage[]
+    /** Rows that would not open while unlocked (corruption). Not carried. */
+    unreadable: number
+    /** Readable rows whose peer has no contact record. Not carried. */
+    orphaned: number
+    /** Sealed size, which is what actually determines how long this takes. */
+    bytes: number
+    /** Whether that size is over what one transfer may carry. */
+    tooLarge: boolean
+  }> {
+    const history = this.history
+    if (!history) throw new Error('history is not available on this client')
+    const tombstoned = new Set(await this.store.tombstoneKeys())
+    const contacts = new Set((await this.contacts.list()).map((c) => c.peerId))
+    const all: HistoryUnitMessage[] = []
+    let unreadable = 0
+    let orphaned = 0
+    for (const row of await this.store.historyLoadAll()) {
+      if (tombstoned.has(row.key)) continue
+      let msg
+      try {
+        msg = history.open(row)
+      } catch {
+        // Same guard the move export uses: if the app locked mid-scan every
+        // remaining row would "fail to open" and the transfer would complete as a
+        // silently partial one claiming success.
+        if (!history.isUnlocked) throw new Error('the app locked while gathering; unlock and try again')
+        unreadable++
+        continue
+      }
+      if (msg.ts < since) continue
+      if (!contacts.has(msg.peerId)) {
+        orphaned++
+        continue
+      }
+      const m: HistoryUnitMessage = { id: msg.id, peer: msg.peerId, dir: msg.dir, ts: msg.ts, text: msg.text }
+      if (msg.status) m.status = msg.status
+      if (row.failed && msg.dir === 'out') m.failed = true
+      all.push(m)
+    }
+    all.sort((a, b) => a.ts - b.ts)
+    // Measure by sealing for real rather than estimating: the estimate is what
+    // the user decides on, so it must be the same number the send path enforces.
+    let bytes = 0
+    let tooLarge = false
+    try {
+      bytes = sealHistoryTransfer(
+        { accountId: this.account.accountId, messages: all, createdAt: Date.now() },
+        new Uint8Array(LINK_SECRET_BYTES),
+      ).length
+    } catch {
+      tooLarge = true
+    }
+    return { messages: all, unreadable, orphaned, bytes, tooLarge }
+  }
+
+  /**
+   * Seal this account's saved messages for the device showing `secret`.
+   *
+   * `toDevice` is checked against this account's own published device list first.
+   * The seal alone proves only that the sender photographed a screen; it says
+   * nothing about whose screen. Without this check, holding a phone in front of
+   * somebody could walk away with every message they have.
+   */
+  async sealHistoryFor(toDevice: string, secret: Uint8Array, since = 0): Promise<Uint8Array> {
+    if (toDevice === this.deviceId) throw new Error('that is this device\'s own code')
+    const me = this.account
+    const devices = await this.resolveDevices(me.accountId)
+    if (!devices.includes(toDevice)) {
+      throw new Error('that device is not on your account, so it is not being sent anything')
+    }
+    const { messages } = await this.prepareHistoryTransfer(since)
+    return sealHistoryTransfer({ accountId: me.accountId, messages, createdAt: Date.now() }, secret)
+  }
+
+  /**
+   * Take a transfer caught by this device's camera and merge it into history.
+   *
+   * MERGE, never replace: this device may already hold messages, and the point is
+   * to end up with both. Rows are keyed by (peer, direction, content id), so a
+   * message already here is written over itself and a transfer run twice changes
+   * nothing, which is what makes it safe to simply try again.
+   *
+   * Returns what was added and what was refused, because both are things the
+   * person needs told rather than a bare "done".
+   */
+  async importHistoryTransfer(
+    blob: Uint8Array,
+    secret: Uint8Array,
+    onProgress?: (done: number, total: number) => void,
+  ): Promise<{ imported: number; skippedUnknownPeer: number; skippedDeleted: number }> {
+    const history = this.history
+    if (!history) throw new Error('history is not available on this client')
+    const payload = openHistoryTransfer(blob, secret, Date.now())
+    // Sealed under our own code proves the sender was in the room, not that they
+    // are us. Writing somebody else's conversations in under their peer ids would
+    // put words in contacts' mouths exactly as a forged forwarded copy would.
+    if (payload.accountId !== this.account.accountId) {
+      throw new Error('those saved messages belong to a different account, so nothing was imported')
+    }
+    const contacts = new Set((await this.contacts.list()).map((c) => c.peerId))
+    const tombstoned = new Set(await this.store.tombstoneKeys())
+    let imported = 0
+    let skippedUnknownPeer = 0
+    let skippedDeleted = 0
+    const total = payload.messages.length
+    let batch: HistoryRecord[] = []
+    const flush = async () => {
+      if (batch.length === 0) return
+      await this.store.historyPutMany(batch)
+      imported += batch.length
+      batch = []
+      onProgress?.(imported, total)
+      // Yield so a progress line can paint; sealing is otherwise solid CPU.
+      await new Promise((r) => setTimeout(r, 0))
+    }
+    for (const m of payload.messages) {
+      // A peer this device holds no contact for has nothing to bind the message
+      // to: no key, so no safety number, and a conversation that cannot be
+      // verified. The move import refuses these for the same reason.
+      if (!contacts.has(m.peer)) {
+        skippedUnknownPeer++
+        continue
+      }
+      const key = history.storageKey(m.peer, m.dir, m.id)
+      // A message this device was told to delete stays deleted. The sending
+      // device may never have heard about that delete, and a transfer must not
+      // become a way to undo one.
+      if (tombstoned.has(key)) {
+        skippedDeleted++
+        continue
+      }
+      const msg: HistoryMessage = { id: m.id, peerId: m.peer, dir: m.dir, ts: m.ts, text: m.text }
+      if (m.status) msg.status = m.status
+      batch.push(history.seal(msg, m.failed))
+      if (batch.length >= HISTORY_IMPORT_BATCH) await flush()
+    }
+    await flush()
+    return { imported, skippedUnknownPeer, skippedDeleted }
   }
 
   /**

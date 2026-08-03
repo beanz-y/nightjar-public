@@ -28,7 +28,7 @@ import { biometricAvailable, enrollBiometric, unlockBiometric } from '../platfor
 import { openBackup, parseBackupHeader, sealBackup } from '../crypto/backup'
 import { type LinkPayload, openLink } from '../crypto/link'
 import { ed25519Public } from '../crypto/primitives'
-import { newLinkCode, parseLinkCode } from '../trust/linkCode'
+import { newHistoryCode, newLinkCode, parseHistoryCode, parseLinkCode } from '../trust/linkCode'
 import { clearAccountKey, loadAccountKey, saveAccountKey } from '../storage/accountKeyStore'
 import { type OpenedMove, encodeMovePayload, openMove, parseMoveHeader, sealMove } from '../crypto/move'
 import { bytesToHex } from '@noble/hashes/utils.js'
@@ -204,6 +204,9 @@ export function useNightjar() {
   const [restorePending, setRestorePending] = useState(false)
   /** Where this device is in the ceremony of joining an account (Sesame). */
   const [linkState, setLinkState] = useState<LinkState>('idle')
+  /** Import progress while saved messages are being written, so a long one does
+   *  not look like a hang. */
+  const [historyProgress, setHistoryProgress] = useState<{ done: number; total: number } | null>(null)
   /** The peer of the most recent FULL delete, local or from a sibling tab. The
    *  conversation pane keeps its own `selected` state, which no cross-tab event can
    *  reach, so without this a sibling tab keeps the deleted chat open and typing in
@@ -233,6 +236,10 @@ export function useNightjar() {
    *  reload means showing a fresh code rather than leaving it on disk. */
   const linkSecretRef = useRef<Uint8Array | null>(null)
   const linkStopRef = useRef<(() => void) | null>(null)
+  /** The single-use secret from the saved-messages code this device is showing.
+   *  RAM only, for the same reason the linking one is: it opens everything this
+   *  account has ever kept, and it is single-use anyway. */
+  const historySecretRef = useRef<Uint8Array | null>(null)
   const teardownRef = useRef<(() => void) | null>(null)
   const lockNowRef = useRef<() => void>(() => {})
   const contactsGenRef = useRef(0)
@@ -1615,6 +1622,95 @@ export function useNightjar() {
     }
   }, [])
 
+  // --- moving saved messages between your own devices (DESIGN 8.12) ---------
+
+  /** The device that WANTS the messages shows a code. Same shape as the linking
+   *  code and a different magic, so the two ceremonies cannot be crossed. */
+  const startHistoryRequest = useCallback((): { code: string; deviceId: string } | null => {
+    const live = liveRef.current
+    if (!live) return null
+    const { code, parsed } = newHistoryCode(live.identity.ikSig.publicKey)
+    historySecretRef.current = parsed.secret
+    return { code, deviceId: parsed.deviceId }
+  }, [])
+
+  const cancelHistoryRequest = useCallback(() => {
+    historySecretRef.current = null
+  }, [])
+
+  /** The sending device reads that code. Returns what it needs to seal for it. */
+  const readHistoryCode = useCallback((codeText: string): { deviceId: string; secret: Uint8Array } | null => {
+    try {
+      const parsed = parseHistoryCode(codeText)
+      return { deviceId: parsed.deviceId, secret: parsed.secret }
+    } catch (e) {
+      setNotice(String(e instanceof Error ? e.message : e))
+      return null
+    }
+  }, [])
+
+  /** What each span of time would cost, so the choice is made on real numbers
+   *  rather than on hope. */
+  const prepareHistory = useCallback(
+    async (since: number): Promise<{ count: number; bytes: number; tooLarge: boolean; orphaned: number } | null> => {
+      const live = liveRef.current
+      if (!live) return null
+      try {
+        const p = await live.client.prepareHistoryTransfer(since)
+        return { count: p.messages.length, bytes: p.bytes, tooLarge: p.tooLarge, orphaned: p.orphaned }
+      } catch (e) {
+        setNotice(`could not read your saved messages: ${String(e instanceof Error ? e.message : e)}`)
+        return null
+      }
+    },
+    [],
+  )
+
+  const sealHistoryFor = useCallback(
+    async (deviceId: string, secret: Uint8Array, since: number): Promise<Uint8Array | null> => {
+      const live = liveRef.current
+      if (!live) return null
+      try {
+        return await live.client.sealHistoryFor(deviceId, secret, since)
+      } catch (e) {
+        setNotice(`could not prepare those messages: ${String(e instanceof Error ? e.message : e)}`)
+        return null
+      }
+    },
+    [],
+  )
+
+  /** Take in a transfer the camera caught, and say honestly what landed. */
+  const receiveHistoryTransfer = useCallback(async (blob: Uint8Array): Promise<boolean> => {
+    const live = liveRef.current
+    const secret = historySecretRef.current
+    if (!live || !secret) return false
+    setHistoryProgress({ done: 0, total: 0 })
+    try {
+      const res = await live.client.importHistoryTransfer(blob, secret, (done, total) => {
+        if (mountedRef.current) setHistoryProgress({ done, total })
+      })
+      historySecretRef.current = null
+      setHistoryProgress(null)
+      // Re-read from disk rather than appending in RAM, so what is on screen is
+      // what was actually stored, in the right order.
+      const hist = await live.client.loadAllHistory()
+      if (mountedRef.current) setConversations((prev) => mergeHistory(hist, prev))
+      const skipped: string[] = []
+      if (res.skippedUnknownPeer > 0) skipped.push(`${res.skippedUnknownPeer} for people this device does not have`)
+      if (res.skippedDeleted > 0) skipped.push(`${res.skippedDeleted} you had already deleted here`)
+      setNotice(
+        `${res.imported} saved ${res.imported === 1 ? 'message' : 'messages'} added to this device` +
+          (skipped.length > 0 ? `. Left out: ${skipped.join(', ')}.` : '.'),
+      )
+      return true
+    } catch (e) {
+      setHistoryProgress(null)
+      setNotice(`could not take those messages in: ${String(e instanceof Error ? e.message : e)}`)
+      return false
+    }
+  }, [])
+
   const enableNotifications = useCallback(async () => {
     const live = liveRef.current
     if (!live) return
@@ -1674,7 +1770,14 @@ export function useNightjar() {
     moveProgress,
     moveExported,
     linkState,
+    historyProgress,
     actions: {
+      startHistoryRequest,
+      cancelHistoryRequest,
+      readHistoryCode,
+      prepareHistory,
+      sealHistoryFor,
+      receiveHistoryTransfer,
       startLinking,
       cancelLinking,
       openOpticalLink,

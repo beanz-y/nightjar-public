@@ -1377,6 +1377,65 @@ Honest limits, none of them incidental:
   so depletion pressure multiplies with device count, and a dead device that is
   never removed is a permanent tax on every send.
 
+### 8.12 Carrying saved messages to a device you added
+
+A device you add starts empty (8.11), because nothing forward-secret can backfill
+it and pretending otherwise would mean the relay holding history. This is the
+separate, deliberate act that carries messages across afterwards.
+
+It is **optical only**, and unlike linking there is no relay fallback here, by
+choice rather than by omission. The bytes would be sealed either way; what
+differs is volume and what the relay is asked to hold. This can be everything an
+account has ever kept in one blob, and handing that to the relay to carry, even
+sealed and even live-only, is a different promise from the one 7.5 makes about
+what the relay ever sees.
+
+The ceremony runs in the same direction as linking, deliberately, because it is
+the dance the person has already been taught: the device that WANTS the messages
+shows a code carrying its device key and a fresh single-use secret, and the device
+that HAS them photographs it, seals, and displays. Its magic differs from the
+linking code's (section 14) so that a code shown to ask for messages cannot be
+scanned on the linking screen and quietly add a device instead.
+
+The contents are the portable history unit Phase D defined and bounded (8.3),
+which was written with its own caps and its own version precisely so this moment
+would need no new format.
+
+Four checks, none of them incidental:
+
+- **The sender checks the destination is on its own device list.** A seal proves
+  only that the sender photographed a screen; it says nothing about whose. Without
+  this, holding a phone in front of somebody walks away with every message they
+  have.
+- **The receiver checks the transfer names its own account**, for the mirror
+  reason: sealed under this device's code proves somebody was standing here, not
+  that they are you, and writing a stranger's conversations in under their peer
+  ids would put words in a contact's mouth exactly as a forged forwarded copy
+  would (8.11).
+- **A message whose delete already reached the receiving device is not
+  resurrected.** The sending device may never have heard about that delete, and a
+  transfer must not become the way to undo one.
+- **Messages for a peer the receiving device holds no contact for are left out.**
+  It would have no key for them, so no safety number, and a conversation it could
+  never verify. The move import refuses these for the same reason.
+
+Merging, never replacing: rows are keyed by (peer, direction, content id), so a
+message already present is written over itself, a transfer run twice changes
+nothing, and retrying a run that did not finish is safe.
+
+Honest limits:
+
+- **It is bounded by time, not by principle.** A code carries about 930 bytes and
+  six are shown a second, so a perfect capture moves roughly 5 KB/s and a
+  hand-held one rather less. The ceiling in section 14 is that budget wearing a
+  size's clothes; past it the app offers a shorter span of history rather than
+  starting something nobody will finish. It refuses over the cap rather than
+  truncating, because a truncated history arrives looking complete with an
+  arbitrary slice missing and nothing on either device to say so.
+- **It is a copy, not a sync.** The two devices agree about the past only at the
+  moment it is done. Nothing keeps them aligned afterwards, and messages from
+  before a device was added still exist only where they were received.
+
 ---
 
 ## 9. Metadata: the complete leak list and our honest posture
@@ -1875,6 +1934,7 @@ Native (Tauri) is **not** on the critical path; it is a demand-gated v2 (10.5).
 | Device list (roster) | account-key-signed, monotonically versioned, held by the Directory and served to anyone; the Directory NEVER authors one and authorizes a publish by the SIGNATURE, not the caller (a linked device authenticates as itself). Signed bytes are canonical and length-framed, never JSON, under their own `TAG_ROSTER` domain separation (the account key also signs auth challenges and prekeys, so without its own tag one use would be an oracle for another), with the accountId inside the signature so a list cannot be transplanted between accounts. `MAX_DEVICES_PER_ACCOUNT` = 8. Server monotonicity is LIVENESS only: the binding defence is each client's per-account high-water mark, which refuses a version not strictly newer (equal is refused too). Every real change raises a sticky alert. Verified under a key the device already holds (its own, or the contact's recorded key); on ANY failure it keeps the last good list rather than failing closed, because failing closed here means failing to deliver | 8.11 |
 | Device link code | `NJLC` ‖ version ‖ device signing key (32 B) ‖ fresh single-use secret (32 B), base64url, shown as a QR by the device being added. The device id is NOT carried, it is DERIVED from the key, so a tampered code cannot name one device while carrying another's key. The one QR in this app that is secret-bearing | 8.11 |
 | Device link transfer | `NJLK` ‖ version ‖ transfer id (16 B) ‖ index ‖ count ‖ per-chunk salt (16 B) ‖ AEAD, header as AAD, key+nonce = HKDF(scanned secret, salt, `"Nightjar_Link_v1"`). Each chunk sealed INDEPENDENTLY, so reorder/duplicate/drop can only fail to complete, and splicing two transfers is refused (the transfer id is in the AAD). Chunk size is a property of the TRANSPORT: the relay path cuts at 32 KiB to stay inside its envelope cap, the optical path seals ONE unit. Carries the account key, contacts and nicknames, and **no trust field at all** (6.2). Relay delivery is LIVE-ONLY and never queued (an account key must not sit in a 30-day mail queue); the sender must be registered, the recipient need not be | 8.11 |
+| Saved-messages transfer | code `NJHC` ‖ version ‖ device signing key (32 B) ‖ fresh secret (32 B), shown by the device that WANTS the messages; a DIFFERENT magic from the linking code so the two ceremonies cannot be crossed by a camera that cannot tell them apart. Envelope `NJHT` ‖ version ‖ salt (16 B) ‖ AEAD, header as AAD, key+nonce = HKDF(scanned secret, salt, `"Nightjar_HistoryXfer_v1"`), sealed as ONE piece (the fountain layer splits it). Payload is the Phase D portable history unit (8.3) plus the sending account's id. `HISTORY_XFER_MAX_BYTES` = 512 KiB, which is a TIME budget (~5 KB/s optically) wearing a size's clothes: over it the app offers a shorter span rather than truncating, since a truncated history arrives looking complete. **Optical only, no relay path at all.** Sender checks the destination is on its own device list; receiver checks the transfer names its own account, refuses to resurrect a message it holds a delete tombstone for, and drops rows whose peer it holds no contact for. Merges by (peer, dir, content id), so running it twice changes nothing | 8.12 |
 | Optical stream | fountain-coded frames as base64url TEXT in QR version 40 at EC level L (~2.1 KB payload per frame). Frames MUST be text: a camera-side decoder returns a string, and the native `BarcodeDetector` exposes only `rawValue` read as UTF-8, so binary would survive the pure-JS fallback and be mangled on the fast native path. Frames `0..K-1` ARE the raw blocks (a clean capture costs exactly K), later frames are XORs of a subset derived from `sha256(transferId ‖ seq)` so both sides agree with nothing shared but the header, and roughly one frame in eight covers a SINGLE block (belief propagation cannot start without one, so a receiver joining late could otherwise never decode). NO cryptography in this layer: it carries already-sealed bytes, so a wrong reassembly simply fails the AEAD above it | 8.11 |
 | Version octet | starts at `0x01` (classical X25519) | 4.4 |
 | Reproducible build inputs | digest-pinned container (Node + OS + arch), committed lockfile (`npm ci`), no build-time dynamic values (`__APP_VERSION__` injected, never a clock). *`SOURCE_DATE_EPOCH`/`strip-nondeterminism` are inert here (vite emits no timestamps; the manifest hashes content only) and kept only as documented no-ops* | 10.1, P7 |

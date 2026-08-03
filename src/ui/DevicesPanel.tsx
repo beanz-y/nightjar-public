@@ -14,6 +14,7 @@
 //     remote, not even another of your own devices, can mark a contact verified.
 
 import { useCallback, useEffect, useState } from 'react'
+import { HistoryTransferPanel } from './HistoryTransferPanel'
 import { LinkDevicePanel } from './LinkDevicePanel'
 
 export interface DeviceRow {
@@ -31,16 +32,39 @@ interface Props {
   onSeal: (secret: Uint8Array) => Promise<Uint8Array | null>
   onSendOverRelay: (deviceId: string, secret: Uint8Array) => Promise<boolean>
   onErase: () => Promise<void>
+  history: HistoryTransferProps
   onClose: () => void
+}
+
+/** The saved-messages ceremony, passed straight through: this panel decides only
+ *  which half is being run. */
+export interface HistoryTransferProps {
+  onStartRequest: () => { code: string; deviceId: string } | null
+  onCancelRequest: () => void
+  onReadCode: (codeText: string) => { deviceId: string; secret: Uint8Array } | null
+  onPrepare: (since: number) => Promise<{ count: number; bytes: number; tooLarge: boolean; orphaned: number } | null>
+  onSeal: (deviceId: string, secret: Uint8Array, since: number) => Promise<Uint8Array | null>
+  onReceive: (blob: Uint8Array) => Promise<boolean>
+  progress: { done: number; total: number } | null
 }
 
 function shortId(id: string): string {
   return `${id.slice(0, 8)}…${id.slice(-4)}`
 }
 
-export function DevicesPanel({ onList, onRemove, onAuthorize, onSeal, onSendOverRelay, onErase, onClose }: Props) {
+export function DevicesPanel({
+  onList,
+  onRemove,
+  onAuthorize,
+  onSeal,
+  onSendOverRelay,
+  onErase,
+  history,
+  onClose,
+}: Props) {
   const [devices, setDevices] = useState<DeviceRow[] | null>(null)
   const [linking, setLinking] = useState(false)
+  const [historyMode, setHistoryMode] = useState<'send' | 'receive' | null>(null)
   const [confirming, setConfirming] = useState<string | null>(null)
   const [startingOver, setStartingOver] = useState(false)
   const [eraseConfirm, setEraseConfirm] = useState('')
@@ -52,6 +76,22 @@ export function DevicesPanel({ onList, onRemove, onAuthorize, onSeal, onSendOver
   useEffect(() => {
     void refresh()
   }, [refresh])
+
+  if (historyMode) {
+    return (
+      <HistoryTransferPanel
+        mode={historyMode}
+        onStartRequest={history.onStartRequest}
+        onCancelRequest={history.onCancelRequest}
+        onReadCode={history.onReadCode}
+        onPrepare={history.onPrepare}
+        onSeal={history.onSeal}
+        onReceive={history.onReceive}
+        progress={history.progress}
+        onClose={() => setHistoryMode(null)}
+      />
+    )
+  }
 
   if (linking) {
     return (
@@ -134,6 +174,24 @@ export function DevicesPanel({ onList, onRemove, onAuthorize, onSeal, onSendOver
       <button className="primary block" onClick={() => setLinking(true)}>
         link another device
       </button>
+
+      {/* The deliberate act that carries history to a device that started empty.
+          Both halves live here because which one you need depends on which
+          device you are holding, and only the person knows that. */}
+      <div className="field-label small muted">saved messages</div>
+      <div className="row">
+        <button className="ghost small" onClick={() => setHistoryMode('send')}>
+          Send saved messages
+        </button>
+        <button className="ghost small" onClick={() => setHistoryMode('receive')}>
+          Get saved messages
+        </button>
+      </div>
+      <p className="muted tiny">
+        Messages are not carried across when you add a device, and they are never synced afterwards. This hands a copy
+        of what one device has saved to another of yours, on screen, without any of it going over the network. Do it
+        from the device that HAS the messages, and choose <em>Get</em> on the one that wants them.
+      </p>
 
       <p className="muted tiny">
         A device you add starts empty: nothing you have already received is moved to it, and every contact shows there

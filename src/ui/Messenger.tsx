@@ -38,6 +38,8 @@ interface Props {
   lockMethods: Array<'pass' | 'pin' | 'bio'>
   moveExported: boolean
   moveProgress: { done: number; total: number } | null
+  /** Saved-message import progress, shown while rows are being written. */
+  historyProgress: { done: number; total: number } | null
   actions: {
     send: (peer: string, text: string, ephemeral?: boolean) => void
     deleteMessage: (peer: string, id: string, failed?: boolean) => void
@@ -66,6 +68,14 @@ interface Props {
     authorizeNewDevice: (codeText: string) => Promise<{ deviceId: string; secret: Uint8Array } | null>
     sealLinkTransfer: (secret: Uint8Array) => Promise<Uint8Array | null>
     sendLinkOverRelay: (deviceId: string, secret: Uint8Array) => Promise<boolean>
+    startHistoryRequest: () => { code: string; deviceId: string } | null
+    cancelHistoryRequest: () => void
+    readHistoryCode: (codeText: string) => { deviceId: string; secret: Uint8Array } | null
+    prepareHistory: (
+      since: number,
+    ) => Promise<{ count: number; bytes: number; tooLarge: boolean; orphaned: number } | null>
+    sealHistoryFor: (deviceId: string, secret: Uint8Array, since: number) => Promise<Uint8Array | null>
+    receiveHistoryTransfer: (blob: Uint8Array) => Promise<boolean>
     addBiometric: () => void
     removeBiometric: () => void
   }
@@ -75,7 +85,7 @@ function shortId(id: string): string {
   return `${id.slice(0, 6)}…${id.slice(-4)}`
 }
 
-export function Messenger({ identity, connected, removedPeer, contacts, aliases, conversations, notify, storagePersisted, canary, bioAvailable, lockMethods, moveExported, moveProgress, actions }: Props) {
+export function Messenger({ identity, connected, removedPeer, contacts, aliases, conversations, notify, storagePersisted, canary, bioAvailable, lockMethods, moveExported, moveProgress, historyProgress, actions }: Props) {
   const displayName = (peer: string): string => aliases[peer]?.trim() || shortId(peer)
   const [selected, setSelected] = useState<string | null>(null)
   const [chatView, setChatView] = useState<'chat' | 'verify'>('chat')
@@ -208,6 +218,15 @@ export function Messenger({ identity, connected, removedPeer, contacts, aliases,
           onAuthorizeDevice={actions.authorizeNewDevice}
           onSealLink={actions.sealLinkTransfer}
           onSendLinkOverRelay={actions.sendLinkOverRelay}
+          history={{
+            onStartRequest: actions.startHistoryRequest,
+            onCancelRequest: actions.cancelHistoryRequest,
+            onReadCode: actions.readHistoryCode,
+            onPrepare: actions.prepareHistory,
+            onSeal: actions.sealHistoryFor,
+            onReceive: actions.receiveHistoryTransfer,
+            progress: historyProgress,
+          }}
           onEnableNotifications={actions.enableNotifications}
           onDisableNotifications={actions.disableNotifications}
           onAddBiometric={actions.addBiometric}

@@ -328,6 +328,33 @@ export const LINK_MAX_CHUNK_BYTES = 32 * 1024
 export const LINK_MAX_CHUNKS = 64
 export const LINK_MAX_PAYLOAD_BYTES = LINK_MAX_CHUNKS * LINK_MAX_CHUNK_BYTES
 
+// Moving SAVED MESSAGES to a device already on the account (DESIGN 8.12). A
+// linked device deliberately starts empty, so this is the separate, deliberate
+// act that carries history across, and it goes screen to camera only: there is no
+// relay path for it at all. What it carries is the portable history unit Phase D
+// was built around (crypto/historyUnit.ts), which is why nothing new is invented
+// for the contents.
+/** Code shown by the device that WANTS the messages. A distinct magic from the
+ *  linking code on purpose: the two ceremonies look identical to a camera, and a
+ *  shared format would let a code shown for one be scanned into the other. */
+export const HISTORY_CODE_MAGIC = 'NJHC'
+export const HISTORY_CODE_VERSION = 0x01
+/** The sealed unit itself. One piece, not chunked: chunking exists to fit the
+ *  relay's envelope ceiling, and nothing here ever touches the relay. */
+export const HISTORY_XFER_MAGIC = 'NJHT'
+export const HISTORY_XFER_VERSION = 0x01
+export const INFO_HISTORY_XFER = 'Nightjar_HistoryXfer_v1'
+export const HISTORY_XFER_SALT_BYTES = 16
+/**
+ * Ceiling on one optical history transfer, and it is a TIME budget wearing a
+ * size's clothes. A code carries about 930 bytes and six are shown a second, so a
+ * perfect capture moves roughly 5 KB/s and a real hand-held one rather less. At
+ * 512 KiB that is around two minutes of holding two devices together, which is
+ * already at the edge of what anyone will do. Past it the honest answer is to
+ * send a shorter span of time rather than to start something nobody will finish.
+ */
+export const HISTORY_XFER_MAX_BYTES = 512 * 1024
+
 // Post-loss message recovery: the retry-receipt (DESIGN 8.10). When a session is
 // gone on one side only (a move, a restore, an evicted database), the other side
 // keeps sending on a ratchet nobody can open. Those messages are poison-dropped
