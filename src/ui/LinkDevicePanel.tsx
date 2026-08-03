@@ -109,7 +109,7 @@ export function LinkDevicePanel({ onAuthorize, onSeal, onSendOverRelay, onDone, 
             back
           </button>
         </div>
-        <OpticalSend payload={blob} transferId={transferId} size={300} />
+        <OpticalSend payload={blob} transferId={transferId} />
         <p className="muted small">
           About {estimateSeconds(blob.length)} seconds with the devices held steady. It keeps looping, so there is no
           rush and nothing is lost if the camera misses part of it.

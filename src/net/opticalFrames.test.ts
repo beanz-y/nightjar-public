@@ -41,10 +41,17 @@ describe('optical frames', () => {
     expect(out).toEqual(payload)
   })
 
-  it('carries far more per frame than the old encoder ceiling', () => {
-    // The whole reason the encoder was extended: ~180 bytes was unusable for
-    // anything but a short code.
-    expect(BLOCK_BYTES).toBeGreaterThan(2000)
+  it('carries far more per frame than the old encoder ceiling, without going so dense a webcam cannot read it', () => {
+    // Two bounds, and the ceremony fails at either end. The floor is why the
+    // encoder was extended past version 10 at all: ~180 bytes a frame was
+    // unusable for anything longer than a short code. The cap is the lesson from
+    // trying it on a real laptop: a decoder needs roughly three camera pixels per
+    // module, and a version-40 symbol (177 modules) simply cannot be resolved by
+    // a webcam that negotiated 640x480, which is what they commonly do. Frames
+    // are nearly free here (the fountain layer takes whatever it catches), so
+    // when the two pull against each other, readability wins.
+    expect(BLOCK_BYTES).toBeGreaterThan(500)
+    expect(BLOCK_BYTES).toBeLessThan(1200)
     expect(FRAME_BYTES).toBeGreaterThan(BLOCK_BYTES)
   })
 

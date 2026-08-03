@@ -9,6 +9,31 @@ or the commit page on the repository host). The format is loosely based on
 [Keep a Changelog](https://keepachangelog.com/); version headings correspond to the
 release tags cut by the deploy pipeline. Dates are the tag dates.
 
+## [1.12.2] - 2026-08-03
+
+### Fixed
+- **The moving code could not be read by an ordinary laptop webcam, and nothing said
+  so.** It was drawn as the densest code the format allows, 177 squares across, on the
+  assumption that this is always a phone held close to a screen. A webcam left to choose
+  its own settings usually runs at 640x480, which is not enough pixels to resolve squares
+  that small, so it read nothing at all, forever, while showing exactly what it shows
+  when you simply have not aimed it properly. The code is now a third of that density
+  and is drawn much larger, which together make each square about two and a half times
+  the size it was, and the camera is now asked for the highest resolution it has. It
+  takes a few more codes to send the same thing, which costs a fraction of a second and
+  is worth it. Nothing needs to agree on this: each code says how much it carries, so a
+  device on the previous version still works in both directions.
+- **The receiving screen now shows what is happening.** There is a progress bar, and it
+  distinguishes the three situations that previously looked identical: not reading any
+  code at all, reading codes that are not a transfer, and receiving one. It also shows
+  how many codes it has read and what resolution the camera actually gave, because when
+  this goes wrong that is the number that explains it, and says so directly if the
+  camera is too low-resolution to have a chance.
+- **The sending screen now shows it is still running**, by counting the codes it has
+  shown. There is no acknowledgement of any kind from the other device, by design, so
+  without that counter there was nothing to tell a transfer in progress from a page that
+  had stopped.
+
 ## [1.12.1] - 2026-08-03
 
 ### Fixed

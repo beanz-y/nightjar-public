@@ -21,7 +21,10 @@ interface OpticalSendProps {
   payload: Uint8Array
   /** Ties the frames of one transfer together. Fresh per transfer. */
   transferId: Uint8Array
-  /** Rendered size in CSS pixels. */
+  /** Largest rendered size in CSS pixels. The code fills the space it is given up
+   *  to this, rather than sitting at a fixed size: the receiving camera needs
+   *  roughly three of its pixels per module, so how big this is drawn is a
+   *  direct input to whether the transfer can happen at all. */
   size?: number
   /** Frames per second. Ten is a deliberate floor rather than a maximum: a camera
    *  needs a whole frame to be on screen when its shutter opens, and pushing the
@@ -30,9 +33,13 @@ interface OpticalSendProps {
   fps?: number
 }
 
-export function OpticalSend({ payload, transferId, size = 320, fps = 10 }: OpticalSendProps) {
+export function OpticalSend({ payload, transferId, size = 560, fps = 10 }: OpticalSendProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null)
   const [error, setError] = useState<string | null>(null)
+  /** Frames drawn so far. The other device acknowledges nothing, ever, so this is
+   *  the only thing on the sending screen that separates a transfer in progress
+   *  from a page that has quietly stopped. */
+  const [shown, setShown] = useState(0)
   const total = frameCount(payload.length)
 
   useEffect(() => {
@@ -50,6 +57,7 @@ export function OpticalSend({ payload, transferId, size = 320, fps = 10 }: Optic
         return
       }
       seq++
+      setShown(seq)
       const n = matrix.length
       const quiet = 4
       const dim = n + quiet * 2
@@ -81,16 +89,25 @@ export function OpticalSend({ payload, transferId, size = 320, fps = 10 }: Optic
     <div className="optical-send">
       <canvas
         ref={canvasRef}
-        width={size}
-        height={size}
-        style={{ width: size, height: size, imageRendering: 'pixelated' }}
+        className="optical-canvas"
+        style={{ maxWidth: size, imageRendering: 'pixelated' }}
         role="img"
         aria-label="animated transfer code"
       />
-      <p className="small muted">
+      <p className="small muted" aria-live="off">
         {total === 1
-          ? 'Point the other device at this code.'
-          : `Point the other device at this code and hold it there. This is about ${total} frames.`}
+          ? 'Point the other device at this code. This transfer is small enough that any one of these codes completes it, so it should be quick.'
+          : `Point the other device at this code and hold it there. It cycles through about ${total} parts and then keeps going, so there is no need to catch them in order.`}
+      </p>
+      {/* Proof of life. The other device gives no acknowledgement of any kind, so
+          this is the only thing on the sending screen that distinguishes a
+          transfer in progress from a page that has stopped. */}
+      <p className="tiny muted" role="status">
+        <span className="optical-pulse" aria-hidden="true" /> sending, {shown} {shown === 1 ? 'code' : 'codes'} shown
+      </p>
+      <p className="tiny muted">
+        Fill the other device's camera view with this code. If it is not being read, move the devices closer together
+        or make this window larger.
       </p>
     </div>
   )

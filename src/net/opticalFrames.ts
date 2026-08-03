@@ -18,10 +18,31 @@ import { base64urlnopad } from '@scure/base'
 import { qrCapacityBytes } from '../ui/qr'
 import { FRAME_HEADER_LEN, encodeFrame, readFrameHeader } from './fountain'
 
-/** Symbol version the stream uses. 40 is the densest, and the ceremony is a
- *  phone held in front of a screen, which is exactly the situation a dense
- *  symbol is fine in: close, well lit, and steady enough. */
-const STREAM_VERSION = 40
+/**
+ * Symbol version the stream uses.
+ *
+ * This was version 40, the densest there is, on the reasoning that the ceremony
+ * is a phone held close to a screen. That reasoning was wrong about the hardware
+ * people actually have: a version-40 symbol is 177 modules across, 185 with its
+ * quiet zone, and a decoder needs roughly three camera pixels per module. A
+ * laptop webcam left to its own devices commonly negotiates 640x480, which gives
+ * under two pixels per module even when the code fills the view, so it could
+ * never decode and there was no way for anyone to tell that from a code that had
+ * simply not been aimed at properly.
+ *
+ * Version 25 is 117 modules, 125 with the quiet zone, which is comfortable at
+ * 720p and easy at 1080p. It costs frames: about 930 payload bytes each instead
+ * of about 2190, so a transfer takes rather more than twice as many. That is the
+ * right trade every time here, because frames are nearly free (the fountain
+ * layer means a receiver takes whatever it catches, and a clean pass at ten
+ * frames a second is a fraction of a second either way) while a symbol nobody can
+ * read costs the whole ceremony.
+ *
+ * Nothing needs to agree on this. The block size travels in each frame's own
+ * header, so a receiver adapts to whatever a sender chose, and the two builds
+ * either side of this change interoperate in both directions.
+ */
+const STREAM_VERSION = 25
 const STREAM_LEVEL = 'L' as const
 
 /** Bytes of fountain frame that fit in one symbol once base64 has taken its

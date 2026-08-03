@@ -31,6 +31,15 @@ export function OpticalReceive({ onPayload, onCancel, title = 'Receiving' }: Opt
   const [status, setStatus] = useState<Status>('starting')
   const [error, setError] = useState('')
   const [progress, setProgress] = useState({ have: 0, need: 0 })
+  /** Any QR read at all, whether or not it was part of a transfer. This is what
+   *  separates "the camera cannot read that code" from "it is reading something
+   *  that is not a transfer", which used to look identical: both showed the same
+   *  "point this at the other device" line forever. */
+  const [codesSeen, setCodesSeen] = useState(0)
+  /** What the camera actually gave us. A decoder needs about three pixels per
+   *  module, so a camera that came up at 640x480 is the whole explanation for a
+   *  transfer that never progresses, and the number belongs on screen. */
+  const [resolution, setResolution] = useState<{ w: number; h: number } | null>(null)
 
   useEffect(() => {
     let stream: MediaStream | null = null
@@ -52,7 +61,21 @@ export function OpticalReceive({ onPayload, onCancel, title = 'Receiving' }: Opt
         return
       }
       try {
-        stream = await media.getUserMedia({ video: { facingMode: 'environment' }, audio: false })
+        // Ask for as much resolution as the camera will give. Without this a
+        // laptop webcam commonly negotiates 640x480, which is not enough pixels
+        // per module to decode the codes at all, and the failure is silent: the
+        // scanner simply never reports progress. `ideal` rather than `exact` so a
+        // camera that cannot manage it still starts rather than throwing, and
+        // facingMode stays a preference so a device with only a front camera
+        // (every laptop) is not excluded.
+        stream = await media.getUserMedia({
+          video: {
+            facingMode: 'environment',
+            width: { ideal: 1920 },
+            height: { ideal: 1080 },
+          },
+          audio: false,
+        })
       } catch (e) {
         const name = e instanceof DOMException ? e.name : ''
         setError(
@@ -76,8 +99,12 @@ export function OpticalReceive({ onPayload, onCancel, title = 'Receiving' }: Opt
 
       const tick = async () => {
         if (stopped) return
+        if (video.videoWidth) {
+          setResolution((r) => (r?.w === video.videoWidth ? r : { w: video.videoWidth, h: video.videoHeight }))
+        }
         try {
           const text = await decodeQrFrame(video, canvas)
+          if (text) setCodesSeen((n) => n + 1)
           const frame = text ? parseOpticalFrame(text) : null
           if (frame) {
             // A frame from another transfer, or one this decoder cannot use, is
@@ -106,6 +133,10 @@ export function OpticalReceive({ onPayload, onCancel, title = 'Receiving' }: Opt
   }, [])
 
   const pct = progress.need > 0 ? Math.round((progress.have / progress.need) * 100) : 0
+  const receiving = progress.need > 0
+  // A camera below roughly 1280 across cannot resolve these codes reliably, and
+  // saying so beats leaving someone to conclude the feature is broken.
+  const lowRes = resolution !== null && Math.min(resolution.w, resolution.h) < 700
 
   return (
     <div className="optical-receive">
@@ -116,13 +147,43 @@ export function OpticalReceive({ onPayload, onCancel, title = 'Receiving' }: Opt
         <>
           <video ref={videoRef} playsInline muted className="scanner-video" />
           <canvas ref={canvasRef} hidden />
+
+          {receiving && (
+            <div
+              className="optical-bar"
+              role="progressbar"
+              aria-valuemin={0}
+              aria-valuemax={progress.need}
+              aria-valuenow={progress.have}
+              aria-label="transfer progress"
+            >
+              <div className="optical-bar-fill" style={{ width: `${pct}%` }} />
+            </div>
+          )}
+
           <p className="small muted" aria-live="polite">
             {status === 'starting'
               ? 'Starting the camera...'
-              : progress.need === 0
-                ? 'Point this at the other device.'
-                : `Received ${progress.have} of ${progress.need} parts (${pct}%). Keep both devices still.`}
+              : receiving
+                ? `Received ${progress.have} of ${progress.need} parts (${pct}%). Keep both devices still.`
+                : codesSeen > 0
+                  ? 'Reading a code, but it is not a device transfer. Check the other device is showing the moving code.'
+                  : 'Looking for the code. Fill this view with it, and hold both devices still.'}
           </p>
+
+          {/* Three different things can be happening while nothing progresses, and
+              before this they all looked the same. This says which. */}
+          <p className="tiny muted" role="status">
+            {codesSeen > 0 ? `codes read: ${codesSeen}` : 'no code read yet'}
+            {resolution ? ` · camera ${resolution.w}x${resolution.h}` : ''}
+          </p>
+
+          {lowRes && !receiving && (
+            <p className="tiny muted">
+              This camera is running at a low resolution, which may not be enough to read the code. Move the devices
+              closer together, make the code larger on the other screen, or use a device with a better camera.
+            </p>
+          )}
         </>
       )}
       <button type="button" onClick={onCancel}>
