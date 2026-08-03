@@ -11,6 +11,41 @@ release tags cut by the deploy pipeline. Dates are the tag dates.
 
 ## [Unreleased]
 
+## [1.9.0] - 2026-08-02
+
+### Added
+- **Move to a new device.** A new option in settings makes one encrypted file that
+  carries everything this device knows to a new one: your identity, your contacts and
+  who you verified, your nicknames, your deleted-conversation markers, and every saved
+  message. On the new device you restore that file instead of an identity backup. The
+  passphrase is generated for you and shown once, because the file holds every message
+  you have saved and is typed only once; write it down, send it separately from the
+  file, and do not photograph it. When the new device is working, the old one offers to
+  erase itself.
+- The honest parts, said plainly in the app and in DESIGN 8.3: a move is a copy, not a
+  sync (the two devices never reconcile afterward); until you message each contact from
+  the new device, anything they send is lost while their app shows delivered; a message
+  still waiting to send when you move is never sent, so the export refuses while any is
+  queued; nothing can disable the old device remotely, which is why the erase step
+  exists; and a move file you did not make yourself can contain messages that were never
+  sent, so only ever import your own.
+
+### Fixed
+- **Restoring a backup during onboarding no longer dead-ends.** A brand-new device
+  enrolls its app-lock before onboarding, and choosing "restore" then tried to enroll a
+  second time and failed. Restore now unlocks the existing lock and finishes, on every
+  entry point (onboarding, a returning evicted device, or a retry after an interrupted
+  restore).
+- **A restored or moved device can no longer be handed a one-time prekey a contact
+  already used.** The directory's anti-depletion cache re-served the same prekey to a
+  repeat fetcher; after a restore that could silently break the first new conversation
+  with a recently-contacted person in both directions. Re-registration now clears that
+  device's fetch history server-side.
+- **A crash midway through a restore can no longer attach the backup's data to the
+  wrong identity.** Staging now removes any existing identity first, so a loadable
+  identity exists only once the restore has fully landed; an interrupted restore returns
+  to the restore screen and re-runs cleanly.
+
 ## [1.8.3] - 2026-08-02
 
 ### Fixed

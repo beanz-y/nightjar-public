@@ -34,8 +34,9 @@ and an in-app canary) are implemented. See the roadmap in the design doc.
 > your contacts' safety numbers in person, though note even that check runs on code
 > I serve. Also know: your messages' contents are private, but I can see *who* you
 > talk to and *when* (not what you say). And keep a backup of your identity,
-> because if you lose your device without one your account is gone (message
-> history stays only on each device and is never in a backup).
+> because if you lose your device without one your account is gone (message history
+> stays on each device and is never in an identity backup; it survives a device
+> change only in a move file you deliberately make first).
 > If your threat model includes being targeted by me, by anyone who can compel me,
 > or by a state, use Signal.
 

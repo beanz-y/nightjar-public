@@ -267,6 +267,12 @@ export function parseBackupHeader(blob: Uint8Array): { params: BackupParams; sal
   if (blob.length > HEADER_LEN + BACKUP_MAX_PAYLOAD_BYTES + 64) {
     throw new BackupFormatError('backup file is implausibly large')
   }
+  // A move file (Phase D) fed to the backup opener gets the real reason, not a
+  // generic rejection; a pre-1.9 build cannot say this, which is why the export
+  // panel states the minimum app version.
+  if (blob[0] === 0x4e && blob[1] === 0x4a && blob[2] === 0x4d && blob[3] === 0x56) {
+    throw new BackupFormatError('this is a move file (.njmv); it carries messages and needs app version 1.9.0 or newer')
+  }
   for (let i = 0; i < 4; i++) {
     if (blob[i] !== MAGIC_BYTES[i]) throw new BackupFormatError('not a Nightjar backup')
   }

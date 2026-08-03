@@ -66,10 +66,13 @@ const DISMISSED_KEY = 'contacts.dismissed.v1'
 /** A dismissal expires with the relay-side invite record that motivates it, so the
  *  list cannot become a permanent record of everyone you ever deleted. */
 const DISMISSAL_TTL_MS = INVITE_TTL_MS
-/** Bound, newest kept: this list is convenience, never a security control. */
-const MAX_DISMISSALS = 200
+/** Bound, newest kept: this list is convenience, never a security control.
+ *  Exported: the move-package importer must cap at the SAME bound, or the next
+ *  contact write here would silently trim what the import claimed to keep. */
+export const MAX_DISMISSALS = 200
 const MAX_PENDING_RECORDS = 100
-const MAX_ALIAS_LENGTH = 60
+/** Exported for the same lockstep reason as MAX_DISMISSALS. */
+export const MAX_ALIAS_LENGTH = 60
 const encoder = new TextEncoder()
 const decoder = new TextDecoder()
 
@@ -477,6 +480,65 @@ export class ContactStore {
       // Likewise the deleted-peer list: it belongs to the identity that made it,
       // and inheriting it would silently gate contacts for a different identity.
       await this.store.delete(DISMISSED_KEY)
+    })
+  }
+
+  /** Export-side alias read (Phase D move). PROPAGATES failures where getAliases
+   *  fails open: an exporter that read {} from a broken blob would seal a file
+   *  asserting "no nicknames" inside an honest-looking success report. */
+  async exportAliases(): Promise<Record<string, string>> {
+    const bytes = await this.getSealed(ALIASES_KEY, ALIASES_KEY)
+    if (!bytes) return {}
+    const m = JSON.parse(decoder.decode(bytes)) as Record<string, string>
+    return m && typeof m === 'object' ? m : {}
+  }
+
+  /** Export-side deletion-marker read (Phase D move). Propagating, TTL-filtered,
+   *  and WITHOUT hadSession: that field answers "did THIS device's published
+   *  prekeys get consumed", and the importing device's re-registration (fresh
+   *  prekeys, fetcher vends cleared server-side) falsifies it by construction. */
+  async exportDismissals(): Promise<Record<string, { at: number; auto: boolean }>> {
+    const m = await this.loadDismissals()
+    const out: Record<string, { at: number; auto: boolean }> = {}
+    for (const [peer, d] of Object.entries(m)) out[peer] = { at: d.at, auto: d.auto }
+    return out
+  }
+
+  /** Replace contacts + nicknames + deletion markers from a move file (Phase D).
+   *  ONE method on purpose: replaceAllFromBackup deletes the dismissal blob as
+   *  part of its own contract, so separate replace calls would be one call-site
+   *  transposition away from silently destroying the markers the move exists to
+   *  carry. Every write is a BLIND whole-blob overwrite, never read-modify-write:
+   *  a crashed earlier import attempt may have left blobs behind, and a re-run
+   *  must converge without being able to read them. */
+  async replaceAllForMove(
+    contacts: Contact[],
+    aliases: Record<string, string>,
+    dismissals: Record<string, { at: number; auto: boolean }>,
+  ): Promise<void> {
+    const map: Record<string, Contact> = {}
+    for (const c of contacts) {
+      if (deriveUserId(b64decode(c.ikSig, 32)) !== c.peerId) continue
+      map[c.peerId] = { ...c }
+    }
+    await this.lock.withLock(CONTACTS_LOCK, async () => {
+      await this.write(map)
+      // The prior identity's parked trust work never carries (fresh-device premise).
+      await this.store.delete(PENDING_KEY)
+      if (Object.keys(aliases).length === 0) {
+        await this.store.delete(ALIASES_KEY)
+      } else {
+        await this.putSealed(ALIASES_KEY, ALIASES_KEY, encoder.encode(JSON.stringify(aliases)))
+      }
+      const rows = Object.entries(dismissals)
+        .map(([peer, d]) => [peer, { at: d.at, auto: d.auto, hadSession: false }] as const)
+        .sort((a, b) => b[1].at - a[1].at)
+        .slice(0, MAX_DISMISSALS)
+      if (rows.length === 0) {
+        await this.store.delete(DISMISSED_KEY)
+      } else {
+        await this.putSealed(DISMISSED_KEY, DISMISSED_KEY, encoder.encode(JSON.stringify(Object.fromEntries(rows))))
+      }
     })
   }
 

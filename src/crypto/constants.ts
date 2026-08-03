@@ -178,6 +178,24 @@ export const BACKUP_MAX_CONTACTS = 1000
  *  passphrase is 20 base32 characters (~100 bits) and always passes. */
 export const PASSPHRASE_MIN_LENGTH = 12
 
+// Move package (Phase D, DESIGN 8.3). One deliberately made file that carries
+// identity + contacts + aliases + deletion markers + saved message history to a
+// NEW device. The envelope discipline is the backup blob's exactly (fixed header
+// as AAD, every parameter bounds-checked BEFORE the KDF runs); the KDF info
+// differs so a move key can never be a backup key even under a reused passphrase.
+export const MOVE_MAGIC = 'NJMV'
+export const MOVE_FORMAT_VERSION = 0x01
+export const INFO_MOVE = 'Nightjar_Move_v1'
+/** Decrypted payload cap. Enforced against the FILE SIZE before the file is even
+ *  read into memory, again in the header parse before the KDF, and again before
+ *  JSON.parse. Sized for message history (the backup cap is 256 KiB). */
+export const MOVE_MAX_PAYLOAD_BYTES = 16 * 1024 * 1024
+/** Saved-message row cap, aligned with the byte cap (at observed row sizes the
+ *  byte cap lands near this count; a higher row cap would be dead code). Exports
+ *  REFUSE over the cap with a count and a remedy; nothing ever truncates. */
+export const MOVE_MAX_MESSAGES = 90000
+export const MOVE_MAX_ALIASES = 1000
+
 // Persistent local message history (P10b, DESIGN 8.1/8.3, 14). Each history
 // row's body is sealed with a per-record key+nonce derived from a random 32-byte
 // History Master Key (HMK) and a FRESH per-record salt. The fresh salt is

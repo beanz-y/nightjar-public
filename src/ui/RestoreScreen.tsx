@@ -16,7 +16,9 @@ interface Props {
 export function RestoreScreen({ mode, busy, error, onRestore, onBack }: Props) {
   const [file, setFile] = useState<File | null>(null)
   const [passphrase, setPassphrase] = useState('')
+  const [reveal, setReveal] = useState(false)
   const fileRef = useRef<HTMLInputElement>(null)
+  const isMove = !!file && /\.njmv$/i.test(file.name)
 
   return (
     <section className="onboard">
@@ -31,51 +33,67 @@ export function RestoreScreen({ mode, busy, error, onRestore, onBack }: Props) {
         </>
       ) : (
         <p className="muted small">
-          Restore replaces this device's brand-new identity with the one in your backup, along with your contacts and
-          their verification status. Message history is not in backups; it stays on the device it happened on.
+          Restore replaces this device's brand-new identity with the one in your file, along with your contacts and
+          their verification status. An identity backup (.njbk) does not carry messages; a move file (.njmv) does. If you
+          have a move file, use it here.
         </p>
       )}
 
       <p className="small">
-        Only restore a backup <strong>you created yourself</strong>. A backup file IS an identity: restoring someone
-        else's file means using an identity its creator fully controls.
+        Only restore a file <strong>you created yourself</strong>. A backup or move file IS an identity (and a move file
+        is also every message it saved): restoring someone else's means using an identity its creator fully controls and
+        reading messages that are not yours.
       </p>
 
-      <label className="field-label small muted">backup file (.njbk)</label>
+      <label className="field-label small muted">backup or move file (.njbk, .njmv)</label>
       <div className="row">
         <input
           ref={fileRef}
           type="file"
-          accept=".njbk,application/octet-stream"
+          accept=".njbk,.njmv,application/octet-stream"
           onChange={(e) => setFile(e.target.files?.[0] ?? null)}
           disabled={busy}
         />
       </div>
 
-      <label className="field-label small muted">backup passphrase</label>
+      <label className="field-label small muted">file passphrase</label>
       <div className="row">
         <input
           className="mono"
-          type="password"
-          placeholder="the passphrase you saved with the backup"
+          type={reveal ? 'text' : 'password'}
+          placeholder="the passphrase you saved with the file"
           value={passphrase}
           onChange={(e) => setPassphrase(e.target.value)}
           disabled={busy}
+          autoCapitalize="none"
+          autoCorrect="off"
+          spellCheck={false}
           onKeyDown={(e) => {
             if (e.key === 'Enter' && file && passphrase) onRestore(file, passphrase)
           }}
         />
+        <button className="ghost small" type="button" onClick={() => setReveal((r) => !r)} disabled={busy}>
+          {reveal ? 'hide' : 'show'}
+        </button>
         <button className="primary" disabled={busy || !file || !passphrase} onClick={() => file && onRestore(file, passphrase)}>
-          {busy ? 'unlocking…' : 'restore'}
+          {busy ? 'unlocking…' : isMove ? 'move in' : 'restore'}
         </button>
       </div>
 
       {busy && <p className="muted small">Unlocking is slow on purpose (it is what makes the file hard to crack). This can take several seconds.</p>}
       {error && <p className="error small">{error}</p>}
-      {!busy && (
+      {!busy && !isMove && (
         <p className="muted small">
           After a restore, send each contact a message to re-establish the conversation. Anything sent to you between
           losing the device and restoring cannot be recovered.
+        </p>
+      )}
+      {!busy && isMove && (
+        <p className="muted small">
+          After the move, do two things. Stop using the old device and erase Nightjar from it; until then it keeps a full
+          copy and can still act as you. And send each contact a message: until you do, anything they send you was
+          encrypted for the old device and is dropped while their app shows delivered. Nobody is told you moved, so tell
+          them. Then delete the move file and destroy the passphrase note.
         </p>
       )}
 

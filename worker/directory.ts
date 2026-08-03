@@ -258,6 +258,14 @@ export class Directory {
         // half the owner no longer holds, silently breaking new inbound sessions.
         this.sql.exec('DELETE FROM opks WHERE user_id = ?', body.userId)
         this.sql.exec('DELETE FROM vends WHERE target = ?', body.userId)
+        // Also drop vends where this user was the FETCHER (Phase D). The vend
+        // cache re-serves the SAME one-time prekey to a repeat fetcher for 7
+        // days; a restored or moved device re-fetching a recently-contacted
+        // peer would be handed a prekey that peer already consumed, its initial
+        // would never decrypt, and both directions black-hole while showing
+        // delivered. A re-registration is a declaration that this device's
+        // session world restarted, so its fetch history restarts with it.
+        this.sql.exec('DELETE FROM vends WHERE fetcher = ?', body.userId)
         this.storeBundle(body.userId, canon)
         return { opkCount: this.opkCount(body.userId) }
       })

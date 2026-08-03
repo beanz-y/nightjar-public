@@ -502,6 +502,42 @@ describe('end-to-end messaging through the relay', () => {
     expect(decode(dec.plaintext)).toBe('after re-register')
   })
 
+  it('clears a re-registered fetcher\'s prior vends so a re-fetch does not re-serve a consumed OPK (Phase D)', async () => {
+    // The vend cache is idempotent per (fetcher, target): a repeat fetch returns
+    // the SAME one-time prekey, whose private half the target consumed on the
+    // first handshake. After a MOVE, the fetcher re-registers; if that vend
+    // survived, its next fetch would be handed the already-consumed OPK and the
+    // new session would never decrypt. Re-registration must clear vends where
+    // this user is the FETCHER, so the re-fetch vends a fresh OPK.
+    const bob = generateIdentity()
+    const bConn = await connectAndAuth(bob)
+    expect((await register(bConn, ownBundleFor(bob), await adminInvite())).t).toBe('registered')
+
+    const alice = generateIdentity()
+    const aConn = await connectAndAuth(alice)
+    await register(aConn, ownBundleFor(alice), await adminInvite())
+
+    const fetchOpkId = async (): Promise<number | null> => {
+      const req = nextReq()
+      aConn.send({ t: 'fetchBundle', reqId: req, target: bob.userId })
+      const msg = (await aConn.waitPred(
+        (m) => m.t === 'bundle' && (m as { reqId?: string }).reqId === req,
+      )) as Extract<ServerMessage, { t: 'bundle' }>
+      return decodeFetchedBundle(msg.bundle!).opk?.id ?? null
+    }
+
+    const first = await fetchOpkId()
+    expect(first).not.toBeNull()
+    // Same fetcher, no re-register: idempotent vend returns the SAME id.
+    expect(await fetchOpkId()).toBe(first)
+
+    // Alice re-registers (the move's fresh prekey publish), then re-fetches.
+    await register(aConn, ownBundleFor(alice), 'ignored-on-reregister')
+    const afterReregister = await fetchOpkId()
+    expect(afterReregister).not.toBeNull()
+    expect(afterReregister).not.toBe(first)
+  })
+
   it('queues while offline and drains on reconnect, then ack-drops a replay', async () => {
     const alice = generateIdentity()
     const bob = generateIdentity()

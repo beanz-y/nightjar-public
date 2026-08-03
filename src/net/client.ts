@@ -16,9 +16,11 @@
 import { bytesToHex, hexToBytes } from '@noble/hashes/utils.js'
 import { type Identity, deriveUserId } from '../crypto/identity'
 import type { PushSubscriptionInfo } from '../platform'
-import { decodeMessage, encodeDeleteMessage, encodeTextMessage, newMsgId } from '../crypto/message'
+import { decodeMessage, encodeDeleteMessage, encodeRefreshMessage, encodeTextMessage, newMsgId } from '../crypto/message'
+import type { HistoryUnitMessage } from '../crypto/historyUnit'
 import {
   MAX_DELIVERED_CHECK_IDS,
+  MOVE_MAX_MESSAGES,
   OPK_BATCH,
   OPK_REPLENISH_THRESHOLD,
   OPK_VEND_TTL_MS,
@@ -35,7 +37,7 @@ import { currentSession, promoteSession, updateSession } from '../session/sessio
 import type { DeliveryStatus, HistoryStore } from '../storage/historyStore'
 import type { Lock } from '../storage/lock'
 import type { PrekeyStore } from '../storage/prekeyStore'
-import type { OutboxEntry, SessionStore } from '../storage/sessionStore'
+import type { HistoryRecord, OutboxEntry, SessionBook, SessionStore } from '../storage/sessionStore'
 import {
   type Envelope,
   type WireEnvelope,
@@ -53,6 +55,23 @@ import { type AuthedInfo, Transport } from './transport'
 
 const sessionLock = (peerId: string) => `nightjar-session:${peerId}`
 const REPLENISH_LOCK = 'nightjar-opk-replenish'
+
+/** An export refusal the UI words for the user (Phase D). The move must not
+ *  proceed while sends are queued (they would cross as rows neither device will
+ *  ever transmit) or past the message cap (a truncated file is worse than none). */
+export class MoveBlockedError extends Error {
+  constructor(
+    readonly reason: 'outbox' | 'too-large',
+    readonly count: number,
+  ) {
+    super(
+      reason === 'outbox'
+        ? `move blocked: ${count} message(s) still queued to send`
+        : `move blocked: ${count} saved messages exceed the move-file cap`,
+    )
+    this.name = 'MoveBlockedError'
+  }
+}
 
 // Reconnect backoff (P8): exponential with jitter, capped. A dropped socket
 // self-heals; the UI additionally kicks reconnectNow() on visibility/online.
@@ -117,6 +136,12 @@ export interface ClientCallbacks {
    *  relay and dropped from the outbox. The UI marks that exact message failed so
    *  it never reads as delivered (the envelope id equals the UI message id). */
   onSendFailed?: (envId: string, reason: string) => void
+  /** Optional (Phase D): a message from this LIVE contact was permanently
+   *  undecryptable and dropped, typically because it was encrypted for a session
+   *  that did not ride a move; the honest UI move is "ask them to resend". Only
+   *  ever fired for a current, non-deleted contact: a deleted peer's dropped
+   *  backlog stays anonymous on purpose (naming them would undo the delete). */
+  onUnreadableFrom?: (peerId: string) => void
   /** Optional: how far one of OUR sent messages got, by content id. Only ever
    *  moves forward (sent -> delivered), and both states are the relay's word, not
    *  a signed statement by the peer. A UI hint, never a security property. */
@@ -156,6 +181,9 @@ export class NightjarClient {
   /** Queued-send ids already reported as unreadable, so a stuck row is surfaced once
    *  rather than on every reconnect (mirrors `warnedSendCodes`). */
   private readonly warnedUnreadableOutbox = new Set<string>()
+  /** Live contacts already named in an unreadable-message notice this connect
+   *  (Phase D), so a redelivering backlog names each sender once, not per drop. */
+  private readonly notedUnreadableFrom = new Set<string>()
 
   constructor(
     private readonly identity: Identity,
@@ -235,6 +263,7 @@ export class NightjarClient {
   /** Post-auth housekeeping, shared by first connect and every reconnect. */
   private async afterConnect(): Promise<void> {
     this.reconnectAttempt = 0
+    this.notedUnreadableFrom.clear()
     this.cb.onConnection?.(true)
     await this.flushOutbox()
     // If we came back with a low server-side OPK stock (a run of inbound sessions
@@ -645,76 +674,120 @@ export class NightjarClient {
         return e
       }
 
-      // No session: fetch the peer bundle, run the trust check against its IK_sig,
-      // and open a new initiator session only if the key is trusted (DESIGN 6.4).
-      const { bundle } = await this.directory.fetchBundle(to)
-      if (!bundle) throw new Error(`peer ${to} is not registered`)
-      // The fetched IK_sig MUST hash to the userId we asked for. Because a userId
-      // IS SHA-256(IK_sig) (DESIGN 3), this catches a directory that served a
-      // substituted key for this contact (the cheap key-swap of 6.1) before any
-      // DH, without needing the out-of-band check. The safety number still covers
-      // the complementary case (a wrong userId handed to us at all).
-      if (deriveUserId(bundle.ikSigPub) !== to) {
-        throw new Error(`directory served a key that does not match ${to}`)
-      }
-      // Fail closed if we already hold a DIFFERENT key for this userId (collision
-      // or local corruption); else record on first contact below.
-      const a = await this.contacts.assess(to, bundle.ikSigPub)
-      if (a.outcome === 'conflict') throw new KeyConflictError(to)
-
-      // Record the contact BEFORE committing the session. A later send to an
-      // established peer takes the current-session branch (above) and never touches
-      // the contact store, so if this record were only best-effort AFTER the commit,
-      // a single contacts-store hiccup would leave a durable session with no contact
-      // record: the peer would be unverifiable forever (no stored IK_sig -> no safety
-      // number, the priority-1 control). Recording first means a failure aborts this
-      // first-contact send with nothing queued to lose. (Contact/trust is not message
-      // content, so it is recorded even for an ephemeral first message.)
-      if (a.outcome === 'first-contact') {
-        await this.contacts.recordFirstContact(to, bundle.ikSigPub, now)
-      }
-
-      // Re-establishing with someone whose session we USED to hold, and deleted
-      // recently, must NOT use the directory's one-time prekey. The vend is
-      // idempotent per (fetcher, target) for OPK_VEND_TTL_MS, so a re-fetch inside
-      // that window hands back the SAME OPK, whose private half the peer consumed
-      // when the first session was set up. They would fail to respond, our initial
-      // would be poison-dropped after its retries, and the conversation would be
-      // silently dead while our own UI showed it delivered. The no-OPK path is the
-      // documented degraded mode (DESIGN 4.3) and always opens, because the peer
-      // keeps its signed-prekey private half through the retire grace period.
-      //
-      // `hadSession` is load-bearing, not belt-and-braces. Deleting a conversation
-      // KEEPS the session (8.9), so reaching this branch at all means the session
-      // was lost some other way. A peer deleted before any session existed consumed
-      // NOTHING, and stripping their prekey would downgrade a perfectly healthy
-      // handshake to the degraded path for no reason.
-      let usable = bundle
-      try {
-        const dismissal = await this.contacts.getDismissal(to)
-        if (dismissal?.hadSession && now - dismissal.at < OPK_VEND_TTL_MS && bundle.opk) {
-          usable = { ...bundle, opk: null }
-        }
-      } catch {
-        /* best-effort: on doubt, use the bundle as served */
-      }
-      const ini = x3dhInitiate(this.identity, usable, now)
-      const state0 = initRatchetInitiator(ini.sk, ini.ad, usable.spk.pub)
-      const { state, header, ciphertext } = ratchetEncrypt(state0, plaintext)
-      const env: WireEnvelope = {
-        id: contentIdHex,
-        kind: 'initial',
-        header: encodeMessageHeaderWire(header),
-        ciphertext: b64encode(ciphertext),
-        initialHeader: encodeInitialHeader(ini.header),
-      }
-      const promoted = promoteSession(book, serializeRatchet(state), now)
-      const e: OutboxEntry = { id: contentIdHex, to, env, createdAt: now }
-      await this.store.saveBookWithOutbox(to, promoted, e, historyRow)
-      return e
+      // No session: open a fresh initiator session carrying this text (shared
+      // helper; the transport id equals the content id for a first-send text,
+      // per the two-id rule's one safe case).
+      return this.openInitiatorEntry(to, plaintext, contentIdHex, {
+        book,
+        now,
+        ...(historyRow ? { historyRow } : {}),
+      })
     })
     this.fire(entry)
     return entry.id
+  }
+
+  /** Open a fresh initiator session to `to` and commit `plaintext` as its first
+   *  message: bundle fetch, key<->userId binding check, trust assessment and
+   *  first-contact recording, the deleted-peer prekey strip, X3DH, and the atomic
+   *  session+outbox(+history) commit. Shared by a first-contact text, the
+   *  post-move session-refresh ping, and a delete control sent where no session
+   *  survives (Phase D). The CALLER holds the per-peer session lock. */
+  private async openInitiatorEntry(
+    to: string,
+    plaintext: Uint8Array,
+    transportId: string,
+    opts: { book: SessionBook | null; now: number; historyRow?: HistoryRecord; silent?: boolean },
+  ): Promise<OutboxEntry> {
+    const { book, now } = opts
+    const { bundle } = await this.directory.fetchBundle(to)
+    if (!bundle) throw new Error(`peer ${to} is not registered`)
+    // The fetched IK_sig MUST hash to the userId we asked for. Because a userId
+    // IS SHA-256(IK_sig) (DESIGN 3), this catches a directory that served a
+    // substituted key for this contact (the cheap key-swap of 6.1) before any
+    // DH, without needing the out-of-band check. The safety number still covers
+    // the complementary case (a wrong userId handed to us at all).
+    if (deriveUserId(bundle.ikSigPub) !== to) {
+      throw new Error(`directory served a key that does not match ${to}`)
+    }
+    // Fail closed if we already hold a DIFFERENT key for this userId (collision
+    // or local corruption); else record on first contact below.
+    const a = await this.contacts.assess(to, bundle.ikSigPub)
+    if (a.outcome === 'conflict') throw new KeyConflictError(to)
+
+    // Record the contact BEFORE committing the session. A later send to an
+    // established peer takes the current-session branch and never touches
+    // the contact store, so if this record were only best-effort AFTER the commit,
+    // a single contacts-store hiccup would leave a durable session with no contact
+    // record: the peer would be unverifiable forever (no stored IK_sig -> no safety
+    // number, the priority-1 control). Recording first means a failure aborts this
+    // first-contact send with nothing queued to lose. (Contact/trust is not message
+    // content, so it is recorded even for an ephemeral first message.)
+    if (a.outcome === 'first-contact') {
+      await this.contacts.recordFirstContact(to, bundle.ikSigPub, now)
+    }
+
+    // Re-establishing with someone whose session we USED to hold, and deleted
+    // recently, must NOT use the directory's one-time prekey. The vend is
+    // idempotent per (fetcher, target) for OPK_VEND_TTL_MS, so a re-fetch inside
+    // that window hands back the SAME OPK, whose private half the peer consumed
+    // when the first session was set up. They would fail to respond, our initial
+    // would be poison-dropped after its retries, and the conversation would be
+    // silently dead while our own UI showed it delivered. The no-OPK path is the
+    // documented degraded mode (DESIGN 4.3) and always opens, because the peer
+    // keeps its signed-prekey private half through the retire grace period.
+    //
+    // `hadSession` is load-bearing, not belt-and-braces. Deleting a conversation
+    // KEEPS the session (8.9), so reaching this branch at all means the session
+    // was lost some other way. A peer deleted before any session existed consumed
+    // NOTHING, and stripping their prekey would downgrade a perfectly healthy
+    // handshake to the degraded path for no reason. (After a MOVE, re-registration
+    // also cleared this user's fetcher-side vends at the Directory, so a re-fetch
+    // there vends fresh; imported markers carry hadSession=false for the same
+    // reason and never reach this strip.)
+    let usable = bundle
+    try {
+      const dismissal = await this.contacts.getDismissal(to)
+      if (dismissal?.hadSession && now - dismissal.at < OPK_VEND_TTL_MS && bundle.opk) {
+        usable = { ...bundle, opk: null }
+      }
+    } catch {
+      /* best-effort: on doubt, use the bundle as served */
+    }
+    const ini = x3dhInitiate(this.identity, usable, now)
+    const state0 = initRatchetInitiator(ini.sk, ini.ad, usable.spk.pub)
+    const { state, header, ciphertext } = ratchetEncrypt(state0, plaintext)
+    const env: WireEnvelope = {
+      id: transportId,
+      kind: 'initial',
+      header: encodeMessageHeaderWire(header),
+      ciphertext: b64encode(ciphertext),
+      initialHeader: encodeInitialHeader(ini.header),
+    }
+    const promoted = promoteSession(book, serializeRatchet(state), now)
+    const e: OutboxEntry = { id: transportId, to, env, createdAt: now, ...(opts.silent ? { silent: true } : {}) }
+    await this.store.saveBookWithOutbox(to, promoted, e, opts.historyRow)
+    return e
+  }
+
+  /** Send the post-move session-refresh ping to `peer` (Phase D, DESIGN 8.3): a
+   *  fresh X3DH initial carrying a record every receiver, old build or new,
+   *  renders and persists as NOTHING (an unknown NJM1 kind). Its entire value is
+   *  that receiving it promotes a live session, so the peer's NEXT send stops
+   *  riding the dead pre-move session this device could never decrypt (which
+   *  would be poison-dropped while the relay told them "delivered"). Silent: no
+   *  push nudge, nothing user-visible arrives. A peer with a live session is
+   *  skipped (the user's own first message already refreshed it). Throws on
+   *  failure; the drain loop classifies permanent vs retryable. */
+  async sendSessionRefresh(peer: string): Promise<void> {
+    const entry = await this.lock.withLock(sessionLock(peer), async () => {
+      const now = Date.now()
+      const book = await this.store.loadBook(peer)
+      if (currentSession(book)) return null
+      const transportId = bytesToHex(newMsgId())
+      return this.openInitiatorEntry(peer, encodeRefreshMessage(newMsgId()), transportId, { book, now, silent: true })
+    })
+    if (entry) this.fire(entry)
   }
 
   /**
@@ -957,6 +1030,84 @@ export class NightjarClient {
     if (this.history) await this.store.historyRemove(this.history.storageKey(peerId, dir, id))
   }
 
+  /** Gather everything a move file carries (Phase D, DESIGN 8.3); the caller
+   *  seals. Refuses rather than truncates (MoveBlockedError) while sends are
+   *  still queued or past the message cap, and ABORTS if the app locks mid-scan:
+   *  every remaining row would read "unreadable" and the export would complete
+   *  as a silently partial file claiming success, the exact failure
+   *  sweepHistory's guard exists to prevent. loadAllHistory is deliberately NOT
+   *  used here: its per-row catch skips unreadable rows without counting them.
+   *
+   *  Torn-snapshot discipline: history is scanned FIRST, the contact-side blobs
+   *  are read LAST (propagating reads, never the fail-open consultors), and any
+   *  peer whose deletion marker postdates the scan start is stripped (contact,
+   *  nickname, rows) with the marker KEPT, so a deleteConversation landing
+   *  mid-gather cannot resurrect on the new device. */
+  async exportMoveData(): Promise<{
+    contacts: Contact[]
+    aliases: Record<string, string>
+    dismissals: Record<string, { at: number; auto: boolean }>
+    messages: HistoryUnitMessage[]
+    /** Rows that would not open while the app stayed unlocked (corruption):
+     *  not in the file, and the panel says so. */
+    unreadable: number
+    /** Readable rows whose peer has no contact row (nothing the importer could
+     *  bind them to): not in the file, and the panel says so. */
+    orphaned: number
+  }> {
+    const history = this.history
+    if (!history) throw new Error('history is not available on this client')
+    const start = Date.now()
+    const pending = await this.store.pendingOutbox()
+    const queued = pending.entries.length + pending.unreadable.length
+    if (queued > 0) throw new MoveBlockedError('outbox', queued)
+    const tombstoned = new Set(await this.store.tombstoneKeys())
+    const rows = await this.store.historyLoadAll()
+    const all: HistoryUnitMessage[] = []
+    let unreadable = 0
+    for (const row of rows) {
+      if (tombstoned.has(row.key)) continue
+      let msg
+      try {
+        msg = history.open(row)
+      } catch {
+        if (!history.isUnlocked) {
+          throw new Error('the app locked while exporting; unlock and try again (nothing was written)')
+        }
+        unreadable++
+        continue
+      }
+      const m: HistoryUnitMessage = { id: msg.id, peer: msg.peerId, dir: msg.dir, ts: msg.ts, text: msg.text }
+      if (msg.status) m.status = msg.status
+      if (row.failed && msg.dir === 'out') m.failed = true
+      all.push(m)
+    }
+    if (all.length > MOVE_MAX_MESSAGES) throw new MoveBlockedError('too-large', all.length)
+    // Contact-side blobs LAST; propagating reads only, then the torn-snapshot filter.
+    const contacts = await this.contacts.list()
+    const aliases = await this.contacts.exportAliases()
+    const dismissals = await this.contacts.exportDismissals()
+    const midGather = new Set(
+      Object.entries(dismissals)
+        .filter(([, d]) => d.at >= start)
+        .map(([p]) => p),
+    )
+    const keptContacts = contacts.filter((c) => !midGather.has(c.peerId))
+    const ids = new Set(keptContacts.map((c) => c.peerId))
+    const keptAliases: Record<string, string> = {}
+    for (const [k, v] of Object.entries(aliases)) if (!midGather.has(k)) keptAliases[k] = v
+    let orphaned = 0
+    const messages = all.filter((m) => {
+      if (midGather.has(m.peer)) return false // deleted mid-gather: the marker rides, rows do not
+      if (!ids.has(m.peer)) {
+        orphaned++
+        return false
+      }
+      return true
+    })
+    return { contacts: keptContacts, aliases: keptAliases, dismissals, messages, unreadable, orphaned }
+  }
+
   /**
    * Delete-for-everyone a message YOU sent (P10d, DESIGN 8.6). Always removes the
    * local copy; whether the peer is asked to remove it too depends on delivery
@@ -965,7 +1116,8 @@ export class NightjarClient {
    *     (drop the outbox entry) rather than transmit it and then chase it with a
    *     delete. Nothing was delivered, so there is nothing to recall.
    *   - already delivered (not in the outbox): send a `delete{contentId}` control
-   *     with its OWN fresh transport id (the two-id rule) on the current session.
+   *     with its OWN fresh transport id (the two-id rule) on the current session,
+   *     or on a FRESH initiator session when none survives (moved history, Phase D).
    *
    * `id` is the content msgId (hex) the bubble/history is keyed by. Returns whether
    * a delete request was actually sent to the peer. Best-effort and honest-client-
@@ -991,37 +1143,46 @@ export class NightjarClient {
     return { requested: sent }
   }
 
-  // Encrypt + queue a delete control targeting content id `targetId` on the peer's
-  // current session, with its OWN fresh transport id (never the target's id: reusing
-  // it would make the relay treat the delete as a duplicate of the original and drop
-  // it, and would clobber a still-queued original in the outbox). The control is not
-  // itself persisted to history. If no session exists we never delivered the target,
-  // so there is nothing to recall.
+  // Encrypt + queue a delete control targeting content id `targetId`, with its OWN
+  // fresh transport id (never the target's id: reusing it would make the relay
+  // treat the delete as a duplicate of the original and drop it, and would clobber
+  // a still-queued original in the outbox). The control is not itself persisted to
+  // history. With no live session it opens a FRESH initiator session (Phase D):
+  // "no session means the target was never delivered" stopped being true the day
+  // moved history could arrive without its sessions, and a delete is a valid first
+  // message (the receiver's compound-key check scopes what it can remove).
   private async sendDeleteControl(peer: string, targetId: string): Promise<boolean> {
     const plaintext = encodeDeleteMessage(hexToBytes(targetId))
-    const entry = await this.lock.withLock(sessionLock(peer), async () => {
-      const now = Date.now()
-      const book = await this.store.loadBook(peer)
-      const current = currentSession(book)
-      if (!current) return null
-      const { state, header, ciphertext } = ratchetEncrypt(deserializeRatchet(current.snapshot, now), plaintext)
-      const transportId = bytesToHex(newMsgId()) // fresh 16-byte id, distinct from targetId
-      const env: WireEnvelope = {
-        id: transportId,
-        kind: 'normal',
-        header: encodeMessageHeaderWire(header),
-        ciphertext: b64encode(ciphertext),
-      }
-      const advanced = updateSession(book!, current.id, serializeRatchet(state), now)
-      // silent: a delete control is delivered without a push nudge, so deleting a
-      // message never notifies the recipient (it still applies in-band / on drain).
-      const e: OutboxEntry = { id: transportId, to: peer, env, createdAt: now, silent: true }
-      await this.store.saveBookWithOutbox(peer, advanced, e) // commit before release; no history row
-      return e
-    })
-    if (!entry) return false
-    this.fire(entry)
-    return true
+    try {
+      const entry = await this.lock.withLock(sessionLock(peer), async () => {
+        const now = Date.now()
+        const book = await this.store.loadBook(peer)
+        const current = currentSession(book)
+        const transportId = bytesToHex(newMsgId()) // fresh 16-byte id, distinct from targetId
+        if (!current) {
+          return this.openInitiatorEntry(peer, plaintext, transportId, { book, now, silent: true })
+        }
+        const { state, header, ciphertext } = ratchetEncrypt(deserializeRatchet(current.snapshot, now), plaintext)
+        const env: WireEnvelope = {
+          id: transportId,
+          kind: 'normal',
+          header: encodeMessageHeaderWire(header),
+          ciphertext: b64encode(ciphertext),
+        }
+        const advanced = updateSession(book!, current.id, serializeRatchet(state), now)
+        // silent: a delete control is delivered without a push nudge, so deleting a
+        // message never notifies the recipient (it still applies in-band / on drain).
+        const e: OutboxEntry = { id: transportId, to: peer, env, createdAt: now, silent: true }
+        await this.store.saveBookWithOutbox(peer, advanced, e) // commit before release; no history row
+        return e
+      })
+      this.fire(entry)
+      return true
+    } catch {
+      // Unreachable peer (unregistered, key conflict, directory down): the local
+      // copy is already removed; the ask could not be queued. Honest answer: false.
+      return false
+    }
   }
 
   // Fire a queued envelope at the socket and arrange for its outbox entry to be
@@ -1070,6 +1231,21 @@ export class NightjarClient {
         continue
       }
       this.fire(e)
+    }
+  }
+
+  // Name the sender of a permanently-dropped envelope ONLY when they are a live,
+  // non-deleted contact (see the dropped branch below for why a deleted peer's
+  // backlog stays anonymous). Once per peer per connect; best-effort throughout.
+  private async noteUnreadableFrom(peer: string): Promise<void> {
+    if (!this.cb.onUnreadableFrom || this.notedUnreadableFrom.has(peer)) return
+    try {
+      if ((await this.contacts.trustLevel(peer)) === null) return
+      if ((await this.contacts.dismissedAt(peer)) !== null) return
+      this.notedUnreadableFrom.add(peer)
+      this.cb.onUnreadableFrom(peer)
+    } catch {
+      /* best-effort */
     }
   }
 
@@ -1138,9 +1314,13 @@ export class NightjarClient {
         void this.maybeReplenishOpks().catch(() => {})
       }
     } else if (res.kind === 'dropped') {
-      // No peer id: after a delete this fires on every reconnect for as long as the
-      // relay holds their queued messages, and printing the id would undo the very
-      // thing the delete promised (see the same reasoning in inbound.ts).
+      // Anonymous by default: after a delete this fires on every reconnect for as
+      // long as the relay holds the deleted peer's queued messages, and printing
+      // the id would undo the very thing the delete promised (see the same
+      // reasoning in inbound.ts). When the sender IS a live, non-deleted contact
+      // (the post-move case: their device still sends on a session that did not
+      // ride the move), the honest notice is the NAMED one, once per connect.
+      void this.noteUnreadableFrom(from)
       this.cb.onError?.(`dropped a message that could not be read: ${res.reason}`)
     }
     try {

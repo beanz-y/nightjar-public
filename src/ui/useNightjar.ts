@@ -6,10 +6,10 @@
 // down and clears the decrypted history from memory.
 
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { PRESENCE_HEARTBEAT_MS } from '../crypto/constants'
+import { MOVE_MAX_PAYLOAD_BYTES, PRESENCE_HEARTBEAT_MS } from '../crypto/constants'
 import { AppLockAuthError } from '../crypto/appLock'
 import type { Identity } from '../crypto/identity'
-import { NightjarClient, type StoredMessage } from '../net/client'
+import { MoveBlockedError, NightjarClient, type StoredMessage } from '../net/client'
 import type { DeliveryStatus } from '../storage/historyStore'
 import { CROSS_TAB_CHANNEL, type CrossTab, type CrossTabEvent, createCrossTab } from '../net/crossTab'
 import { getRelayOrigin } from '../platform'
@@ -26,20 +26,28 @@ import {
 } from '../platform/webpush'
 import { biometricAvailable, enrollBiometric, unlockBiometric } from '../platform/webauthn'
 import { openBackup, parseBackupHeader, sealBackup } from '../crypto/backup'
+import { type OpenedMove, encodeMovePayload, openMove, parseMoveHeader, sealMove } from '../crypto/move'
 import { bytesToHex } from '@noble/hashes/utils.js'
 import { newMsgId } from '../crypto/message'
 import { createBackupKdf } from '../platform/backupKdf'
 import { AppLockStore, type EnrollMethod } from '../storage/appLockStore'
 import { IdbKeyStore, type KeyStore } from '../storage/keystore'
 import { HistoryStore } from '../storage/historyStore'
-import { bootstrapIdentity } from '../storage/identityStore'
+import { IDENTITY_KEY, bootstrapIdentity } from '../storage/identityStore'
 import { IdbSessionStore } from '../storage/sessionStore'
 import { SessionSealer } from '../storage/sessionSeal'
 import { type Lock, createLock } from '../storage/lock'
 import { type Sentinel, createSentinel, requestPersistentStorage } from '../storage/persist'
 import { PREKEYS_KEY, PrekeyStore } from '../storage/prekeyStore'
 import { type BackupPayload } from '../crypto/backup'
-import { RESTORE_PENDING_KEY, clearPendingRestore, pendingRestore, stageRestoreEnrolled } from '../storage/restore'
+import {
+  MOVE_REFRESH_KEY,
+  RESTORE_PENDING_KEY,
+  clearPendingRestore,
+  pendingRestore,
+  stageMove,
+  stageRestoreEnrolled,
+} from '../storage/restore'
 import { type Contact, ContactStore } from '../trust/contactStore'
 import {
   type InviteArtifact,
@@ -197,6 +205,12 @@ export function useNightjar() {
   const mountedRef = useRef(true)
   const restoreFixupRef = useRef<Promise<void> | null>(null)
   const restorePayloadRef = useRef<BackupPayload | null>(null)
+  /** An opened MOVE file awaiting its staging step (Phase D). Mutually exclusive
+   *  with restorePayloadRef; whichever is set, the next enroll/unlock stages it. */
+  const movePayloadRef = useRef<OpenedMove | null>(null)
+  const drainingMoveRef = useRef(false)
+  const [moveProgress, setMoveProgress] = useState<{ done: number; total: number } | null>(null)
+  const [moveExported, setMoveExported] = useState(false)
   const pushKeyRef = useRef<string | null>(null)
   const teardownRef = useRef<(() => void) | null>(null)
   const lockNowRef = useRef<() => void>(() => {})
@@ -298,6 +312,53 @@ export function useNightjar() {
     return restoreFixupRef.current
   }, [])
 
+  // Drain the post-move session-refresh list (Phase D): one silent fresh-session
+  // ping per imported contact, so peers stop sending on the dead pre-move
+  // sessions (which this device would poison-drop while the relay reported them
+  // delivered). Runs only AFTER the post-move re-registration finished (fresh
+  // prekeys published, this user's stale fetcher vends cleared server-side).
+  // Durable progress: the list is rewritten after every peer, so a mid-drain
+  // crash resumes where it stopped. Permanent failures (peer unregistered, key
+  // conflict) drop the peer; transient ones keep the rest for the next connect.
+  const drainMoveRefresh = useCallback(async (client: NightjarClient, keys: KeyStore): Promise<void> => {
+    if (drainingMoveRef.current) return
+    drainingMoveRef.current = true
+    try {
+      const raw = await keys.get(MOVE_REFRESH_KEY)
+      if (!raw) return
+      if (await pendingRestore(keys)) return // reregister not done; retried next connect
+      let list: string[]
+      try {
+        const parsed = JSON.parse(new TextDecoder().decode(raw)) as unknown
+        if (!Array.isArray(parsed) || parsed.some((p) => typeof p !== 'string')) throw new Error('shape')
+        list = parsed as string[]
+      } catch {
+        await keys.delete(MOVE_REFRESH_KEY).catch(() => {})
+        return
+      }
+      while (list.length > 0) {
+        const peer = list[0]
+        try {
+          await client.sendSessionRefresh(peer)
+        } catch (e) {
+          const msg = String(e instanceof Error ? e.message : e)
+          const permanent =
+            (e instanceof Error && e.name === 'KeyConflictError') ||
+            msg.includes('not registered') ||
+            msg.includes('does not match')
+          if (!permanent) return // transient: keep the remainder for the next connect
+        }
+        list = list.slice(1)
+        if (list.length === 0) await keys.delete(MOVE_REFRESH_KEY)
+        else await keys.put(MOVE_REFRESH_KEY, new TextEncoder().encode(JSON.stringify(list)))
+      }
+    } catch {
+      /* best-effort: retried on the next connect */
+    } finally {
+      drainingMoveRef.current = false
+    }
+  }, [])
+
   // Tear down the live client + its foreground handlers (idle-lock / "lock now" /
   // unmount). Does NOT touch the app-lock key material.
   const teardownLive = useCallback(() => {
@@ -355,6 +416,14 @@ export function useNightjar() {
             markStatus(peer, id, status)
             broadcast({ kind: 'status', peer, id, status })
           },
+          onUnreadableFrom: (peer) => {
+            // A live contact's message was dropped as permanently unreadable: it
+            // was encrypted for a session that did not ride a move. Runtime
+            // honesty (Phase D): name them so the user can ask for a resend.
+            setNotice(
+              `a message from ${peer.slice(0, 12)}… arrived that this device cannot read (it was sent to your old device). Ask them to resend it.`,
+            )
+          },
           onContactsChanged: () => {
             // A mutual-invite joiner was auto-learned (or deferred trust work landed)
             // after the connect-time refresh already ran; re-read so it appears now.
@@ -371,6 +440,8 @@ export function useNightjar() {
                 .catch(() => {})
             }
             void completeRestoreIfPending(client, stores.keys)
+              .then(() => drainMoveRefresh(client, stores.keys))
+              .catch(() => {})
             setRegistered(client.isRegistered)
             void listContacts().catch(() => {})
             setPhase((prev) => (prev === 'error' ? (client.isRegistered ? 'ready' : 'onboarding') : prev))
@@ -415,7 +486,10 @@ export function useNightjar() {
       if (!mountedRef.current) return
       setConnected(true)
       setRegistered(authed.registered)
-      if (authed.registered) await completeRestoreIfPending(client, stores.keys)
+      if (authed.registered) {
+        await completeRestoreIfPending(client, stores.keys)
+        void drainMoveRefresh(client, stores.keys)
+      }
       if (!mountedRef.current) return
       await listContacts()
       setAliases(await client.listAliases())
@@ -470,7 +544,7 @@ export function useNightjar() {
       setError(String(e instanceof Error ? e.message : e))
       setPhase('error')
     }
-  }, [appendMessage, removeBubble, markFailed, broadcast, completeRestoreIfPending, refreshNotify])
+  }, [appendMessage, removeBubble, markFailed, broadcast, completeRestoreIfPending, drainMoveRefresh, refreshNotify])
 
   // Lock now: clear the LDK + decrypted history from RAM and tear down the socket.
   const lockNow = useCallback(() => {
@@ -546,6 +620,46 @@ export function useNightjar() {
 
   // --- app-lock actions ----------------------------------------------------
 
+  // Stage whichever opened file is pending (backup or move) now that the LDK is
+  // resident (just enrolled, or just unlocked). Returns true when it staged and
+  // reloaded; the caller must not continue to activate() in that case. The
+  // one-shot cross-tab stop tells any sibling tab with a live client to tear
+  // down FIRST: a single contact write from a still-live old tab after the
+  // contacts stage would sit sealed beside the staged world and brick startup.
+  const finishStagedRestore = useCallback(async (): Promise<boolean> => {
+    const stores = storesRef.current
+    if (!stores) return false
+    const move = movePayloadRef.current
+    const backup = restorePayloadRef.current
+    if (!move && !backup) return false
+    try {
+      const ch = new BroadcastChannel(CROSS_TAB_CHANNEL)
+      ch.postMessage({ kind: 'lockReset' })
+      ch.close()
+    } catch {
+      /* unsupported: single-tab is then the only case, which is safe */
+    }
+    const deps = {
+      keys: stores.keys,
+      sessions: stores.sessions,
+      contacts: stores.contacts,
+      sentinel: stores.sentinel,
+      lock: stores.lock,
+    }
+    if (move) {
+      setMoveProgress({ done: 0, total: move.payload.messages.length })
+      await stageMove(deps, stores.history, move.payload, (done, total) => {
+        if (mountedRef.current) setMoveProgress({ done, total })
+      })
+      movePayloadRef.current = null
+    } else if (backup) {
+      await stageRestoreEnrolled(deps, backup)
+      restorePayloadRef.current = null
+    }
+    globalThis.location.reload()
+    return true
+  }, [])
+
   // Enroll the mandatory app-lock (first run, or the final step of a restore).
   const enrollLock = useCallback(
     async (methods: EnrollMethod[]) => {
@@ -555,24 +669,16 @@ export function useNightjar() {
       try {
         await stores.appLock.enroll(methods)
         setLockMethods(await stores.appLock.methods())
-        const payload = restorePayloadRef.current
-        if (payload) {
-          // Restore path: the lock now exists, so stage the identity + encrypted
-          // contacts, then reload into the unlock screen.
-          await stageRestoreEnrolled(
-            { keys: stores.keys, sessions: stores.sessions, contacts: stores.contacts, sentinel: stores.sentinel, lock: stores.lock },
-            payload,
-          )
-          restorePayloadRef.current = null
-          globalThis.location.reload()
-          return
-        }
+        // Restore/move path: the lock now exists, so stage, then reload into
+        // the unlock screen.
+        if (await finishStagedRestore()) return
         await activate()
       } catch (e) {
+        setMoveProgress(null)
         setNotice(`could not set the app-lock: ${String(e instanceof Error ? e.message : e)}`)
       }
     },
-    [activate],
+    [activate, finishStagedRestore],
   )
 
   // Enroll a biometric alongside the knowledge factor (returns the enroll method).
@@ -626,14 +732,19 @@ export function useNightjar() {
       setNotice(null)
       try {
         await stores.appLock.unlockWithSecret(secret)
+        // A restore/move opened on an already-configured device finishes HERE:
+        // the unlock made the LDK resident, so stage and reload instead of
+        // activating (the shipped enroll-throw dead end, fixed).
+        if (await finishStagedRestore()) return true
         await activate()
         return true
       } catch (e) {
+        setMoveProgress(null)
         setNotice(e instanceof AppLockAuthError ? 'incorrect passphrase or PIN' : `could not unlock: ${String(e instanceof Error ? e.message : e)}`)
         return false
       }
     },
-    [activate],
+    [activate, finishStagedRestore],
   )
 
   const unlockWithBiometric = useCallback(async (): Promise<boolean> => {
@@ -645,13 +756,15 @@ export function useNightjar() {
       if (!credId) throw new Error('no biometric enrolled')
       const prf = await unlockBiometric(credId)
       await stores.appLock.unlockWithBiometric(prf)
+      if (await finishStagedRestore()) return true
       await activate()
       return true
     } catch (e) {
+      setMoveProgress(null)
       setNotice(`biometric unlock failed: ${String(e instanceof Error ? e.message : e)}`)
       return false
     }
-  }, [activate])
+  }, [activate, finishStagedRestore])
 
   // Forgot-secret escape: erase saved history + the lock, keep identity/contacts,
   // and return to enrollment.
@@ -676,6 +789,9 @@ export function useNightjar() {
       // connect re-register a fresh set, exactly as a restore does.
       await stores.keys.delete(PREKEYS_KEY)
       await stores.keys.put(RESTORE_PENDING_KEY, Uint8Array.from([1]))
+      // A pending move-refresh list would re-add (via first-contact recording)
+      // the very contacts this reset just wiped; it dies with them.
+      await stores.keys.delete(MOVE_REFRESH_KEY)
       await stores.appLock.reset()
       // Tell any sibling tab still holding the old key to stop. This tab is on the
       // lock screen with no channel open, so it posts through a one-shot one.
@@ -698,6 +814,8 @@ export function useNightjar() {
     setContacts([])
     setAliases({})
     restorePayloadRef.current = null
+    movePayloadRef.current = null
+    setMoveProgress(null)
     setRestorePending(false)
     setNotice('the app-lock was reset. Every conversation on this device ended: message each contact again to reopen one, and until you do they cannot reach you.')
     setPhase('enroll')
@@ -983,21 +1101,61 @@ export function useNightjar() {
     setRestoreBusy(true)
     setRestoreError(null)
     try {
+      // Size gate BEFORE reading the file into memory: the in-blob cap cannot
+      // protect against a mis-picked multi-gigabyte file if the whole thing is
+      // buffered first. Generous bound, shared by both formats.
+      if (file.size > MOVE_MAX_PAYLOAD_BYTES + 128) {
+        throw new Error('that file is far too large to be a Nightjar backup or move file')
+      }
       const blob = new Uint8Array(await file.arrayBuffer())
-      parseBackupHeader(blob)
-      const opened = await openBackup(blob, passphrase, { kdf: createBackupKdf() })
-      teardownLive()
-      idRef.current = opened.payload.identity
-      restorePayloadRef.current = opened.payload
+      // Route by MAGIC, never by file extension (pickers lie; names get edited).
+      const isMove = blob.length >= 4 && blob[0] === 0x4e && blob[1] === 0x4a && blob[2] === 0x4d && blob[3] === 0x56
+      if (isMove) {
+        parseMoveHeader(blob)
+        const opened = await openMove(blob, passphrase, { kdf: createBackupKdf() })
+        teardownLive()
+        idRef.current = opened.payload.identity
+        movePayloadRef.current = opened
+        restorePayloadRef.current = null
+      } else {
+        parseBackupHeader(blob)
+        const opened = await openBackup(blob, passphrase, { kdf: createBackupKdf() })
+        teardownLive()
+        idRef.current = opened.payload.identity
+        restorePayloadRef.current = opened.payload
+        movePayloadRef.current = null
+      }
       setRestorePending(true)
       setRestoreBusy(false)
-      setNotice('backup opened. Now set an app-lock for this device to finish restoring.')
-      setPhase('enroll')
+      // The lock decides how staging finishes (the shipped enroll-throw dead end,
+      // fixed): unconfigured enrolls; still-unlocked (onboarding: the mandatory
+      // enrollment already ran this session) stages immediately; locked (a crash
+      // retry, or an evicted device whose lock record survived) unlocks first.
+      const st = await stores.appLock.status()
+      if (st === 'unconfigured') {
+        setNotice(
+          isMove
+            ? 'move file opened. Now set an app-lock for this device to finish the move.'
+            : 'backup opened. Now set an app-lock for this device to finish restoring.',
+        )
+        setPhase('enroll')
+      } else if (st === 'unlocked') {
+        if (await finishStagedRestore()) return
+      } else {
+        setLockMethods(await stores.appLock.methods())
+        setNotice(
+          isMove
+            ? 'move file opened. Unlock this device to finish the move.'
+            : 'backup opened. Unlock this device to finish restoring.',
+        )
+        setPhase('locked')
+      }
     } catch (e) {
+      setMoveProgress(null)
       setRestoreError(e instanceof Error ? e.message : String(e))
       setRestoreBusy(false)
     }
-  }, [teardownLive])
+  }, [teardownLive, finishStagedRestore])
 
   const exportBackup = useCallback(async (passphrase: string): Promise<boolean> => {
     const live = liveRef.current
@@ -1016,6 +1174,115 @@ export function useNightjar() {
       return true
     } catch (e) {
       setNotice(`backup failed: ${String(e instanceof Error ? e.message : e)}`)
+      return false
+    }
+  }, [])
+
+  // Erase Nightjar from THIS device (Phase D old-device finish step). Offered
+  // only after a move file was exported this session (moveExported), behind a
+  // typed confirmation in the UI. Not a forensic wipe: it removes Nightjar's
+  // local data (identity, sealed stores, the eviction marker, push registration,
+  // the service worker) so the device boots factory-fresh, and disconnects so it
+  // stops draining mail meant for the new device. Nothing can revoke it remotely;
+  // this is the honest local half of that.
+  const eraseThisDevice = useCallback(async (): Promise<void> => {
+    const stores = storesRef.current
+    if (!stores) return
+    try {
+      const live = liveRef.current
+      const endpoint = await unsubscribePush().catch(() => null)
+      if (endpoint && live) live.client.unsubscribePush(endpoint)
+      teardownLive()
+      await stores.sessions.wipeAll().catch(() => {})
+      await stores.contacts.wipeLocalData().catch(() => {})
+      await stores.keys.delete(PREKEYS_KEY).catch(() => {})
+      await stores.keys.delete(RESTORE_PENDING_KEY).catch(() => {})
+      await stores.keys.delete(MOVE_REFRESH_KEY).catch(() => {})
+      await stores.keys.delete(IDENTITY_KEY).catch(() => {})
+      await stores.appLock.reset().catch(() => {})
+      await stores.sentinel.unmark().catch(() => {})
+      try {
+        const regs = await navigator.serviceWorker?.getRegistrations?.()
+        if (regs) for (const r of regs) await r.unregister().catch(() => {})
+      } catch {
+        /* best-effort */
+      }
+      globalThis.location.reload()
+    } catch (e) {
+      setNotice(`could not erase this device: ${String(e instanceof Error ? e.message : e)}`)
+    }
+  }, [teardownLive])
+
+  // --- move to a new device (Phase D, DESIGN 8.3) --------------------------
+
+  /** Gather + measure what a move file would carry, WITHOUT sealing anything:
+   *  the panel shows the counts and projected size (or the refusal and its
+   *  remedy) BEFORE the user commits to a slow KDF. */
+  const prepareMove = useCallback(async (): Promise<
+    | { ok: true; messages: number; contacts: number; unreadable: number; orphaned: number; bytes: number }
+    | { ok: false; blocked: 'outbox' | 'too-large'; count: number }
+    | null
+  > => {
+    const live = liveRef.current
+    if (!live) return null
+    try {
+      const data = await live.client.exportMoveData()
+      const bytes = encodeMovePayload(live.identity, data.contacts, data.aliases, data.dismissals, data.messages, Date.now()).length
+      return {
+        ok: true,
+        messages: data.messages.length,
+        contacts: data.contacts.length,
+        unreadable: data.unreadable,
+        orphaned: data.orphaned,
+        bytes,
+      }
+    } catch (e) {
+      if (e instanceof MoveBlockedError) return { ok: false, blocked: e.reason, count: e.count }
+      setNotice(`could not prepare the move: ${String(e instanceof Error ? e.message : e)}`)
+      return null
+    }
+  }, [])
+
+  /** Seal + download the move file under the (generated) passphrase. Re-gathers
+   *  fresh so the guards re-check at seal time; the preview is advisory only. */
+  const createMoveFile = useCallback(async (passphrase: string): Promise<boolean> => {
+    const live = liveRef.current
+    const stores = storesRef.current
+    if (!live || !stores) return false
+    try {
+      const data = await live.client.exportMoveData()
+      const blob = await sealMove(
+        { identity: live.identity, contacts: data.contacts, aliases: data.aliases, dismissals: data.dismissals, messages: data.messages },
+        passphrase,
+        { kdf: createBackupKdf() },
+      )
+      // The idle-lock may have fired during the KDF. The file is sealed under the
+      // passphrase (not the LDK), so nothing leaks either way, but a download must
+      // not pop over the lock screen.
+      if (!stores.appLock.isUnlocked) {
+        setNotice('the app locked while exporting; unlock and try again')
+        return false
+      }
+      const stamp = new Date().toISOString().slice(0, 10).replaceAll('-', '')
+      const url = URL.createObjectURL(new Blob([blob.buffer as ArrayBuffer], { type: 'application/octet-stream' }))
+      const a = document.createElement('a')
+      a.href = url
+      a.download = `nightjar-move-${stamp}-v1.njmv`
+      a.rel = 'noopener'
+      a.click()
+      setTimeout(() => URL.revokeObjectURL(url), 60_000)
+      setMoveExported(true)
+      return true
+    } catch (e) {
+      if (e instanceof MoveBlockedError) {
+        setNotice(
+          e.reason === 'outbox'
+            ? `${e.count} message(s) are still waiting to send. Stay connected until they show sent, then try again; a message still waiting when you move will never be sent by either device.`
+            : `this device holds more saved history than one move file can carry (${e.count} messages). Clear messages you no longer need (per conversation: Clear messages), then try again.`,
+        )
+      } else {
+        setNotice(`move export failed: ${String(e instanceof Error ? e.message : e)}`)
+      }
       return false
     }
   }, [])
@@ -1076,6 +1343,8 @@ export function useNightjar() {
     bioAvailable,
     restorePending,
     removedPeer,
+    moveProgress,
+    moveExported,
     actions: {
       enrollLock,
       makeBiometricMethod,
@@ -1085,6 +1354,9 @@ export function useNightjar() {
       resetLock,
       addBiometric,
       removeBiometric,
+      prepareMove,
+      createMove: createMoveFile,
+      eraseThisDevice,
       join,
       send,
       deleteMessage,

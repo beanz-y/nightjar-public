@@ -8,13 +8,18 @@ import type { Identity } from '../crypto/identity'
 import type { CanaryResult } from '../verify/canary'
 import { About } from './About'
 import { BackupPanel } from './BackupPanel'
+import { MovePanel } from './MovePanel'
 import { DownloadIcon, ShieldCheckIcon } from './icons'
 import { NotifySettings } from './NotifySettings'
 import { QrCode } from './QrCode'
 import { type TimeFormat, setTimeFormat, useTimeFormat } from './timePref'
 import type { NotifyState } from './useNightjar'
 
-type Mode = 'menu' | 'mycode' | 'backup' | 'about'
+type Mode = 'menu' | 'mycode' | 'backup' | 'move' | 'about'
+
+type Prepared =
+  | { ok: true; messages: number; contacts: number; unreadable: number; orphaned: number; bytes: number }
+  | { ok: false; blocked: 'outbox' | 'too-large'; count: number }
 
 interface Props {
   identity: Identity
@@ -23,7 +28,12 @@ interface Props {
   canary: CanaryResult | null
   bioAvailable: boolean
   lockMethods: Array<'pass' | 'pin' | 'bio'>
+  moveExported: boolean
+  moveProgress: { done: number; total: number } | null
   onExportBackup: (passphrase: string) => Promise<boolean>
+  onPrepareMove: () => Promise<Prepared | null>
+  onCreateMove: (passphrase: string) => Promise<boolean>
+  onEraseDevice: () => Promise<void>
   onEnableNotifications: () => void
   onDisableNotifications: () => void
   onAddBiometric: () => void
@@ -38,7 +48,12 @@ export function Settings({
   canary,
   bioAvailable,
   lockMethods,
+  moveExported,
+  moveProgress,
   onExportBackup,
+  onPrepareMove,
+  onCreateMove,
+  onEraseDevice,
   onEnableNotifications,
   onDisableNotifications,
   onAddBiometric,
@@ -64,6 +79,20 @@ export function Settings({
     return (
       <section className="sheet">
         <BackupPanel onExport={onExportBackup} storagePersisted={storagePersisted} onClose={() => setMode('menu')} />
+      </section>
+    )
+  }
+  if (mode === 'move') {
+    return (
+      <section className="sheet">
+        <MovePanel
+          onPrepare={onPrepareMove}
+          onCreate={onCreateMove}
+          onErase={onEraseDevice}
+          moveExported={moveExported}
+          moveProgress={moveProgress}
+          onClose={() => setMode('menu')}
+        />
       </section>
     )
   }
@@ -148,6 +177,16 @@ export function Settings({
         <span>
           <span className="tile-title">Back up identity</span>
           <span className="tile-sub muted small">Save your identity + contacts under a passphrase.</span>
+        </span>
+      </button>
+
+      <button className="tile" onClick={() => setMode('move')}>
+        <span className="tile-icon" aria-hidden="true">
+          <DownloadIcon />
+        </span>
+        <span>
+          <span className="tile-title">Move to a new device</span>
+          <span className="tile-sub muted small">Carry your messages and contacts to a new device, then erase this one.</span>
         </span>
       </button>
 

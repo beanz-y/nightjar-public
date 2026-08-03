@@ -30,6 +30,7 @@ export const MSG_MAGIC = utf8('NJM1') // 0x4e 0x4a 0x4d 0x31
 export const MSG_VERSION = 0x01
 export const MSG_KIND_TEXT = 0x01
 export const MSG_KIND_DELETE = 0x02
+export const MSG_KIND_REFRESH = 0x03
 const HEADER_LEN = 4 + 1 + 1 + 16 // magic + version + kind + msgId = 22
 const FLAG_EPHEMERAL = 0x01
 /** Defensive cap on a decoded body. The send path caps at 8000 chars and the
@@ -66,6 +67,18 @@ export function encodeTextMessage(id: Uint8Array, body: string, ephemeral: boole
 export function encodeDeleteMessage(id: Uint8Array): Uint8Array {
   if (id.length !== 16) throw new Error('message: msgId must be 16 bytes')
   return concatBytes(MSG_MAGIC, Uint8Array.from([MSG_VERSION, MSG_KIND_DELETE]), id)
+}
+
+/** Encode a session-refresh message (Phase D, DESIGN 8.3). Sent once to each
+ *  imported contact after a move so THEIR next send rides a live session instead
+ *  of the dead one their device still holds. Its entire value is the fresh X3DH
+ *  initial it rides in on; the payload itself means nothing. decodeMessage
+ *  deliberately does NOT learn this kind: every receiver, old build or new,
+ *  classifies it `malformed` and renders/persists NOTHING, which is exactly the
+ *  desired behavior, while the protocol layer still promotes the new session. */
+export function encodeRefreshMessage(id: Uint8Array): Uint8Array {
+  if (id.length !== 16) throw new Error('message: msgId must be 16 bytes')
+  return concatBytes(MSG_MAGIC, Uint8Array.from([MSG_VERSION, MSG_KIND_REFRESH]), id)
 }
 
 /** Total decoder, never throws. See the file header for the classification. */

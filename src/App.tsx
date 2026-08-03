@@ -36,6 +36,8 @@ export function App() {
     bioAvailable,
     restorePending,
     removedPeer,
+    moveExported,
+    moveProgress,
     actions,
   } = useNightjar()
   const canary = useCanary()
@@ -165,6 +167,8 @@ export function App() {
                 canary={canary}
                 bioAvailable={bioAvailable}
                 lockMethods={lockMethods}
+                moveExported={moveExported}
+                moveProgress={moveProgress}
                 actions={actions}
               />
             )}

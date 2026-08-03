@@ -53,7 +53,8 @@ export function BackupPanel({ onExport, storagePersisted, onClose }: Props) {
         <>
           <p className="muted small">
             The backup file holds your identity keys plus your contacts and their verification status, sealed under
-            this passphrase. It does NOT hold message history (history stays on the device it happened on). Keep the
+            this passphrase. It does NOT hold message history (to carry messages to a new device, use "Move to a new
+            device" in settings; this backup is the small file you keep long term). Keep the
             file anywhere; keep the passphrase written somewhere safe and separate. Whoever has both IS you, and if you
             lose either along with this device, nobody can recover the account. That is the design.
           </p>

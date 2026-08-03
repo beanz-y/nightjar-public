@@ -35,6 +35,8 @@ interface Props {
   canary: CanaryResult | null
   bioAvailable: boolean
   lockMethods: Array<'pass' | 'pin' | 'bio'>
+  moveExported: boolean
+  moveProgress: { done: number; total: number } | null
   actions: {
     send: (peer: string, text: string, ephemeral?: boolean) => void
     deleteMessage: (peer: string, id: string, failed?: boolean) => void
@@ -51,6 +53,13 @@ interface Props {
     enableNotifications: () => void
     disableNotifications: () => void
     exportBackup: (passphrase: string) => Promise<boolean>
+    prepareMove: () => Promise<
+      | { ok: true; messages: number; contacts: number; unreadable: number; orphaned: number; bytes: number }
+      | { ok: false; blocked: 'outbox' | 'too-large'; count: number }
+      | null
+    >
+    createMove: (passphrase: string) => Promise<boolean>
+    eraseThisDevice: () => Promise<void>
     addBiometric: () => void
     removeBiometric: () => void
   }
@@ -60,7 +69,7 @@ function shortId(id: string): string {
   return `${id.slice(0, 6)}…${id.slice(-4)}`
 }
 
-export function Messenger({ identity, connected, removedPeer, contacts, aliases, conversations, notify, storagePersisted, canary, bioAvailable, lockMethods, actions }: Props) {
+export function Messenger({ identity, connected, removedPeer, contacts, aliases, conversations, notify, storagePersisted, canary, bioAvailable, lockMethods, moveExported, moveProgress, actions }: Props) {
   const displayName = (peer: string): string => aliases[peer]?.trim() || shortId(peer)
   const [selected, setSelected] = useState<string | null>(null)
   const [chatView, setChatView] = useState<'chat' | 'verify'>('chat')
@@ -182,7 +191,12 @@ export function Messenger({ identity, connected, removedPeer, contacts, aliases,
           canary={canary}
           bioAvailable={bioAvailable}
           lockMethods={lockMethods}
+          moveExported={moveExported}
+          moveProgress={moveProgress}
           onExportBackup={actions.exportBackup}
+          onPrepareMove={actions.prepareMove}
+          onCreateMove={actions.createMove}
+          onEraseDevice={actions.eraseThisDevice}
           onEnableNotifications={actions.enableNotifications}
           onDisableNotifications={actions.disableNotifications}
           onAddBiometric={actions.addBiometric}

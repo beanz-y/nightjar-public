@@ -195,6 +195,11 @@ export interface SessionStore {
    *  is not possible (by design: the DB reveals no peer); a full scan is the only
    *  reader, which the app does once at unlock. */
   historyLoadAll(): Promise<HistoryRecord[]>
+  /** Batched import write (Phase D move). ONE transaction per call, durable on
+   *  commit: a put request can report success while the transaction still aborts
+   *  at commit time (quota/disk), and the move import's identity write would
+   *  convert that silent truncation into a committed, undetectable loss. */
+  historyPutMany(records: HistoryRecord[]): Promise<void>
   /** One record by its opaque storage key, or null. */
   historyGet(key: string): Promise<HistoryRecord | null>
   /** Overwrite one record in place, ONLY if it already exists (never resurrects a
@@ -379,6 +384,10 @@ export class MemorySessionStore implements SessionStore {
 
   async historyLoadAll(): Promise<HistoryRecord[]> {
     return [...this.history.values()].map(clone)
+  }
+
+  async historyPutMany(records: HistoryRecord[]): Promise<void> {
+    for (const r of records) this.history.set(r.key, clone(r))
   }
 
   async historyGet(key: string): Promise<HistoryRecord | null> {
@@ -841,6 +850,22 @@ export class IdbSessionStore implements SessionStore {
   async historyLoadAll(): Promise<HistoryRecord[]> {
     const rows = await this.tx<HistoryRecord[]>(HISTORY, 'readonly', (t) => t.objectStore(HISTORY).getAll())
     return rows ?? []
+  }
+
+  // See the interface note: resolves on transaction.oncomplete, NEVER per put,
+  // because a commit-time quota abort after per-put resolution would read as a
+  // completed batch. The caller sizes batches; this writes one durable chunk.
+  async historyPutMany(records: HistoryRecord[]): Promise<void> {
+    if (records.length === 0) return
+    const db = await this.open()
+    await new Promise<void>((resolve, reject) => {
+      const t = db.transaction(HISTORY, 'readwrite')
+      t.oncomplete = () => resolve()
+      t.onabort = () => reject(t.error ?? new Error('sessions: history import aborted'))
+      t.onerror = () => reject(t.error ?? new Error('sessions: history import failed'))
+      const store = t.objectStore(HISTORY)
+      for (const r of records) store.put(r, r.key)
+    })
   }
 
   async historyRemove(key: string): Promise<void> {

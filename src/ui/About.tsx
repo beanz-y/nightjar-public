@@ -106,7 +106,8 @@ export function About({ canary, onBack }: Props) {
           The strongest thing you can do is verify your contacts' safety numbers in person, though note even that check
           runs on code I serve. Also know: your messages' contents are private, but I can see who you talk to and when
           (not what you say). And keep a backup of your identity key, because if you lose your device without one, your
-          account and history are gone.
+          account is gone. Message history stays on each device; a move file you make deliberately can carry it to a new
+          device, but nothing saves it automatically.
         </p>
         <p>If your threat model includes being targeted by me, by anyone who can compel me, or by a state, use Signal.</p>
       </div>

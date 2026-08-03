@@ -1,30 +1,43 @@
-// Restore staging (P8, DESIGN 8.3). Turning an opened backup into this
-// device's identity is a multi-write operation with crash windows, so it is
-// ordered for fail-safety and gated by a durable one-shot flag:
+// Restore staging (P8, DESIGN 8.3) and move staging (Phase D). Turning an opened
+// backup or move file into this device's identity is a multi-write operation
+// with crash windows, so it is ordered for fail-safety around ONE invariant:
 //
-//   1. wipe session-layer state (old sessions/dedup/outbox/prekeys belong to a
-//      dead ratchet world and could never be used by the restored identity), AND
-//      the persistent history + its at-rest key (P10b): the prior identity's
-//      message history must never be readable by or confused with the restored
-//      one. sessions.wipeAll() clears the history ROWS (they live in the sessions
-//      DB); deleting the HMK record forces the restored identity to mint a fresh
-//      history key (the old rows are gone anyway);
+//   THE IDENTITY WRITE IS THE COMMIT POINT. Step 1 DELETES any identity already
+//   present, so "an identity exists" is true only after the final write. A crash
+//   anywhere before it leaves no identity + a marked sentinel, which boot routes
+//   to the restore screen, and the user simply re-runs the import; wipe-first +
+//   blind-overwrite writes make the re-run converge. Without the delete this
+//   invariant was FALSE on the onboarding path: a fresh device persists a real
+//   throwaway identity before onboarding ever renders, and a crash mid-stage
+//   would boot that identity with the restore's staged data and RESTORE_PENDING
+//   attributed to it (red-team finding, shipped-bug class).
+//
+// Order within a stage:
+//   1. delete IDENTITY (the invariant), wipe session-layer state (old
+//      sessions/dedup/outbox/prekeys belong to a dead ratchet world), and with
+//      it the persistent history rows (sessions.wipeAll clears them);
 //   2. set RESTORE_PENDING (BEFORE the identity: the flag must already be
 //      durable when a loadable identity first exists, so the forced fresh-
 //      prekey publish can never be skipped by a crash);
-//   3. write contacts, then the identity + sentinel;
-//   4. the caller reloads; after the next authenticated connect the flag is
+//   3. write contacts (and for a move: nicknames, deletion markers, the
+//      refresh-ping list, and every history row re-sealed under this device's
+//      lock, in bounded durable batches);
+//   4. write the identity + sentinel (the commit point);
+//   5. the caller reloads; after the next authenticated connect the flag is
 //      consumed by client.reregister() (fresh SPK + OPKs, server-side
-//      hard-invalidation of anything the Directory still serves) and cleared
-//      ONLY on success. If the network is down it survives and refires.
+//      hard-invalidation of the old bundle AND of this user's fetcher-side
+//      one-time-prekey vends) and cleared ONLY on success.
 //
-// The whole staging runs under the same cross-tab lock as identity bootstrap,
-// with a re-check so two tabs cannot interleave restores.
+// The whole staging runs under the same cross-tab lock as identity bootstrap.
+// (The lock serializes stagers; it does not re-check state in between, and does
+// not need to: each stage is wipe-first, so sequential double-staging converges.)
 
 import type { BackupPayload } from '../crypto/backup'
 import { serializeIdentity } from '../crypto/identity'
+import type { MovePayload } from '../crypto/move'
 import type { ContactStore } from '../trust/contactStore'
 import { HISTORY_LOCK_KEY } from './appLockStore'
+import type { HistoryMessage, HistoryStore } from './historyStore'
 import { IDENTITY_KEY } from './identityStore'
 import type { KeyStore } from './keystore'
 import type { Lock } from './lock'
@@ -33,7 +46,16 @@ import { PREKEYS_KEY } from './prekeyStore'
 import type { SessionStore } from './sessionStore'
 
 export const RESTORE_PENDING_KEY = 'restore.pending.v1'
+/** Peers owed a session-refresh ping after a move (JSON string[]), drained by the
+ *  client after the post-move re-registration succeeds. Durable so a crash
+ *  between the move and the first connect cannot lose the list. */
+export const MOVE_REFRESH_KEY = 'move.refresh.v1'
 const IDENTITY_LOCK = 'nightjar-identity'
+/** Rows per durable import transaction: large enough to amortize commit cost,
+ *  small enough that progress is visible and memory stays flat. */
+const MOVE_IMPORT_BATCH = 500
+
+const encoder = new TextEncoder()
 
 export interface RestoreDeps {
   keys: KeyStore
@@ -48,6 +70,7 @@ export interface RestoreDeps {
  *  set up a lock). The caller MUST reload afterwards. */
 export async function stageRestore(deps: RestoreDeps, payload: BackupPayload): Promise<void> {
   await deps.lock.withLock(IDENTITY_LOCK, async () => {
+    await deps.keys.delete(IDENTITY_KEY) // the commit-point invariant (see header)
     await deps.sessions.wipeAll() // also clears the history store (P10c)
     await deps.keys.delete(PREKEYS_KEY)
     // Delete the app-lock record so a restored device is genuinely UNCONFIGURED
@@ -62,16 +85,62 @@ export async function stageRestore(deps: RestoreDeps, payload: BackupPayload): P
   })
 }
 
-/** Stage an opened backup when the app-lock has ALREADY been enrolled in this
- *  session (P10c restore flow): the LDK is resident, so the contact import is
- *  encrypted at rest. Does NOT touch the lock record (the caller just created it).
- *  The caller MUST reload afterwards (into the unlock screen). */
+/** Stage an opened backup when the app-lock is ALREADY enrolled or unlocked in
+ *  this session (P10c restore flow): the LDK is resident, so the contact import
+ *  is encrypted at rest. Does NOT touch the lock record. The caller MUST reload
+ *  afterwards (into the unlock screen). */
 export async function stageRestoreEnrolled(deps: RestoreDeps, payload: BackupPayload): Promise<void> {
   await deps.lock.withLock(IDENTITY_LOCK, async () => {
+    await deps.keys.delete(IDENTITY_KEY) // the commit-point invariant (see header)
     await deps.sessions.wipeAll()
     await deps.keys.delete(PREKEYS_KEY)
     await deps.keys.put(RESTORE_PENDING_KEY, Uint8Array.from([1]))
-    await deps.contacts.replaceAllFromBackup(payload.contacts) // encrypted under the just-enrolled LDK
+    await deps.contacts.replaceAllFromBackup(payload.contacts) // encrypted under the resident LDK
+    await deps.keys.put(IDENTITY_KEY, serializeIdentity(payload.identity))
+    await deps.sentinel.mark()
+  })
+}
+
+/** Stage an opened MOVE file (Phase D): identity + contacts + nicknames +
+ *  deletion markers + every saved message, the latter re-sealed under THIS
+ *  device's resident LDK (the lock must already be enrolled or unlocked).
+ *
+ *  CONSUMES payload.messages destructively (batches are spliced off as they
+ *  commit) so a large import's parsed rows become collectible as they land
+ *  instead of all being pinned until the end. Any batch failure (quota, disk)
+ *  rejects BEFORE the identity write, so a partial import can never read as a
+ *  completed move; the caller surfaces the error and the user re-runs it.
+ *  The caller MUST reload afterwards (into the unlock screen). */
+export async function stageMove(
+  deps: RestoreDeps,
+  history: HistoryStore,
+  payload: MovePayload,
+  onProgress?: (done: number, total: number) => void,
+): Promise<void> {
+  await deps.lock.withLock(IDENTITY_LOCK, async () => {
+    await deps.keys.delete(IDENTITY_KEY) // the commit-point invariant (see header)
+    await deps.sessions.wipeAll()
+    await deps.keys.delete(PREKEYS_KEY)
+    await deps.keys.put(RESTORE_PENDING_KEY, Uint8Array.from([1]))
+    await deps.contacts.replaceAllForMove(payload.contacts, payload.aliases, payload.dismissals)
+    // The refresh-ping list: every imported contact EXCEPT dismissed peers (a
+    // deleted conversation must not be re-established by the move itself).
+    const refresh = payload.contacts.map((c) => c.peerId).filter((p) => !payload.dismissals[p])
+    await deps.keys.put(MOVE_REFRESH_KEY, encoder.encode(JSON.stringify(refresh)))
+    const total = payload.messages.length
+    let done = 0
+    while (payload.messages.length > 0) {
+      const batch = payload.messages.splice(0, MOVE_IMPORT_BATCH).map((m) => {
+        const msg: HistoryMessage = { id: m.id, peerId: m.peer, dir: m.dir, ts: m.ts, text: m.text }
+        if (m.status) msg.status = m.status
+        return history.seal(msg, m.failed)
+      })
+      await deps.sessions.historyPutMany(batch)
+      done += batch.length
+      onProgress?.(done, total)
+      // Yield so the progress line paints; the seal loop is otherwise sync CPU.
+      await new Promise((r) => setTimeout(r, 0))
+    }
     await deps.keys.put(IDENTITY_KEY, serializeIdentity(payload.identity))
     await deps.sentinel.mark()
   })

@@ -23,6 +23,9 @@ export async function requestPersistentStorage(): Promise<boolean> {
 export interface Sentinel {
   mark(): Promise<void>
   exists(): Promise<boolean>
+  /** Forget the marker (Phase D erase): an erased device must boot as factory
+   *  fresh (onboarding), not as "registered before, storage cleared" (evicted). */
+  unmark(): Promise<void>
 }
 
 const SENTINEL_CACHE = 'nightjar-sentinel'
@@ -54,6 +57,15 @@ export class CacheStorageSentinel implements Sentinel {
       return false
     }
   }
+
+  async unmark(): Promise<void> {
+    try {
+      await caches.delete(SENTINEL_CACHE)
+    } catch {
+      // Best-effort: a surviving marker only routes an erased device to the
+      // restore screen instead of onboarding, which is confusing but harmless.
+    }
+  }
 }
 
 export class MemorySentinel implements Sentinel {
@@ -63,6 +75,9 @@ export class MemorySentinel implements Sentinel {
   }
   async exists(): Promise<boolean> {
     return this.marked
+  }
+  async unmark(): Promise<void> {
+    this.marked = false
   }
 }
 

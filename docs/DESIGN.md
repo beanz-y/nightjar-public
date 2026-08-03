@@ -109,8 +109,10 @@ cryptographic code was written; the roadmap in section 12 tracks what has shippe
    locked (8.5), "delivered" already implies their app was open and running. The
    indicator we do ship reports on devices, not people (8.8).
 7. **Forward-secret synced history and cloud backup.** History is persisted on
-   your device (section 8.5) but is per-device: it is not synced, and the identity
-   backup (section 8.3) does not carry it, so it does not transfer to a new device.
+   your device (section 8.5) but is per-device: it is not synced, no copy lives
+   server-side, and the identity backup (section 8.3) does not carry it. A
+   deliberate one-time move file (8.3) can carry it to a new device; nothing keeps
+   two devices' histories aligned afterward.
 8. **Endpoint security.** A compromised device is outside the guarantees.
 9. **A trustless web client.** A PWA cannot prove to the user that the code it
    runs is honest (section 1.4). We do not pretend otherwise; we harden it,
@@ -130,6 +132,7 @@ cryptographic code was written; the roadmap in section 12 tracks what has shippe
 | Us, malicious or court-compelled | **Content: No, but only if the contact is verified AND the client code is honest.** For a TOFU contact we can substitute the directory identity key at setup and read content (6.1). Even for a verified contact, serving dishonest client code (1.4) defeats verification (6.1). | Yes (metadata) | Yes: silently drop, delay, reorder, suppress, or withhold bundles. Cannot forge a verified contact's content without shipping modified client code (1.4). |
 | Thief of our server / subpoena at rest | No stored plaintext; only undelivered ciphertext (30-day TTL, 7.1) and any opt-in server-stored identity backups, which reduce to passphrase strength (8.3) | Transient routing state only | n/a |
 | Global passive network adversary | No (content) | Yes (out of scope for any practical messenger) | n/a |
+| Someone who obtains your move file (8.3) | **With the passphrase: everything.** The file holds your identity and every saved message; opening it makes them you on a new device, with your history and verified status, and your contacts get no signal. **Without the passphrase:** opening reduces to the generated ~100-bit passphrase (offline attack infeasible at that entropy, Argon2id-bound). The realistic failure is custody, not cracking: the file sits in a Downloads folder that often syncs to a cloud account, and the passphrase gets photographed or pasted into a synced note beside it. The file also has an **integrity** direction: one you did NOT create can contain messages that were never sent (nothing binds a row to a ratchet), so importing a stranger's file is importing their identity and their fabrications. | No new server-side observation; the file never touches the relay. | n/a |
 | Thief of your unlocked device | Yes (it is your device) | Yes | n/a |
 | Thief / forensic image of your at-rest (locked or powered-off) device | **Message history, the contact list, the ratchet sessions, the send queue and the prekey privates are all encrypted at rest** behind the mandatory app-lock (section 8.5); reading any of it reduces to the unlock secret's strength (strong for a passphrase/biometric, **weak for a short PIN** against an offline brute-force of the image). BUT the **identity key stays unencrypted** (the app must route its own start-up before you unlock), so an image can still authenticate to the relay AS YOU: collect your undelivered mail, send messages your contacts' safety numbers accept as genuine, and read new first-contact conversations. | **Not from the local database, but yes by other means.** Nothing on disk names a peer any more (session rows are keyed by an opaque HMAC, 8.5). What remains is unattributable: message and session COUNTS, message lengths, and per-message arrival timestamps. The unsealed identity key, however, still lets an imager query the relay as you, so the social graph is reachable that way. See 8.5 for the full residue list. | n/a |
 
@@ -732,11 +735,56 @@ Implemented in P8, **download-only** in v1.
   rather than silently leaving the Directory serving dead prekeys. In-flight
   initial messages sent in the seconds before invalidation are unrecoverable, and
   we say so.
-- **History does not come back.** The backup carries the identity and contact
-  trust, not message history (8.5): history is per-device, and syncing ratchet
-  sessions would break forward secrecy. A restored device starts with an empty
-  history and a fresh at-rest history key. Encrypted history export/import is a v2
-  candidate.
+- **History does not ride the identity backup.** The identity backup carries the
+  identity and contact trust, not message history (8.5): a restored device starts
+  with empty history and a fresh at-rest history key. History moves to a new device
+  only through the deliberate move file below.
+- **Move to a new device (the move file).** A second, larger artifact (magic
+  `NJMV`) carries a device's whole standing to a new device: identity, contacts and
+  their verification, local nicknames, deletion markers, and the full saved message
+  history. Same envelope discipline as the identity backup (header-as-AAD, every
+  KDF parameter bounds-checked before the KDF runs), a distinct KDF info so a move
+  key can never be a backup key under a reused passphrase, and a **generated-only**
+  ~100-bit passphrase: the file holds every past plaintext and is typed once on the
+  new device, so a user-chosen weak secret is not offered. The history travels as a
+  self-bounding, self-versioning unit so a future multi-device link can reuse it.
+  Import re-registers exactly like a restore, then re-seals every message under the
+  new device's app-lock. Honest limits, disclosed in the UI and here:
+  - **A move is a copy, not a sync.** After export there are up to three copies (old
+    device, file, new device), and the two devices never reconcile afterward. The
+    file is a snapshot of one moment.
+  - **The window is not the minutes of the move.** For each contact it lasts until
+    you message them from the new device: until then their app keeps sending on the
+    session the old device held, the new device cannot decrypt it, and it is dropped
+    while their app shows delivered. This is the same both-sides-lie that 8.9 refuses
+    to create permanently; here it is bounded per contact by your first send, and
+    disclosed. Messages still waiting to send when you move are not in the file and
+    are never sent by either device; the export refuses while any send is queued.
+  - **Delivery marks cross as data and never update afterward** (a message that was
+    "sent" at export stays "sent" on the new device even if it was later delivered).
+  - **Deletion markers ride along, so a move preserves "deleted stays deleted"**
+    where an identity-backup restore cannot (8.9); carrying markers in a future
+    backup format is a candidate, and the identity backup format is unchanged here.
+  - **A delete-for-everyone** sent while a moved recipient's conversation is not yet
+    re-established is lost with the window; once re-established, deletes apply
+    normally, including to pre-move messages, because content ids move with history.
+  - **Nothing can disable the old device remotely.** The move invalidates its
+    published prekeys (new contacts cannot open sessions to it), but its existing
+    sessions keep working until it is erased. The app offers a local "erase Nightjar
+    from this device" step; it removes Nightjar's data from that browser and is not a
+    forensic wipe (8.5's no-secure-delete caveat applies).
+  - **A move file you did not create can contain fabricated history.** Nothing binds
+    an imported row to the ratchet that produced it, so importing someone else's file
+    both hands you their identity and shows you messages that were never sent; the UI
+    says to import only a file you exported yourself, and import is offered only to a
+    new or evicted device.
+  - **Custody, not cracking, is the realistic risk to the file.** With the file and
+    its passphrase, an attacker becomes you (history and verified status included)
+    with no signal to your contacts. The file lands in a Downloads folder that often
+    syncs to a cloud account, and the passphrase gets photographed or pasted into a
+    synced note beside it. Deleting both after use is required hygiene, not a
+    guarantee (cloud trash and versions can retain copies); the generated passphrase,
+    not the deletion, is what keeps a surviving copy sealed.
 
 ### 8.4 XSS is the real endpoint enemy
 
@@ -863,6 +911,13 @@ Honest posture, stated in the UI and here:
 - The delete is **content, doubly encrypted like any message**; the relay sees only
   another opaque envelope. It does not retroactively unsend: the ciphertext the peer
   already received cannot be recalled, only asked to be discarded.
+- **Across a move (8.3):** a delete sent while a moved recipient's conversation has
+  not yet re-established is lost with the move window, and is never re-sent on the new
+  session. Once re-established, deletes apply normally *including to pre-move messages*,
+  because content ids move with the history and the receiver recomputes the same
+  compound key under its own at-rest key. With no live session at all, the control
+  opens a fresh initiator session rather than assuming "no session means never
+  delivered" (which stopped being true once moved history could outlive its sessions).
 - **A delete never notifies the recipient.** The send frame carries a `silent` flag,
   so the relay stores and delivers the delete (in-band to a live device, drained on
   the next connect otherwise) but skips the content-free push nudge (P6): deleting a
@@ -1031,11 +1086,14 @@ What it can honestly claim, and what it cannot:
   a small, app-lock-sealed, 30-day list that the **relay-driven** paths consult and
   refuse. It gates nothing else: a message that actually arrives from that peer, or
   you adding them back yourself, records them normally and lifts it. The list is
-  discarded by the forgot-secret reset and never travels with a restored backup, so
-  both of those can re-learn invite joiners from the relay's record. A backup taken
-  BEFORE a delete still contains that contact and its verification, and restoring it
-  brings both back; a backup is a snapshot of a moment, not a record of what you
-  have since removed.
+  discarded by the forgot-secret reset and never travels with a restored *identity
+  backup*, so both of those can re-learn invite joiners from the relay's record. A
+  backup taken BEFORE a delete still contains that contact and its verification, and
+  restoring it brings both back; a backup is a snapshot of a moment, not a record of
+  what you have since removed. A **move file (8.3) is different**: deletion markers
+  ride along, so a move preserves "deleted stays deleted" where an identity-backup
+  restore cannot. Carrying markers in a future identity-backup format is a candidate;
+  the backup format is unchanged for now.
 - **Three row classes deliberately survive, and none of them names anybody.** Delete
   **tombstones** (8.6) are keyed by the same opaque HMAC as the row they replaced,
   and that row is destroyed in the same transaction, so a tombstone can never be
@@ -1442,12 +1500,13 @@ Native (Tauri) is **not** on the critical path; it is a demand-gated v2 (10.5).
 5. 1:1 only; no groups.
 6. Classical crypto; not yet post-quantum (but downgrade-protected, 4.4).
 7. History is persisted on the device (section 8.5) but per-device: it is not
-   synced, and the identity backup does not carry it, so it does not transfer to a
-   new device and is lost on device loss. It is **encrypted at rest behind the
-   mandatory app-lock** (as is the contact list), so its at-rest confidentiality is
-   the strength of the unlock secret (weak for a short PIN against a device image,
-   8.5). The identity + ratchet session keys are NOT under the lock, so a device
-   image can still decrypt future traffic (1.3).
+   synced, and the identity backup does not carry it, so it is lost on device loss
+   unless you first make a move file (8.3), which can carry it to a new device but
+   never keeps two devices aligned. It is **encrypted at rest behind the mandatory
+   app-lock** (as is the contact list), so its at-rest confidentiality is the
+   strength of the unlock secret (weak for a short PIN against a device image, 8.5).
+   The identity + ratchet session keys are NOT under the lock, so a device image can
+   still decrypt future traffic (1.3).
 8. Message-header metadata and message length are visible to the relay in v1;
    header encryption and padding deferred.
 9. OPK depletion can force new inbound sessions onto the weaker no-OPK path;
@@ -1507,7 +1566,9 @@ Native (Tauri) is **not** on the critical path; it is a demand-gated v2 (10.5).
 | Argon2id (backup) | m = 64 MiB, t = 3, p = 1 (measured ~2.3 s desktop via `@noble/hashes`; 256 MiB was ~9 s and risks OOM in an iOS Safari worker; RFC 9106 constrained-env recommendation); 16-B salt; XChaCha20-Poly1305 body with the header as AAD; key+nonce via HKDF-SHA256 info `"Nightjar_Backup_v1"`; restore bounds m to [8 MiB, 256 MiB], t <= 6, p == 1 before running the KDF | 8.3 |
 | Passphrase floor | typed passphrases >= 12 chars (after NFC-trim); the offered generated passphrase is 20 base32 chars (~100 bits) | 8.3 |
 | Backup blob format | magic `"NJBK"`, format version `0x01`, then m/t/p/salt header, then AEAD body; download-only in v1 | 8.3 |
-| Message payload format | magic `"NJM1"`, format version `0x01`, kind (`0x01` text / `0x02` delete), 16-B content msgId, then (text) a flags byte (bit0 = ephemeral, other bits reserved) + utf8 body; the ratchet plaintext. A payload with no magic is legacy plain text; a magic-but-invalid/unknown-version/unknown-kind payload is clean-ignored (never thrown or rendered) | 8.5 |
+| Move file format | magic `"NJMV"`, format version `0x01`, same m/t/p/salt header + AEAD body as the backup blob but key+nonce via HKDF info `"Nightjar_Move_v1"` (domain-separated from the backup); passphrase is generated-only (~100 bits) and canonicalized (NFC, lowercase, base32-alphabet only) before the KDF; payload cap 16 MiB (checked against file size before read, header before KDF, and before parse), <= 90000 messages, <= 1000 contacts, <= 200 deletion markers; refuse-over-cap, never truncate | 8.3 |
+| Portable history unit | `{ t: "njhist", hv: 1, messages: [...] }` embedded in the move payload; self-bounding (own row and total-text budgets, not the envelope's) and self-versioning so a future multi-device link reuses it without the passphrase envelope; per-row `kind` reserved | 8.3 |
+| Message payload format | magic `"NJM1"`, format version `0x01`, kind (`0x01` text / `0x02` delete / `0x03` session-refresh), 16-B content msgId, then (text) a flags byte (bit0 = ephemeral, other bits reserved) + utf8 body; the ratchet plaintext. A payload with no magic is legacy plain text; a magic-but-invalid/unknown-version/unknown-kind payload is clean-ignored (never thrown or rendered), which is exactly how kind `0x03` renders on every build: nothing, while the fresh session it rides still promotes | 8.5 |
 | Content vs transport id | the 16-B content msgId lives inside the ratchet plaintext (history key / delete target); the relay-visible transport envelope id is separate (dedup/ack/outbox). A first-send text may reuse its content id as the transport id (brand-new, safe); a delete gets its own fresh transport id | 8.5 |
 | Delete-for-everyone | `delete{targetContentId}` (kind `0x02`) sent on the current session with its OWN fresh transport id; receiver removes only the compound (this peer, dir=in, target id), records a **tombstone** (opaque history key, TTL = envelope TTL 30 d) so a target arriving after its delete is suppressed; removal + tombstone ride the same tx as the ratchet advance. A still-outboxed target is cancelled, not chased. Best-effort, honest-client-dependent; UI says "delete sent" | 8.6 |
 | Session-only (ephemeral) | NJM1 text with flags bit0 set; **never** sealed to history on either device (send-side seal skipped, receive-side persist gate fails closed). RAM-only, cleared on reload/lock. Delivered EXACTLY like any message (same outbox + ack + retransmit, so a session-establishing initial is reliable); it removes only the persistent history row and leaves no EXTRA at-rest trace (the unencrypted session state any message updates still keys on the peer + stamps the send time). Encrypted identically in transit; does not hide relay metadata or the push nudge; off-the-record courtesy, not a guarantee; delete-for-everyone hidden on ephemeral bubbles; rendered live in other open **unlocked** tabs via a same-origin render `BroadcastChannel` (render-only, never leaves the browser, closed while locked), so the remaining miss is only a tab closed/locked/reloaded at arrival | 8.7 |
