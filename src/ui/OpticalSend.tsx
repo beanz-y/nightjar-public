@@ -26,14 +26,25 @@ interface OpticalSendProps {
    *  roughly three of its pixels per module, so how big this is drawn is a
    *  direct input to whether the transfer can happen at all. */
   size?: number
-  /** Frames per second. Ten is a deliberate floor rather than a maximum: a camera
-   *  needs a whole frame to be on screen when its shutter opens, and pushing the
-   *  rate up past what the receiving device can decode simply means it catches a
-   *  smaller share of them. */
+  /**
+   * Codes shown per second. Deliberately SLOW.
+   *
+   * A camera needs a whole code to be on screen for the length of its exposure.
+   * At ten a second each code lasts 100ms, which is close enough to a typical
+   * exposure that a large share of captures span a change and decode as nothing,
+   * and a hand that drifts has no time to settle between them. Six gives each
+   * code 167ms, so more captures land cleanly and a camera being held rather than
+   * clamped has a real chance at every one.
+   *
+   * Going slower costs almost nothing. The fountain layer means a receiver takes
+   * whatever it catches in any order, so the rate sets how fast a PERFECT capture
+   * could finish, not how long the transfer actually takes, and a perfect capture
+   * was never the case worth optimizing.
+   */
   fps?: number
 }
 
-export function OpticalSend({ payload, transferId, size = 560, fps = 10 }: OpticalSendProps) {
+export function OpticalSend({ payload, transferId, size = 560, fps = 6 }: OpticalSendProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null)
   const [error, setError] = useState<string | null>(null)
   /** Frames drawn so far. The other device acknowledges nothing, ever, so this is
@@ -106,18 +117,21 @@ export function OpticalSend({ payload, transferId, size = 560, fps = 10 }: Optic
         <span className="optical-pulse" aria-hidden="true" /> sending, {shown} {shown === 1 ? 'code' : 'codes'} shown
       </p>
       <p className="tiny muted">
-        Fill the other device's camera view with this code. If it is not being read, move the devices closer together
-        or make this window larger.
+        Fill most of the other device's camera view with this code. If it is not being read, try moving the devices
+        apart rather than together: a laptop camera usually cannot focus on something held right up against it.
       </p>
     </div>
   )
 }
 
 /** Exported for the panel that decides whether a payload is worth sending this
- *  way at all: roughly how long it will take at `fps`, in seconds. */
-export function estimateSeconds(payloadBytes: number, fps = 10): number {
-  // Allow a little over one pass, since a camera never catches every frame.
-  return Math.ceil((frameCount(payloadBytes) * 1.3) / fps)
+ *  way at all: roughly how long it will take at `fps`, in seconds. Must default
+ *  to the same rate the component does, or the estimate quietly describes a
+ *  different transfer than the one on screen. */
+export function estimateSeconds(payloadBytes: number, fps = 6): number {
+  // Allow well over one pass: a hand-held camera misses a good share of codes,
+  // and promising the best case would make a normal transfer look broken.
+  return Math.ceil((frameCount(payloadBytes) * 2) / fps)
 }
 
 /** Bytes carried by one frame, re-exported so a caller can size a payload. */

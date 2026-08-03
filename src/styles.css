@@ -468,8 +468,12 @@ textarea.mono {
   display: block;
   background: #fff;
   border-radius: 0.4rem;
-  /* A quiet border only; anything drawn over the code itself risks the scan. */
-  padding: 0;
+  /* Real white margin around the drawn code, on top of the quiet zone inside it.
+     A decoder needs clear space around the finder patterns, and a camera aimed by
+     hand routinely clips the edge of the element; this gives that a few
+     millimetres of slack rather than making the whole capture fail. */
+  padding: 0.6rem;
+  box-sizing: border-box;
 }
 .optical-receive .scanner-video {
   width: 100%;

@@ -33,6 +33,26 @@ release tags cut by the deploy pipeline. Dates are the tag dates.
   shown. There is no acknowledgement of any kind from the other device, by design, so
   without that counter there was nothing to tell a transfer in progress from a page that
   had stopped.
+- **The scanner was doing so much work per look that it barely got to look.** It examined
+  every pixel of a full-resolution frame, which on a 1080p camera is two million of them
+  on the main thread, so it managed only a few attempts a second. That is fatal for
+  reading a code that CHANGES several times a second rather than a printed one that sits
+  still: it both looked rarely and was disproportionately likely to catch the moment a
+  code was being replaced, which reads as nothing at all. It now examines only the
+  centre square, which is the part the preview actually shows, at a capped size. It also
+  asks the browser's own decoder first and then still tries its own when that sees
+  nothing, since the two fail on different marginal frames.
+- **The codes are shown more slowly, and it no longer asks you to hold still.** Each code
+  now lasts about a sixth of a second rather than a tenth, so more of a hand-held
+  camera's exposures land on a whole one. Slowing down costs almost nothing, because
+  missed parts simply come round again, which is what the fountain coding is for. There
+  is also more white space around the code, so clipping its edge no longer ruins a read.
+- **It now says what to try when nothing is being read**, including the counterintuitive
+  part: move the devices FURTHER apart, not closer. Most laptop cameras have a fixed
+  focus set for a face at arm's length and cannot focus on something held right up to
+  them, so a code that fills the view can be too blurred to read while a smaller, sharper
+  one is fine. The diagnostic line now also reports how many times a second the scanner
+  is managing to look.
 
 ## [1.12.1] - 2026-08-03
 

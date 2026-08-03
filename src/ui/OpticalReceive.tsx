@@ -40,16 +40,26 @@ export function OpticalReceive({ onPayload, onCancel, title = 'Receiving' }: Opt
    *  module, so a camera that came up at 640x480 is the whole explanation for a
    *  transfer that never progresses, and the number belongs on screen. */
   const [resolution, setResolution] = useState<{ w: number; h: number } | null>(null)
+  /** Decode attempts per second. The other number that explains a failure: the
+   *  code changes several times a second, so a loop managing only two or three
+   *  looks at it will miss most of them however steadily it is aimed. */
+  const [scanRate, setScanRate] = useState(0)
 
   useEffect(() => {
     let stream: MediaStream | null = null
     let raf = 0
     let stopped = false
     const decoder = new FountainDecoder()
+    let attempts = 0
+    const rateTimer = setInterval(() => {
+      setScanRate(attempts)
+      attempts = 0
+    }, 1000)
 
     const stop = () => {
       stopped = true
       if (raf) cancelAnimationFrame(raf)
+      clearInterval(rateTimer)
       stream?.getTracks().forEach((t) => t.stop())
     }
 
@@ -102,6 +112,7 @@ export function OpticalReceive({ onPayload, onCancel, title = 'Receiving' }: Opt
         if (video.videoWidth) {
           setResolution((r) => (r?.w === video.videoWidth ? r : { w: video.videoWidth, h: video.videoHeight }))
         }
+        attempts += 1
         try {
           const text = await decodeQrFrame(video, canvas)
           if (text) setCodesSeen((n) => n + 1)
@@ -165,10 +176,10 @@ export function OpticalReceive({ onPayload, onCancel, title = 'Receiving' }: Opt
             {status === 'starting'
               ? 'Starting the camera...'
               : receiving
-                ? `Received ${progress.have} of ${progress.need} parts (${pct}%). Keep both devices still.`
+                ? `Received ${progress.have} of ${progress.need} parts (${pct}%). It does not have to be steady, just readable, and missed parts come round again.`
                 : codesSeen > 0
                   ? 'Reading a code, but it is not a device transfer. Check the other device is showing the moving code.'
-                  : 'Looking for the code. Fill this view with it, and hold both devices still.'}
+                  : 'Looking for the code. Fill most of this view with it.'}
           </p>
 
           {/* Three different things can be happening while nothing progresses, and
@@ -176,12 +187,22 @@ export function OpticalReceive({ onPayload, onCancel, title = 'Receiving' }: Opt
           <p className="tiny muted" role="status">
             {codesSeen > 0 ? `codes read: ${codesSeen}` : 'no code read yet'}
             {resolution ? ` · camera ${resolution.w}x${resolution.h}` : ''}
+            {scanRate > 0 ? ` · ${scanRate} looks/sec` : ''}
           </p>
+
+          {codesSeen === 0 && status === 'scanning' && (
+            <p className="tiny muted">
+              If nothing is being read, try moving the other device FURTHER AWAY rather than closer. Most laptop
+              cameras have a fixed focus set for a face at arm's length and cannot focus on something held right up to
+              them, so a code that fills the view can be too blurred to read while a smaller, sharper one is fine.
+              Failing that, tilt it slightly to kill the reflection of your own screen.
+            </p>
+          )}
 
           {lowRes && !receiving && (
             <p className="tiny muted">
-              This camera is running at a low resolution, which may not be enough to read the code. Move the devices
-              closer together, make the code larger on the other screen, or use a device with a better camera.
+              This camera is running at a low resolution, which may not be enough to read the code. Make the code
+              larger on the other screen, or use a device with a better camera.
             </p>
           )}
         </>
