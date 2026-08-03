@@ -1986,6 +1986,17 @@ export class NightjarClient {
    *  linking). Mirrors `register`, minus the invite: an account's roster already
    *  listing this device is what authorizes it. */
   async registerAsDevice(accountId: string): Promise<number> {
+    // A device that already has an account of its own must not join another.
+    // Linking deliberately does NOT wipe: it keeps this device's identity, its
+    // saved messages, its ratchet sessions and its send queue, because a link
+    // ADDS a device rather than replacing one. Run it on a device that was
+    // already somebody, and the result is one store holding two accounts: the old
+    // account's messages and live sessions filed under the new account's identity,
+    // with the old contact list replaced out from under them. Refuse at the
+    // protocol layer, not just by hiding the button.
+    if (this.isRegistered) {
+      throw new Error('this device already has an account of its own; erase it before joining another')
+    }
     return this.lock.withLock(REPLENISH_LOCK, async () => {
       const now = Date.now()
       const own = buildOwnBundle(this.identity, now, { spkId: 1, opkStartId: 1, opkCount: OPK_BATCH })

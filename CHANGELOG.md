@@ -9,6 +9,35 @@ or the commit page on the repository host). The format is loosely based on
 [Keep a Changelog](https://keepachangelog.com/); version headings correspond to the
 release tags cut by the deploy pipeline. Dates are the tag dates.
 
+## [1.12.1] - 2026-08-03
+
+### Fixed
+- **Starting a device over was effectively unreachable.** A device that already has its
+  own Nightjar account cannot join another one, so turning an existing device into a
+  second device of an account means erasing it first. That erase existed, but the only
+  way to it was to download a move file, so repurposing a device meant exporting a file
+  you did not want just to reach the button. It now also sits under Settings, Your
+  devices, behind the same typed confirmation, and says plainly what it costs: the
+  device stops being the account it is now, everyone holding that id can no longer
+  reach it, and nothing is recoverable afterwards.
+- **Joining an account from a device that already has one is now refused.** Linking
+  deliberately keeps what a device holds rather than replacing it, because adding a
+  device is not the same as moving to one. Doing it from a device that was already
+  somebody would leave a single device holding two accounts: the old account's saved
+  messages and live conversations filed under the new account's identity, with the old
+  contact list replaced out from under them. Nothing in the app offered this, but it is
+  now refused outright rather than merely unreachable.
+- **Erasing a device now stops its other open tabs first.** A second tab of the same
+  device kept running with the key still in memory, kept its connection open, and wrote
+  contacts and conversations straight back into what had just been erased. The device
+  then came back looking untouched, which read as it restoring a backup from nowhere.
+- **An erase that does not finish now says so.** Every step was previously allowed to
+  fail silently and the app reloaded regardless, so a device whose identity would not
+  delete came back as itself, reconnected, and pulled its contacts down again, with
+  nothing on screen to say the erase had not worked. A failure is now reported after the
+  reload, naming what could not be removed. A successful erase also clears this device's
+  saved preferences, which were being left behind.
+
 ## [1.12.0] - 2026-08-03
 
 ### Added

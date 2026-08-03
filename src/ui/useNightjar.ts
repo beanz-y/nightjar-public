@@ -69,6 +69,12 @@ export type LinkState = 'idle' | 'waiting' | 'joining' | 'done'
 /** Lock the app after this long hidden (idle). */
 const IDLE_LOCK_MS = 5 * 60 * 1000
 
+/** Left behind when erasing this device could not remove everything. It has to
+ *  outlive the reload that erasing ends with, which is why it is not React state:
+ *  the whole failure mode being reported is a device that comes back looking
+ *  erased while it still holds what would not delete. */
+const ERASE_INCOMPLETE_KEY = 'nightjar.eraseIncomplete'
+
 export interface NotifyState {
   supported: boolean
   permission: NotificationPermission
@@ -631,6 +637,20 @@ export function useNightjar() {
       } catch {
         /* cosmetic only */
       }
+    }
+
+    // An erase that did not finish, reported on the far side of the reload it
+    // ends with. Read and cleared here so it is said once, not on every start.
+    try {
+      const incomplete = localStorage.getItem(ERASE_INCOMPLETE_KEY)
+      if (incomplete) {
+        localStorage.removeItem(ERASE_INCOMPLETE_KEY)
+        setNotice(
+          `starting over on this device did not finish: ${incomplete} could not be removed, so some of what was here may still be. Try again from Settings, and if it keeps failing, clear this site's data in your browser settings.`,
+        )
+      }
+    } catch {
+      /* storage unavailable; nothing to report */
     }
 
     void (async () => {
@@ -1254,24 +1274,65 @@ export function useNightjar() {
   const eraseThisDevice = useCallback(async (): Promise<void> => {
     const stores = storesRef.current
     if (!stores) return
+    const failed: string[] = []
+    const step = async (what: string, run: () => Promise<unknown>) => {
+      try {
+        await run()
+      } catch {
+        failed.push(what)
+      }
+    }
     try {
       const live = liveRef.current
+      // Genuinely best-effort: a push registration left behind is a nuisance, not
+      // a reason to abandon an erase.
       const endpoint = await unsubscribePush().catch(() => null)
       if (endpoint && live) live.client.unsubscribePush(endpoint)
+      // Stop sibling tabs FIRST, before anything is destroyed. One still holding
+      // the Local Data Key keeps its socket open, keeps draining the relay, and
+      // writes contacts and sessions straight back into the stores wiped below,
+      // which is indistinguishable from the device restoring itself from nowhere.
+      // Delivery is asynchronous, so this narrows the window rather than closing
+      // it, exactly as the staged-restore path does for the same reason.
+      try {
+        const ch = new BroadcastChannel(CROSS_TAB_CHANNEL)
+        ch.postMessage({ kind: 'lockReset' })
+        ch.close()
+      } catch {
+        /* unsupported: single-tab is then the only case, which is safe */
+      }
       teardownLive()
-      await stores.sessions.wipeAll().catch(() => {})
-      await stores.contacts.wipeLocalData().catch(() => {})
-      await stores.keys.delete(PREKEYS_KEY).catch(() => {})
-      await stores.keys.delete(RESTORE_PENDING_KEY).catch(() => {})
-      await stores.keys.delete(IDENTITY_KEY).catch(() => {})
-      await clearAccountKey(stores.keys).catch(() => {})
-      await stores.appLock.reset().catch(() => {})
-      await stores.sentinel.unmark().catch(() => {})
+      await step('saved messages and sessions', () => stores.sessions.wipeAll())
+      await step('contacts', () => stores.contacts.wipeLocalData())
+      await step('prekeys', () => stores.keys.delete(PREKEYS_KEY))
+      await step('the restore flag', () => stores.keys.delete(RESTORE_PENDING_KEY))
+      await step('the identity', () => stores.keys.delete(IDENTITY_KEY))
+      await step('the account key', () => clearAccountKey(stores.keys))
+      await step('the app-lock', () => stores.appLock.reset())
+      await step('the storage marker', () => stores.sentinel.unmark())
       try {
         const regs = await navigator.serviceWorker?.getRegistrations?.()
         if (regs) for (const r of regs) await r.unregister().catch(() => {})
       } catch {
         /* best-effort */
+      }
+      try {
+        if (failed.length > 0) {
+          // A partial erase used to be indistinguishable from a complete one:
+          // every step swallowed its error and the reload happened regardless, so
+          // a device whose IDENTITY would not delete came back as itself,
+          // re-registered, and pulled its contacts down again, looking for all the
+          // world like it had restored a backup from nowhere. The reload still has
+          // to happen (the client is already torn down and the stores are in an
+          // unknown state), so the warning is left where a reload cannot clear it.
+          localStorage.setItem(ERASE_INCOMPLETE_KEY, failed.join(', '))
+        } else {
+          // Per-device preferences (notification opt-in, time format) are part of
+          // what this device is, so they go with the rest of it.
+          localStorage.clear()
+        }
+      } catch {
+        /* storage unavailable: the wipes above are what actually matter */
       }
       globalThis.location.reload()
     } catch (e) {
@@ -1371,6 +1432,18 @@ export function useNightjar() {
     if (!stores || !live) return
     linkStopRef.current?.()
     linkStopRef.current = null
+    // Refused here as well as inside the client, so the reason reaches the person
+    // rather than arriving as a raw error after a ceremony they just performed.
+    // Nothing in the UI can reach this today (the offer lives only on the setup
+    // screen), but "unreachable" is not the same as "refused".
+    if (live.client.isRegistered) {
+      setLinkState('idle')
+      linkSecretRef.current = null
+      setNotice(
+        'this device already has an account of its own, so it cannot join another. Start it over first (Settings, Your devices, start over on this device), which erases everything it holds.',
+      )
+      return
+    }
     setLinkState('joining')
     try {
       await stageLink(

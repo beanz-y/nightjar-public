@@ -30,6 +30,7 @@ interface Props {
   onAuthorize: (codeText: string) => Promise<{ deviceId: string; secret: Uint8Array } | null>
   onSeal: (secret: Uint8Array) => Promise<Uint8Array | null>
   onSendOverRelay: (deviceId: string, secret: Uint8Array) => Promise<boolean>
+  onErase: () => Promise<void>
   onClose: () => void
 }
 
@@ -37,10 +38,12 @@ function shortId(id: string): string {
   return `${id.slice(0, 8)}…${id.slice(-4)}`
 }
 
-export function DevicesPanel({ onList, onRemove, onAuthorize, onSeal, onSendOverRelay, onClose }: Props) {
+export function DevicesPanel({ onList, onRemove, onAuthorize, onSeal, onSendOverRelay, onErase, onClose }: Props) {
   const [devices, setDevices] = useState<DeviceRow[] | null>(null)
   const [linking, setLinking] = useState(false)
   const [confirming, setConfirming] = useState<string | null>(null)
+  const [startingOver, setStartingOver] = useState(false)
+  const [eraseConfirm, setEraseConfirm] = useState('')
 
   const refresh = useCallback(async () => {
     setDevices(await onList())
@@ -143,6 +146,57 @@ export function DevicesPanel({ onList, onRemove, onAuthorize, onSeal, onSendOver
         contact who verified you stays verified, and equally, a device of yours that someone else got hold of would
         still show them a matching safety number.
       </p>
+
+      {/* Adding a device THAT ALREADY HAS ITS OWN ACCOUNT is refused, because
+          linking keeps what a device holds rather than replacing it, so joining
+          would leave one store holding two accounts. The way through is to start
+          the device over, which needs to be reachable from here: it used to sit
+          behind downloading a move file, so repurposing a device meant exporting
+          a file you did not want just to reach the button. */}
+      <div className="field-label small muted">starting over</div>
+      {!startingOver ? (
+        <>
+          <button className="ghost small" onClick={() => setStartingOver(true)}>
+            start over on this device
+          </button>
+          <p className="muted tiny">
+            Use this on a device that already has its own Nightjar account and that you want to add to a different
+            one instead. It has to be done on the device being added, before you add it.
+          </p>
+        </>
+      ) : (
+        <>
+          <p className="small">
+            This removes Nightjar from this device: its identity, its contacts, and every saved message. This device
+            stops being the account it is now, and the people who have that id will no longer be able to reach it.
+            Nothing here is recoverable afterwards, and nothing is sent anywhere: if you want to keep what is on this
+            device, close this and use <em>Move to a new device</em> first. Type ERASE to confirm.
+          </p>
+          <input
+            className="mono"
+            value={eraseConfirm}
+            onChange={(e) => setEraseConfirm(e.target.value)}
+            autoCapitalize="characters"
+            autoCorrect="off"
+            spellCheck={false}
+            aria-label="type ERASE to confirm"
+          />
+          <div className="row">
+            <button className="danger" disabled={eraseConfirm !== 'ERASE'} onClick={() => void onErase()}>
+              erase this device
+            </button>
+            <button
+              className="link"
+              onClick={() => {
+                setStartingOver(false)
+                setEraseConfirm('')
+              }}
+            >
+              cancel
+            </button>
+          </div>
+        </>
+      )}
     </div>
   )
 }

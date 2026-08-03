@@ -116,6 +116,7 @@ export function Settings({
           onAuthorize={onAuthorizeDevice}
           onSeal={onSealLink}
           onSendOverRelay={onSendLinkOverRelay}
+          onErase={onEraseDevice}
           onClose={() => setMode('menu')}
         />
       </section>

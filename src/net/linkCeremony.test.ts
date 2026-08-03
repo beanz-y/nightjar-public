@@ -249,6 +249,39 @@ describe('the link ceremony', () => {
   })
 })
 
+describe('a device that already has an account of its own', () => {
+  it('refuses to join another, rather than merging two accounts into one store', async () => {
+    // Linking deliberately KEEPS what a device holds (it adds a device, it does
+    // not replace one), so joining from a device that was already somebody would
+    // leave one store holding two accounts: the old account's saved messages and
+    // live sessions filed under the new account's identity, with the old contact
+    // list replaced out from under them. Refused at the protocol layer, so it does
+    // not depend on the UI never offering it.
+    const fresh = await device()
+    const account = await device()
+    // Registered, exactly as the relay would report after this device joined or
+    // was invited on its own.
+    ;(fresh.client as unknown as { authed: unknown }).authed = { registered: true, opkCount: 10 }
+    expect(fresh.client.isRegistered).toBe(true)
+
+    await expect(fresh.client.registerAsDevice(account.client.account.accountId)).rejects.toThrow(
+      /already has an account of its own/,
+    )
+  })
+
+  it('still lets a device that has never registered join', async () => {
+    // The guard must not be a blanket refusal: this is the whole normal path.
+    const fresh = await device()
+    const account = await device()
+    expect(fresh.client.isRegistered).toBe(false)
+    // Fails later, at the directory call this harness does not stub, which is
+    // past the guard and is the point being asserted.
+    await expect(fresh.client.registerAsDevice(account.client.account.accountId)).rejects.not.toThrow(
+      /already has an account of its own/,
+    )
+  })
+})
+
 describe('handing the transfer over a screen instead of the relay', () => {
   it('seals it as ONE unit, and nothing goes near the wire', async () => {
     // The preferred path. The chunking the relay path does is a property of the
