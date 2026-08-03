@@ -279,3 +279,44 @@ export const PIN_MIN_DIGITS = 6
 /** Fixed WebAuthn PRF evaluation input, pinned so the derived PRF secret is
  *  stable for a credential across unlocks. */
 export const LOCK_PRF_INPUT = 'Nightjar-applock-prf-v1'
+
+// Post-loss message recovery: the retry-receipt (DESIGN 8.10). When a session is
+// gone on one side only (a move, a restore, an evicted database), the other side
+// keeps sending on a ratchet nobody can open. Those messages are poison-dropped
+// and ACKED, so the relay reports them delivered and both people believe they
+// arrived (8.9). A device that hits that case asks the sender to re-establish and
+// send its recent messages again.
+//
+// The two bounds below are INDEPENDENT and live on opposite sides on purpose. The
+// asking side's bound is politeness: it stops an honestly broken conversation from
+// storming a contact. It is worth nothing against a hostile requester, who simply
+// runs a client that ignores it. The bound that actually holds is the ANSWERING
+// side's, because it is enforced by the device whose messages are at stake.
+/** The asking side waits this long before asking the same contact again. */
+export const RETRY_REQUEST_MIN_INTERVAL_MS = 15 * 60 * 1000
+/** Consecutive unanswered asks before the asking side stops and says so. Recovery
+ *  needs exactly one round trip when it works at all, so a third attempt means
+ *  something is wrong that asking again will not fix. */
+export const RETRY_REQUEST_MAX_ATTEMPTS = 3
+/** An inbound envelope from a known contact that has failed to decrypt this many
+ *  times triggers the ask. Deliberately far below POISON_MAX_ATTEMPTS: the relay
+ *  drains a queue only when a socket connects, so a failed envelope is retried
+ *  once per app session and waiting for the poison drop would mean ten app opens
+ *  before recovery even started. Two leaves one free redelivery for the benign
+ *  case (a normal message that arrived ahead of its own initial and heals itself). */
+export const RETRY_REQUEST_AFTER_ATTEMPTS = 2
+/** The answering side honors at most one request per requester per window. */
+export const RETRY_HONOR_MIN_INTERVAL_MS = 15 * 60 * 1000
+/** Most messages one honored request can ever produce. */
+export const RETRY_RESEND_MAX_MESSAGES = 50
+/** How far back an honored request may reach, whichever bound binds first. This
+ *  is not only an amplification cap: a resend goes to a userId that IS
+ *  SHA-256(IK_sig), so it can only ever reach the identity that was already the
+ *  recipient, but that means whoever holds a stolen identity can pull this much of
+ *  every conversation without the real owner's device involved. The window is what
+ *  caps that, which is why it is deliberately shorter than the loss it repairs
+ *  (DESIGN 8.10, 1.3). */
+export const RETRY_RESEND_WINDOW_MS = 48 * 60 * 60 * 1000
+/** Bound on the per-peer recovery ledger, newest kept (mirrors MAX_DISMISSALS).
+ *  It is throttling state, never a security control. */
+export const MAX_RETRY_LEDGER = 200

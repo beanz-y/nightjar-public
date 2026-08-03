@@ -23,7 +23,7 @@
 // The safety-number rendering and the verify/invite UI are the React layer (still
 // to come); this module is the durable trust STATE and the binding checks.
 
-import { INVITE_TTL_MS } from '../crypto/constants'
+import { ENVELOPE_TTL_MS, INVITE_TTL_MS, MAX_RETRY_LEDGER } from '../crypto/constants'
 import { deriveUserId } from '../crypto/identity'
 import { openBlob, sealBlob } from '../crypto/appLock'
 import { b64decode, b64encode } from '../wire/codec'
@@ -63,6 +63,8 @@ const PENDING_KEY = 'contacts.pending.v1'
 const ALIASES_KEY = 'aliases.v1'
 /** Peers deleted on this device (see ContactStore.remove). Sealed like the others. */
 const DISMISSED_KEY = 'contacts.dismissed.v1'
+/** Per-peer retry-receipt throttling (8.10). Sealed like the others. */
+const RETRY_KEY = 'contacts.retry.v1'
 /** A dismissal expires with the relay-side invite record that motivates it, so the
  *  list cannot become a permanent record of everyone you ever deleted. */
 const DISMISSAL_TTL_MS = INVITE_TTL_MS
@@ -98,6 +100,22 @@ interface Dismissal {
   at: number
   auto: boolean
   hadSession: boolean
+}
+
+/** Per-peer throttling state for the retry-receipt (DESIGN 8.10). Both directions
+ *  share one record because they describe one conversation, and because the cap
+ *  below then bounds the whole feature rather than each half of it.
+ *   - `askedAt`/`attempts` bound what this device sends THEM: how recently we
+ *     asked them to resend, and how many asks have gone unanswered. Cleared as
+ *     soon as anything from them decrypts, which is the only honest evidence that
+ *     the conversation recovered.
+ *   - `honoredAt` bounds what this device does FOR them: when we last acted on a
+ *     request of theirs. This is the half that has to be durable, because it is
+ *     the only bound a hostile requester cannot simply choose to ignore. */
+interface RetryState {
+  askedAt?: number
+  attempts?: number
+  honoredAt?: number
 }
 
 /** Trust work that failed transiently and must not be lost (P8): an inviter pin
@@ -338,6 +356,14 @@ export class ContactStore {
       if (p.inviterPin === peerId) delete p.inviterPin
       p.records = p.records.filter((r) => r.peerId !== peerId)
     })
+    // The recovery ledger names them too, and 8.9 promises a delete leaves no row
+    // that does. Dropping `honoredAt` hands them at most one more honored request,
+    // which can only resend history this delete has already swept away.
+    await this.mutateRetryState(peerId, (r) => {
+      delete r.askedAt
+      delete r.honoredAt
+      delete r.attempts
+    })
   }
 
   /** Record the deletion marker without touching the contact map, so an interruption
@@ -385,6 +411,77 @@ export class ContactStore {
       }
       if (Object.keys(kept).length === 0) await this.store.delete(DISMISSED_KEY)
       else await this.putSealed(DISMISSED_KEY, DISMISSED_KEY, encoder.encode(JSON.stringify(kept)))
+    })
+  }
+
+  // --- retry-receipt throttling (8.10) ------------------------------------
+  //
+  // Sealed like every other blob here, because it is a per-peer list: read in
+  // cleartext it would say who this device recently could not hear from, and
+  // whose recovery it answered.
+
+  /** TTL-filtered read of the whole ledger. Entries older than the envelope TTL
+   *  are dropped on sight: past it the relay no longer holds the undelivered
+   *  messages that caused the entry, so it can throttle nothing that still exists.
+   *  PROPAGATES failures, for the same reason `loadDismissals` does. */
+  private async loadRetry(now: number): Promise<Record<string, RetryState>> {
+    const bytes = await this.getSealed(RETRY_KEY, RETRY_KEY)
+    if (!bytes) return {}
+    const m = JSON.parse(decoder.decode(bytes)) as Record<string, RetryState>
+    if (!m || typeof m !== 'object') return {}
+    const cutoff = now - ENVELOPE_TTL_MS
+    const out: Record<string, RetryState> = {}
+    for (const [peer, r] of Object.entries(m)) {
+      if (!r || typeof r !== 'object') continue
+      const askedAt = typeof r.askedAt === 'number' ? r.askedAt : undefined
+      const honoredAt = typeof r.honoredAt === 'number' ? r.honoredAt : undefined
+      if (Math.max(askedAt ?? 0, honoredAt ?? 0) <= cutoff) continue
+      out[peer] = {
+        ...(askedAt !== undefined ? { askedAt } : {}),
+        ...(honoredAt !== undefined ? { honoredAt } : {}),
+        ...(typeof r.attempts === 'number' ? { attempts: r.attempts } : {}),
+      }
+    }
+    return out
+  }
+
+  /** One peer's throttling state. Fail-OPEN: an unreadable ledger must not be able
+   *  to stop recovery, and the worst it can cost is one extra round trip that the
+   *  ANSWERING side bounds anyway. */
+  async getRetryState(peerId: string, now = Date.now()): Promise<RetryState> {
+    try {
+      return (await this.loadRetry(now))[peerId] ?? {}
+    } catch {
+      return {}
+    }
+  }
+
+  /** Read-modify-write one peer's throttling state under the contacts lock, so two
+   *  inbound envelopes racing each other cannot both decide they are the first ask. */
+  async mutateRetryState(peerId: string, fn: (r: RetryState) => void, now = Date.now()): Promise<void> {
+    await this.lock.withLock(CONTACTS_LOCK, async () => {
+      let readOk = true
+      let map: Record<string, RetryState> = {}
+      try {
+        map = await this.loadRetry(now)
+      } catch {
+        readOk = false
+      }
+      const r: RetryState = { ...(map[peerId] ?? {}) }
+      fn(r)
+      if (r.askedAt === undefined && r.honoredAt === undefined) delete map[peerId]
+      else map[peerId] = r
+      const rows = Object.entries(map)
+        .sort((a, b) => Math.max(b[1].askedAt ?? 0, b[1].honoredAt ?? 0) - Math.max(a[1].askedAt ?? 0, a[1].honoredAt ?? 0))
+        .slice(0, MAX_RETRY_LEDGER)
+      // Same asymmetry as the dismissal blob: writing over an unreadable ledger
+      // loses nothing, but deleting it on the strength of a failed read would throw
+      // away throttling state that is simply unreadable right now.
+      if (rows.length === 0) {
+        if (readOk) await this.store.delete(RETRY_KEY)
+      } else {
+        await this.putSealed(RETRY_KEY, RETRY_KEY, encoder.encode(JSON.stringify(Object.fromEntries(rows))))
+      }
     })
   }
 
@@ -459,6 +556,7 @@ export class ContactStore {
       await this.store.delete(PENDING_KEY)
       await this.store.delete(ALIASES_KEY)
       await this.store.delete(DISMISSED_KEY)
+      await this.store.delete(RETRY_KEY)
     })
   }
 
@@ -480,6 +578,10 @@ export class ContactStore {
       // Likewise the deleted-peer list: it belongs to the identity that made it,
       // and inheriting it would silently gate contacts for a different identity.
       await this.store.delete(DISMISSED_KEY)
+      // And the recovery ledger (8.10), which is about sessions this device no
+      // longer has: inheriting it would make the restored device believe it had
+      // already asked contacts to resend, in the exact situation that needs asking.
+      await this.store.delete(RETRY_KEY)
     })
   }
 
@@ -525,6 +627,9 @@ export class ContactStore {
       await this.write(map)
       // The prior identity's parked trust work never carries (fresh-device premise).
       await this.store.delete(PENDING_KEY)
+      // Nor its recovery ledger: a move is the single most likely reason the new
+      // device will need to ask everyone to resend (8.10), so it must start clean.
+      await this.store.delete(RETRY_KEY)
       if (Object.keys(aliases).length === 0) {
         await this.store.delete(ALIASES_KEY)
       } else {

@@ -419,9 +419,31 @@ export function useNightjar() {
           onUnreadableFrom: (peer) => {
             // A live contact's message was dropped as permanently unreadable: it
             // was encrypted for a session that did not ride a move. Runtime
-            // honesty (Phase D): name them so the user can ask for a resend.
+            // honesty (Phase D): name them, so a message the relay told them was
+            // delivered is not silently gone here.
             setNotice(
-              `a message from ${peer.slice(0, 12)}… arrived that this device cannot read (it was sent to your old device). Ask them to resend it.`,
+              `a message from ${peer.slice(0, 12)}… arrived that this device cannot read (it was sent to your old device) and has been given up on.`,
+            )
+          },
+          onRetryRequested: (peer) => {
+            // The automatic half of the same story (8.10): their device has been
+            // asked to re-establish and send its recent messages again.
+            setNotice(
+              `a message from ${peer.slice(0, 12)}… could not be read on this device, so their device has been asked to send its recent messages again.`,
+            )
+          },
+          onRetryExhausted: (peer) => {
+            setNotice(
+              `${peer.slice(0, 12)}… has been asked more than once to send messages this device cannot read, and nothing came back. Ask them to send it again themselves.`,
+            )
+          },
+          onRetryHonored: (peer, count) => {
+            // Never silent, by design: this is the only signal the user gets that
+            // someone holding this contact's identity pulled recent messages (8.10).
+            setNotice(
+              count > 0
+                ? `${peer.slice(0, 12)}… could not read some of your messages, so the last ${count} you sent them were sent again.`
+                : `${peer.slice(0, 12)}… asked for recent messages to be sent again; there were none saved to send.`,
             )
           },
           onContactsChanged: () => {

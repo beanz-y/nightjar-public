@@ -11,6 +11,33 @@ release tags cut by the deploy pipeline. Dates are the tag dates.
 
 ## [Unreleased]
 
+## [1.10.0] - 2026-08-03
+
+### Added
+- **Messages lost to a moved or restored device are now asked for again.** There was
+  one way Nightjar could lose a message and show it as delivered to the person who
+  sent it: when your device no longer held the conversation their device was still
+  using, everything they sent was unreadable here and quietly given up on, while the
+  relay told them it arrived. A device that cannot read a message now asks that
+  contact's device to re-establish and send its recent messages again, and their
+  device answers on its own. Nothing needs to be tapped, and a contact running an
+  older build simply ignores the request instead of breaking.
+- The honest parts, said plainly in the app and in DESIGN 8.10: the ask can only ever
+  mean "resend recent", never "resend that one message", because a device that could
+  not read something never learned what it was; at most 50 messages from the last 48
+  hours ever come back, so anything older stays lost; and your device tells you every
+  time it resends messages for someone, including who asked.
+- **What this changes if someone steals your identity** (a leaked backup and its
+  passphrase, or a move file that was not theirs), now written into the threat model
+  in DESIGN 1.3: as well as reading what you are sent next, they can ask each of your
+  contacts to resend, and those devices answer without yours involved. The 48-hour
+  window is the cap on that, and the notice on your contact's device is the only sign
+  it happened, which is why it is never silent.
+
+### Changed
+- After a move, the notice about a message that could not be read no longer tells you
+  to ask the person to resend it, because the app now does that itself.
+
 ## [1.9.0] - 2026-08-02
 
 ### Added

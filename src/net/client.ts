@@ -16,7 +16,14 @@
 import { bytesToHex, hexToBytes } from '@noble/hashes/utils.js'
 import { type Identity, deriveUserId } from '../crypto/identity'
 import type { PushSubscriptionInfo } from '../platform'
-import { decodeMessage, encodeDeleteMessage, encodeRefreshMessage, encodeTextMessage, newMsgId } from '../crypto/message'
+import {
+  decodeMessage,
+  encodeDeleteMessage,
+  encodeRefreshMessage,
+  encodeRetryRequest,
+  encodeTextMessage,
+  newMsgId,
+} from '../crypto/message'
 import type { HistoryUnitMessage } from '../crypto/historyUnit'
 import {
   MAX_DELIVERED_CHECK_IDS,
@@ -25,6 +32,12 @@ import {
   OPK_REPLENISH_THRESHOLD,
   OPK_VEND_TTL_MS,
   OUTBOX_RETRY_HORIZON_MS,
+  RETRY_HONOR_MIN_INTERVAL_MS,
+  RETRY_REQUEST_AFTER_ATTEMPTS,
+  RETRY_REQUEST_MAX_ATTEMPTS,
+  RETRY_REQUEST_MIN_INTERVAL_MS,
+  RETRY_RESEND_MAX_MESSAGES,
+  RETRY_RESEND_WINDOW_MS,
   SEEN_ID_TTL_MS,
   SPK_ROTATION_MS,
 } from '../crypto/constants'
@@ -49,7 +62,7 @@ import {
   encodeOneTimePrekey,
   encodePublishedBundle,
 } from '../wire/codec'
-import { processInbound } from './inbound'
+import { UndecryptableError, processInbound } from './inbound'
 import { DirectoryClient } from './directoryClient'
 import { type AuthedInfo, Transport } from './transport'
 
@@ -142,6 +155,17 @@ export interface ClientCallbacks {
    *  ever fired for a current, non-deleted contact: a deleted peer's dropped
    *  backlog stays anonymous on purpose (naming them would undo the delete). */
   onUnreadableFrom?: (peerId: string) => void
+  /** Optional (8.10): this device asked `peerId`'s device to re-establish and send
+   *  its recent messages again, because something they sent could not be read here. */
+  onRetryRequested?: (peerId: string) => void
+  /** Optional (8.10): the ask above has gone unanswered its full number of times.
+   *  Nothing further will be sent automatically; the UI tells the user to ask. */
+  onRetryExhausted?: (peerId: string) => void
+  /** Optional (8.10): this device honored a resend request from `peerId` and sent
+   *  `count` of its own recent messages again. NEVER silent: it is the only signal
+   *  the user gets that someone holding their contact's identity pulled recent
+   *  messages, so the UI must show it every time (DESIGN 8.10, 1.3). */
+  onRetryHonored?: (peerId: string, count: number) => void
   /** Optional: how far one of OUR sent messages got, by content id. Only ever
    *  moves forward (sent -> delivered), and both states are the relay's word, not
    *  a signed statement by the peer. A UI hint, never a security property. */
@@ -184,6 +208,21 @@ export class NightjarClient {
   /** Live contacts already named in an unreadable-message notice this connect
    *  (Phase D), so a redelivering backlog names each sender once, not per drop. */
   private readonly notedUnreadableFrom = new Set<string>()
+  /** Peers this device has asked to resend during THIS run (8.10). Two jobs, both
+   *  in RAM on purpose: it collapses a burst of undecryptable envelopes into one
+   *  ask without touching the sealed ledger per message, and it is the cheap test
+   *  for whether a newly decrypted message is worth clearing ask-state for. Losing
+   *  it on restart costs nothing that matters: the durable ledger still throttles,
+   *  and it ages out on its own. */
+  private readonly askedRetryFrom = new Set<string>()
+  /** Peers already told about this connect, once, that asking them has stopped
+   *  (mirrors `notedUnreadableFrom`, kept separate so the two notices cannot
+   *  suppress each other: they say different things and only one is actionable). */
+  private readonly notedRetryExhausted = new Set<string>()
+  /** Requesters whose resend is being assembled right now, so a redelivered
+   *  request cannot start a second concurrent burst before the first one has
+   *  written its throttle. */
+  private readonly honoringRetry = new Set<string>()
 
   constructor(
     private readonly identity: Identity,
@@ -264,6 +303,7 @@ export class NightjarClient {
   private async afterConnect(): Promise<void> {
     this.reconnectAttempt = 0
     this.notedUnreadableFrom.clear()
+    this.notedRetryExhausted.clear()
     this.cb.onConnection?.(true)
     await this.flushOutbox()
     // If we came back with a low server-side OPK stock (a run of inbound sessions
@@ -1249,6 +1289,243 @@ export class NightjarClient {
     }
   }
 
+  // --- the retry-receipt (DESIGN 8.10) --------------------------------------
+  //
+  // When one side loses its half of a session (a move, a restore, an evicted
+  // database), the other side keeps encrypting to a ratchet nobody can open. Those
+  // messages are poison-dropped and ACKED, so the relay reports them delivered and
+  // neither person learns anything is wrong (8.9). The device that cannot read them
+  // asks the sender to re-establish and send its recent messages again.
+  //
+  // The two bounds sit on opposite sides deliberately. This half is the polite one
+  // and protects nobody: a hostile requester runs whatever client it likes. The
+  // bound that holds is `honorRetryRequest` below, enforced by the device whose
+  // messages are at stake.
+
+  /** Ask `peer` to resend, if this device has not asked too recently or too often.
+   *  Best-effort throughout: recovery is a convenience and must never interfere
+   *  with handling the message that triggered it. */
+  private async maybeRequestRetry(peer: string): Promise<void> {
+    if (this.askedRetryFrom.has(peer)) return // one ask per run per peer; the ledger covers restarts
+    try {
+      // Same gate as the unreadable notice: only a contact we still hold, and not
+      // one the user deleted. A deleted peer's backlog must stay anonymous AND must
+      // not cause this device to reach out to them on its own initiative.
+      if ((await this.contacts.trustLevel(peer)) === null) return
+      if ((await this.contacts.dismissedAt(peer)) !== null) return
+
+      const now = Date.now()
+      let proceed = false
+      let exhausted = false
+      // Check and record in ONE hold of the contacts lock. Two undecryptable
+      // envelopes arriving together would otherwise both read "not asked yet".
+      // Recording BEFORE sending is deliberate: a burned attempt costs one delayed
+      // recovery, while a send that fails after a successful check could be retried
+      // by every redelivery in the queue.
+      await this.contacts.mutateRetryState(
+        peer,
+        (r) => {
+          const attempts = r.attempts ?? 0
+          if (attempts >= RETRY_REQUEST_MAX_ATTEMPTS) {
+            exhausted = true
+            return
+          }
+          if (r.askedAt !== undefined && now - r.askedAt < RETRY_REQUEST_MIN_INTERVAL_MS) return
+          r.askedAt = now
+          r.attempts = attempts + 1
+          proceed = true
+        },
+        now,
+      )
+      if (exhausted) {
+        // Say so once per run, then stop: a third unanswered ask means something is
+        // wrong that asking a fourth time will not fix.
+        if (!this.notedRetryExhausted.has(peer)) {
+          this.notedRetryExhausted.add(peer)
+          this.cb.onRetryExhausted?.(peer)
+        }
+        return
+      }
+      if (!proceed) return
+      this.askedRetryFrom.add(peer)
+      try {
+        await this.sendRetryRequest(peer)
+      } catch (e) {
+        // The ask never left this device (they are unregistered right now, or the
+        // directory is unreachable). Give the attempt back, because the exhausted
+        // notice tells the user we asked and got no answer, and saying that about
+        // a request that was never sent would be a lie. `askedAt` deliberately
+        // STAYS, so the next try still waits out the interval rather than
+        // retrying on every redelivery in the queue.
+        await this.contacts
+          .mutateRetryState(peer, (r) => {
+            r.attempts = Math.max(0, (r.attempts ?? 1) - 1)
+          })
+          .catch(() => {})
+        throw e
+      }
+      this.cb.onRetryRequested?.(peer)
+    } catch {
+      /* best-effort: the next redelivery tries again once the throttle allows */
+    }
+  }
+
+  /** Queue the request itself: a control carrying no target, on the current session
+   *  if one exists and otherwise on a fresh initiator session (which is the usual
+   *  case, since needing to ask generally means holding no session at all). Silent,
+   *  like every other control: nothing user-visible arrives at the other end. */
+  private async sendRetryRequest(peer: string): Promise<void> {
+    const plaintext = encodeRetryRequest(newMsgId())
+    const entry = await this.lock.withLock(sessionLock(peer), async () => {
+      const now = Date.now()
+      const book = await this.store.loadBook(peer)
+      const current = currentSession(book)
+      const transportId = bytesToHex(newMsgId())
+      if (!current) return this.openInitiatorEntry(peer, plaintext, transportId, { book, now, silent: true })
+      const { state, header, ciphertext } = ratchetEncrypt(deserializeRatchet(current.snapshot, now), plaintext)
+      const env: WireEnvelope = {
+        id: transportId,
+        kind: 'normal',
+        header: encodeMessageHeaderWire(header),
+        ciphertext: b64encode(ciphertext),
+      }
+      const advanced = updateSession(book!, current.id, serializeRatchet(state), now)
+      const e: OutboxEntry = { id: transportId, to: peer, env, createdAt: now, silent: true }
+      await this.store.saveBookWithOutbox(peer, advanced, e) // commit before release; no history row
+      return e
+    })
+    this.fire(entry)
+  }
+
+  /** Something from `peer` decrypted, so whatever this device was asking them to
+   *  repair is repaired. Clears the ask-state so a future break can ask again.
+   *  Gated on the in-RAM set so an ordinary inbound message costs no ledger write. */
+  private async clearRetryAsk(peer: string): Promise<void> {
+    if (!this.askedRetryFrom.delete(peer)) return
+    this.notedRetryExhausted.delete(peer)
+    await this.contacts
+      .mutateRetryState(peer, (r) => {
+        delete r.askedAt
+        delete r.attempts
+      })
+      .catch(() => {})
+  }
+
+  /**
+   * Act on a resend request from `peer`: send our own recent messages to them
+   * again. This is the half that has to hold, because the requester chooses what
+   * their client does and this device is the one whose messages are at stake.
+   *
+   * Three bounds, all enforced here:
+   *   - one honored request per requester per RETRY_HONOR_MIN_INTERVAL_MS,
+   *     recorded durably before anything is sent;
+   *   - at most RETRY_RESEND_MAX_MESSAGES messages, from at most the last
+   *     RETRY_RESEND_WINDOW_MS, whichever binds first;
+   *   - nothing at all for a peer this device does not hold as a contact.
+   *
+   * A resend can only ever reach the identity that was already the recipient: it
+   * goes to a userId that IS SHA-256(IK_sig), on a session authenticated to that
+   * key. What it does change is what a STOLEN identity is worth, which is why the
+   * window is short and why the user is always told this happened (8.10, 1.3).
+   */
+  private async honorRetryRequest(peer: string): Promise<void> {
+    if (!this.history) return
+    if (this.honoringRetry.has(peer)) return
+    this.honoringRetry.add(peer)
+    try {
+      if ((await this.contacts.trustLevel(peer)) === null) return
+      const now = Date.now()
+      let proceed = false
+      await this.contacts.mutateRetryState(
+        peer,
+        (r) => {
+          if (r.honoredAt !== undefined && now - r.honoredAt < RETRY_HONOR_MIN_INTERVAL_MS) return
+          r.honoredAt = now
+          proceed = true
+        },
+        now,
+      )
+      if (!proceed) return
+
+      const rows = await this.collectResendable(peer, now)
+      // Send oldest first so they arrive in the order they were originally written.
+      let sent = 0
+      for (const row of rows) {
+        try {
+          await this.queueResend(peer, row.id, row.text)
+          sent++
+        } catch {
+          break // the session or the store is unhappy; stop rather than thrash
+        }
+      }
+      // Reported even when nothing matched, because "someone asked" is the fact the
+      // user needs, and a silent no-op would hide exactly the case worth seeing.
+      this.cb.onRetryHonored?.(peer, sent)
+    } catch {
+      /* best-effort */
+    } finally {
+      this.honoringRetry.delete(peer)
+    }
+  }
+
+  /** The bounded set of our own recent messages to `peer`, oldest first. Ephemeral
+   *  messages are structurally absent (never persisted), deleted ones were removed
+   *  from history when they were deleted, and rows marked failed are skipped: the
+   *  sender has been told those never left, so quietly delivering them now would
+   *  make the two devices disagree about what was said. */
+  private async collectResendable(peer: string, now: number): Promise<Array<{ id: string; text: string; ts: number }>> {
+    const history = this.history
+    if (!history) return []
+    const cutoff = now - RETRY_RESEND_WINDOW_MS
+    const tombstoned = new Set(await this.store.tombstoneKeys())
+    const out: Array<{ id: string; text: string; ts: number }> = []
+    for (const row of await this.store.historyLoadAll()) {
+      if (row.failed || tombstoned.has(row.key)) continue
+      let m
+      try {
+        m = history.open(row)
+      } catch {
+        continue // unreadable row: nothing to resend from it
+      }
+      if (m.peerId !== peer || m.dir !== 'out' || m.ts < cutoff) continue
+      out.push({ id: m.id, text: m.text, ts: m.ts })
+    }
+    out.sort((a, b) => a.ts - b.ts)
+    return out.slice(-RETRY_RESEND_MAX_MESSAGES) // newest N, still oldest-first
+  }
+
+  /** Queue one message for redelivery under its ORIGINAL content id but a FRESH
+   *  transport id. The content id is what makes this idempotent: the receiver keys
+   *  history by it, so a copy they already hold upserts the same row instead of
+   *  appearing twice. The transport id must NOT be reused, or a receiver that did
+   *  once see the original would ack-and-drop this as a relay duplicate, which is
+   *  precisely the case worth repairing. No history row is written: this device
+   *  already has one, and re-sealing it would rewrite its timestamp. */
+  private async queueResend(peer: string, contentIdHex: string, text: string): Promise<void> {
+    const plaintext = encodeTextMessage(hexToBytes(contentIdHex), text, false)
+    const entry = await this.lock.withLock(sessionLock(peer), async () => {
+      const now = Date.now()
+      const book = await this.store.loadBook(peer)
+      const current = currentSession(book)
+      const transportId = bytesToHex(newMsgId())
+      // Silent: the requesting device is by definition awake and just asked, so a
+      // push per resent message would be a notification storm for no benefit.
+      if (!current) return this.openInitiatorEntry(peer, plaintext, transportId, { book, now, silent: true })
+      const { state, header, ciphertext } = ratchetEncrypt(deserializeRatchet(current.snapshot, now), plaintext)
+      const env: WireEnvelope = {
+        id: transportId,
+        kind: 'normal',
+        header: encodeMessageHeaderWire(header),
+        ciphertext: b64encode(ciphertext),
+      }
+      const advanced = updateSession(book!, current.id, serializeRatchet(state), now)
+      const e: OutboxEntry = { id: transportId, to: peer, env, createdAt: now, silent: true }
+      await this.store.saveBookWithOutbox(peer, advanced, e)
+      return e
+    })
+    this.fire(entry)
+  }
+
   private async handleDeliver(from: string, envJson: unknown): Promise<void> {
     let env: Envelope
     try {
@@ -1278,6 +1555,13 @@ export class NightjarClient {
           `an incoming message presented a key that conflicts with the one stored for ${from.slice(0, 12)}…; the message was refused. Verify safety numbers with this contact.`,
         )
       } else {
+        // A message that has now failed twice is not a reordering that will heal
+        // itself: ask them to re-establish and send it again (8.10). Deliberately
+        // far below the poison bound, because the relay redelivers only when a
+        // socket connects, so waiting for the drop would mean ten app sessions.
+        if (e instanceof UndecryptableError && e.attempts >= RETRY_REQUEST_AFTER_ATTEMPTS) {
+          void this.maybeRequestRetry(from)
+        }
         this.cb.onError?.(String(e instanceof Error ? e.message : e))
       }
       return
@@ -1286,12 +1570,14 @@ export class NightjarClient {
     // durably consumed. Deliver to the UI FIRST, then ack best-effort: a lost ack
     // only causes an idempotent redelivery (hasSeen -> duplicate). `duplicate` and
     // `dropped` are just acked (the latter stops a poison redelivery).
+    let retryRequested = false
     if (res.kind === 'delivered') {
       // Classify the plaintext for RENDERING (the persist decision already ran,
       // atomically, inside processInbound). decodeMessage is total; this runs
       // strictly after the commit, so a malformed/delete record only changes what
       // the UI shows, never protocol state. Route: text/legacy -> render; delete
-      // (P10d) -> apply a removal; malformed -> render nothing (forward-compat).
+      // (P10d) -> apply a removal; retry (8.10) -> answer it after the ack;
+      // malformed -> render nothing (forward-compat).
       const decoded = decodeMessage(res.plaintext)
       if (decoded.kind === 'text') {
         // A text whose delete-for-everyone already arrived was suppressed by the
@@ -1305,6 +1591,11 @@ export class NightjarClient {
         // Delete-for-everyone (P10d). The target row was removed + tombstoned
         // atomically inside processInbound; tell the UI to drop the bubble too.
         this.cb.onDelete?.(from, bytesToHex(decoded.id))
+      } else if (decoded.kind === 'retry') {
+        // A resend request (8.10). Nothing is rendered and nothing was persisted
+        // (planHistory classifies it as nothing to store); it is answered below,
+        // strictly after the ack.
+        retryRequested = true
       }
       // decoded.kind 'malformed': clean-ignored (forward-compat).
       if (res.consumedOpk) {
@@ -1321,6 +1612,10 @@ export class NightjarClient {
       // (the post-move case: their device still sends on a session that did not
       // ride the move), the honest notice is the NAMED one, once per connect.
       void this.noteUnreadableFrom(from)
+      // Normally the ask already went out many redeliveries ago; this covers the
+      // envelope that was already most of the way to the bound when this build
+      // arrived, and costs nothing when it has (the throttle declines it).
+      void this.maybeRequestRetry(from)
       this.cb.onError?.(`dropped a message that could not be read: ${res.reason}`)
     }
     try {
@@ -1329,8 +1624,15 @@ export class NightjarClient {
       // Socket gone; the relay redelivers and we re-ack on reconnect.
     }
     // After the ack, never before it: recovering a contact is a trust convenience
-    // and must not sit between a decrypted message and its acknowledgement.
-    if (res.kind === 'delivered') void this.recoverContact(from, now)
+    // and must not sit between a decrypted message and its acknowledgement. The
+    // same rule covers both halves of the retry-receipt, which are convenience too:
+    // answering someone's request, and noting that our own conversation with them
+    // is working again (anything from them decrypting is the evidence for that).
+    if (res.kind === 'delivered') {
+      void this.recoverContact(from, now)
+      void this.clearRetryAsk(from)
+      if (retryRequested) void this.honorRetryRequest(from)
+    }
   }
 
   /**

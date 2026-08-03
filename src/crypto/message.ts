@@ -6,10 +6,12 @@
 // Layout (binary):
 //   magic(4)   = "NJM1"
 //   version(1) = 0x01
-//   kind(1)    = 0x01 text | 0x02 delete
+//   kind(1)    = 0x01 text | 0x02 delete | 0x03 session-refresh | 0x04 retry-request
 //   msgId(16)  = the SHARED content id (history key / delete target)
 //   text only: flags(1, bit0 = ephemeral; other bits reserved, ignored), body(utf8)
 //   delete:    nothing further (msgId is the target)
+//   refresh:   nothing further (see encodeRefreshMessage; never decoded)
+//   retry:     nothing further (its msgId is only an id, it targets nothing)
 //
 // Two ids (red-team must-fix): this msgId is the CONTENT id and lives ONLY here,
 // inside the authenticated plaintext. It is NOT the transport/envelope id (which
@@ -31,6 +33,7 @@ export const MSG_VERSION = 0x01
 export const MSG_KIND_TEXT = 0x01
 export const MSG_KIND_DELETE = 0x02
 export const MSG_KIND_REFRESH = 0x03
+export const MSG_KIND_RETRY = 0x04
 const HEADER_LEN = 4 + 1 + 1 + 16 // magic + version + kind + msgId = 22
 const FLAG_EPHEMERAL = 0x01
 /** Defensive cap on a decoded body. The send path caps at 8000 chars and the
@@ -40,6 +43,7 @@ export const MSG_MAX_BODY_BYTES = 64 * 1024
 export type DecodedMessage =
   | { kind: 'text'; id: Uint8Array; body: string; ephemeral: boolean }
   | { kind: 'delete'; id: Uint8Array }
+  | { kind: 'retry'; id: Uint8Array }
   | { kind: 'legacy'; body: string }
   | { kind: 'malformed' }
 
@@ -81,6 +85,27 @@ export function encodeRefreshMessage(id: Uint8Array): Uint8Array {
   return concatBytes(MSG_MAGIC, Uint8Array.from([MSG_VERSION, MSG_KIND_REFRESH]), id)
 }
 
+/** Encode a retry-request (DESIGN 8.10): "I could not read something you sent me
+ *  recently; re-establish and send your recent messages again."
+ *
+ *  It deliberately names NOTHING. A device that could not decrypt never learned
+ *  the content ids inside those messages, only the relay's opaque transport ids,
+ *  so it is incapable of asking for a specific message. That is a structural rate
+ *  limit rather than a policy one: any number of unreadable messages collapses
+ *  into one session-level request, and no future version can widen it without
+ *  changing the wire format.
+ *
+ *  `id` is a fresh content id used only to give the record an identity; unlike a
+ *  delete, it targets nothing. Unlike the session-refresh above, this kind IS
+ *  taught to decodeMessage, because the receiver has to act on it. Older builds
+ *  (1.9.0 and before) classify it `malformed` and ignore it, so a request to a
+ *  contact who has not updated degrades to exactly the v1.9.0 behavior: nothing is
+ *  shown or stored, but the X3DH initial it rides still promotes a live session. */
+export function encodeRetryRequest(id: Uint8Array): Uint8Array {
+  if (id.length !== 16) throw new Error('message: msgId must be 16 bytes')
+  return concatBytes(MSG_MAGIC, Uint8Array.from([MSG_VERSION, MSG_KIND_RETRY]), id)
+}
+
 /** Total decoder, never throws. See the file header for the classification. */
 export function decodeMessage(bytes: Uint8Array): DecodedMessage {
   if (!hasMagic(bytes)) {
@@ -101,6 +126,10 @@ export function decodeMessage(bytes: Uint8Array): DecodedMessage {
   if (kind === MSG_KIND_DELETE) {
     if (bytes.length !== HEADER_LEN) return { kind: 'malformed' } // a delete is header-only
     return { kind: 'delete', id }
+  }
+  if (kind === MSG_KIND_RETRY) {
+    if (bytes.length !== HEADER_LEN) return { kind: 'malformed' } // a retry-request is header-only
+    return { kind: 'retry', id }
   }
   return { kind: 'malformed' } // unknown kind -> clean-ignore
 }

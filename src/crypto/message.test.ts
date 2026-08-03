@@ -5,6 +5,8 @@ import {
   MSG_MAGIC,
   decodeMessage,
   encodeDeleteMessage,
+  encodeRefreshMessage,
+  encodeRetryRequest,
   encodeTextMessage,
   newMsgId,
 } from './message'
@@ -28,6 +30,37 @@ describe('structured message payload (P10a)', () => {
     expect(d.kind).toBe('delete')
     if (d.kind !== 'delete') return
     expect(bytesToHex(d.id)).toBe(bytesToHex(ID))
+  })
+
+  it('round-trips a retry-request, which carries no target (8.10)', () => {
+    const d = decodeMessage(encodeRetryRequest(ID))
+    expect(d.kind).toBe('retry')
+    if (d.kind !== 'retry') return
+    // Its id identifies the record and addresses nothing: a device that could not
+    // decrypt never learned a content id, so it CANNOT ask for a specific message.
+    // That is the structural rate limit, and it lives in the wire format.
+    expect(bytesToHex(d.id)).toBe(bytesToHex(ID))
+    expect(encodeRetryRequest(ID)).toHaveLength(22)
+  })
+
+  it('a retry-request with anything appended is malformed, never a partial ask', () => {
+    expect(decodeMessage(new Uint8Array([...encodeRetryRequest(ID), 0x00])).kind).toBe('malformed')
+    expect(decodeMessage(encodeRetryRequest(ID).slice(0, 21)).kind).toBe('malformed')
+  })
+
+  it('the controls a 1.9.0 build cannot know read as malformed there, not as text', () => {
+    // Forward compatibility is what lets a control be added at all: an older build
+    // sees an unknown kind, renders and stores NOTHING, and still promotes the
+    // session the record rode in on. Simulated by decoding with the kind byte an
+    // older decoder would not recognise.
+    for (const kind of [0x03, 0x04, 0x7f]) {
+      const older = new Uint8Array([...MSG_MAGIC, 0x01, kind, ...ID])
+      const decoded = decodeMessage(older)
+      expect(decoded.kind === 'malformed' || decoded.kind === 'retry').toBe(true)
+    }
+    // The session-refresh kind is deliberately never taught to this decoder, so it
+    // is malformed HERE too (its whole value is the initial it rides on).
+    expect(decodeMessage(encodeRefreshMessage(ID)).kind).toBe('malformed')
   })
 
   it('treats a payload without the magic as legacy plain text', () => {

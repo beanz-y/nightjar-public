@@ -17,7 +17,7 @@ import { PrekeyStore } from '../storage/prekeyStore'
 import { MemorySessionStore } from '../storage/sessionStore'
 import { ContactStore } from '../trust/contactStore'
 import type { Envelope } from '../wire/codec'
-import { processInbound } from './inbound'
+import { UndecryptableError, processInbound } from './inbound'
 
 const NOW = 1_700_000_000_000
 const decode = (b: Uint8Array) => new TextDecoder().decode(b)
@@ -157,6 +157,24 @@ describe('processInbound', () => {
     }
     // Thrown (not acked) so a reordered message ahead of its initial is retried.
     await expect(processInbound(orphan, alice2.userId, deps())).rejects.toThrow(/no session/)
+  })
+
+  it('a failure carries its attempt count, which is what triggers the retry-receipt', async () => {
+    const from = generateIdentity().userId
+    const orphan: Envelope = {
+      id: 'counted',
+      kind: 'normal',
+      header: { version: 1, dhPub: new Uint8Array(32), pn: 0, n: 0 },
+      ciphertext: new Uint8Array(48),
+    }
+    // The count has to be visible well before the poison bound: the relay drains a
+    // queue only on connect, so waiting for the drop would be ten app sessions
+    // before recovery started (8.10).
+    for (const expected of [1, 2, 3]) {
+      const err = await processInbound(orphan, from, deps()).catch((e: unknown) => e)
+      expect(err).toBeInstanceOf(UndecryptableError)
+      expect((err as UndecryptableError).attempts).toBe(expected)
+    }
   })
 
   it('drops a never-decryptable message after the poison bound, then dedups it', async () => {

@@ -79,6 +79,23 @@ const lockName = (peerId: string) => `nightjar-session:${peerId}`
  *  than retried (a replayed initial). */
 class PermanentReject extends Error {}
 
+/** An envelope that did not decrypt, carrying how many times it has now failed.
+ *  The count is what the retry-receipt (DESIGN 8.10) triggers on: a queue is
+ *  drained only when a socket connects, so this is effectively "how many app
+ *  sessions has this message been failing for", and waiting for the poison bound
+ *  would mean ten of them before recovery began. Thrown (not returned) because
+ *  nothing changes for the caller: it still must not ack, and the envelope is
+ *  still retried on redelivery. */
+export class UndecryptableError extends Error {
+  constructor(
+    message: string,
+    readonly attempts: number,
+  ) {
+    super(message)
+    this.name = 'UndecryptableError'
+  }
+}
+
 /** A message DECRYPTED fine but could not be durably persisted (history seal or
  *  the atomic commit failed). It must be retried on redelivery, NOT counted
  *  toward the poison bound: poison-dropping a decryptable message would ack-and-
@@ -128,7 +145,7 @@ export async function processInbound(env: Envelope, from: string, deps: InboundD
       if (attempts >= POISON_MAX_ATTEMPTS) {
         return dropAndAck(store, env.id, from, e instanceof Error ? e.message : String(e))
       }
-      throw e
+      throw new UndecryptableError(e instanceof Error ? e.message : String(e), attempts)
     }
   })
 }
@@ -194,7 +211,10 @@ async function planHistory(
     // can only remove a message THEY sent us, never our own or another peer's.
     return { kind: 'delete', key: deps.history.storageKey(from, 'in', bytesToHex(decoded.id)) }
   }
-  return { kind: 'none' } // malformed -> clean-ignore
+  // A control that stores nothing (a retry-request, 8.10) or an unknown record from
+  // a future build: clean-ignored either way. The persist gate names what it saves,
+  // so a kind added later is never persisted by accident.
+  return { kind: 'none' }
 }
 
 async function handleInitial(env: Envelope, from: string, deps: InboundDeps): Promise<InboundResult> {

@@ -133,6 +133,7 @@ cryptographic code was written; the roadmap in section 12 tracks what has shippe
 | Thief of our server / subpoena at rest | No stored plaintext; only undelivered ciphertext (30-day TTL, 7.1) and any opt-in server-stored identity backups, which reduce to passphrase strength (8.3) | Transient routing state only | n/a |
 | Global passive network adversary | No (content) | Yes (out of scope for any practical messenger) | n/a |
 | Someone who obtains your move file (8.3) | **With the passphrase: everything.** The file holds your identity and every saved message; opening it makes them you on a new device, with your history and verified status, and your contacts get no signal. **Without the passphrase:** opening reduces to the generated ~100-bit passphrase (offline attack infeasible at that entropy, Argon2id-bound). The realistic failure is custody, not cracking: the file sits in a Downloads folder that often syncs to a cloud account, and the passphrase gets photographed or pasted into a synced note beside it. The file also has an **integrity** direction: one you did NOT create can contain messages that were never sent (nothing binds a row to a ratchet), so importing a stranger's file is importing their identity and their fabrications. | No new server-side observation; the file never touches the relay. | n/a |
+| Anyone who obtains your IDENTITY but not your history (a leaked identity backup and its passphrase, an imported move file) | **Your future messages, plus up to 50 of the last 48 hours from EACH contact.** The identity is what a session authenticates to, so they receive what is sent to you next. Since the retry-receipt (8.10) they can additionally ask each of your contacts to resend, and those devices answer automatically, without your device involved. The window and the per-message cap are the bound on this; each contact's device tells ITS user it resent messages and to whom, which is the only signal it happened. | Yes, as you (they hold the key the relay authenticates) | Yes: they can drain your undelivered mail |
 | Thief of your unlocked device | Yes (it is your device) | Yes | n/a |
 | Thief / forensic image of your at-rest (locked or powered-off) device | **Message history, the contact list, the ratchet sessions, the send queue and the prekey privates are all encrypted at rest** behind the mandatory app-lock (section 8.5); reading any of it reduces to the unlock secret's strength (strong for a passphrase/biometric, **weak for a short PIN** against an offline brute-force of the image). BUT the **identity key stays unencrypted** (the app must route its own start-up before you unlock), so an image can still authenticate to the relay AS YOU: collect your undelivered mail, send messages your contacts' safety numbers accept as genuine, and read new first-contact conversations. | **Not from the local database, but yes by other means.** Nothing on disk names a peer any more (session rows are keyed by an opaque HMAC, 8.5). What remains is unattributable: message and session COUNTS, message lengths, and per-message arrival timestamps. The unsealed identity key, however, still lets an imager query the relay as you, so the social graph is reachable that way. See 8.5 for the full residue list. | n/a |
 
@@ -758,8 +759,13 @@ Implemented in P8, **download-only** in v1.
     session the old device held, the new device cannot decrypt it, and it is dropped
     while their app shows delivered. This is the same both-sides-lie that 8.9 refuses
     to create permanently; here it is bounded per contact by your first send, and
-    disclosed. Messages still waiting to send when you move are not in the file and
-    are never sent by either device; the export refuses while any send is queued.
+    disclosed. **Partly repaired since:** the new device now asks each contact whose
+    message it could not read to send its recent messages again (8.10), recovering
+    up to 50 of them from the last 48 hours. Anything older than that window is
+    still lost, and the repair needs that contact to be running a build which
+    understands the request. Messages still waiting to send when you move are not in
+    the file and are never sent by either device; the export refuses while any send
+    is queued.
   - **Delivery marks cross as data and never update afterward** (a message that was
     "sent" at export stays "sent" on the new device even if it was later delivered).
   - **Deletion markers ride along, so a move preserves "deleted stays deleted"**
@@ -1112,6 +1118,85 @@ What it can honestly claim, and what it cannot:
   directory would serve again is one the peer already consumed. A peer deleted before
   any session existed consumed nothing, and is not pushed onto that degraded path.
 
+### 8.10 The retry-receipt (recovering what a lost session swallowed)
+
+There is one way Nightjar loses a message and tells both people it arrived. When
+one side stops holding a session the other side is still using (a move to a new
+device, a restore from an identity backup, an evicted database), that side keeps
+encrypting to a ratchet nobody can open. The receiver retries the envelope, gives
+up at the poison bound (5.3), and **acks** it so the relay stops redelivering
+forever. The relay, which cannot read any of this, then reports the message
+delivered. This is the "lies to both sides" property 8.9 refuses to create
+permanently, and 8.3 discloses as the per-contact window after a move.
+
+The session-refresh ping (8.3) closes the FORWARD direction: it makes each
+contact's next message ride a live session. The retry-receipt is what recovers the
+messages that were already lost before that landed.
+
+**The mechanism.** A device that cannot read a message from a known contact sends
+that contact a control (NJM1 kind `0x04`) meaning "I could not read something you
+sent me recently; re-establish and send your recent messages again". The contact's
+device re-sends a bounded window of its own saved sent messages. It rides a fresh
+X3DH initial when no session survives, which is the usual case, so the request
+also repairs the session on its way past.
+
+**The request cannot name a message, and that is structural.** A device that could
+not decrypt never learned the content ids inside those messages, only the relay's
+opaque transport ids, so the wire format gives it nothing to ask for but "recent".
+Any number of lost messages therefore collapses into one request by construction,
+not by policy, and no later version can widen it without changing the format.
+
+**Resends carry their ORIGINAL content id under a FRESH transport id.** The
+content id is what makes the repair idempotent: the receiver keys history by it, so
+a copy they already hold upserts the same row instead of appearing twice. The
+transport id must be new, or a receiver that once saw the original would ack-and-
+drop the repair as a relay duplicate, which is exactly the case being repaired.
+
+**Two bounds, deliberately on opposite sides.** The asking side waits 15 minutes
+between asks, stops after 3 unanswered ones, and only ever asks a contact it still
+holds and has not deleted. That bound is politeness and protects nobody: a hostile
+requester runs whatever client it likes. The bound that holds is the ANSWERING
+side's, enforced by the device whose messages are at stake: one honored request per
+requester per 15 minutes, recorded durably before anything is sent, and at most 50
+messages from at most the last 48 hours. Both sides' state lives in an app-lock-
+sealed per-peer ledger, because a plaintext one would list who this device could
+not hear from and whose recovery it answered.
+
+Honest limits, all of them disclosed in the app as they happen:
+
+- **A resend can only ever reach the identity that was already the recipient.** It
+  goes to a userId that IS `SHA-256(IK_sig)`, over a session authenticated to that
+  key, so this does not create a way to redirect anyone's messages.
+- **It does change what a stolen identity is worth, and this is the sharp edge.**
+  Before this, someone holding your identity (a leaked backup and its passphrase, a
+  move file that was not theirs, 1.3) could read your FUTURE messages. They can now
+  also pull up to 50 messages from the last 48 hours out of every one of your
+  contacts, silently, without touching your device. The window is the cap on that,
+  which is why it is deliberately shorter than the loss it repairs, and why the
+  answering device **always tells its user** it resent messages and to whom. That
+  notice is the only signal this happened, so it is never suppressed, not even when
+  nothing matched.
+- **The relay cannot enforce any of this.** It is content-blind, so a retry-request
+  is just another opaque envelope to it; the caps are a client-side property, like
+  delete-for-everyone (8.6) and ephemeral (8.7), with the relay's transport limits
+  as a coarse backstop only.
+- **A resend can bring back a message you had cleared locally.** Clearing a chat
+  (8.9) removes only your copy, and the other device is the one that keeps its own.
+- **Nothing is resent that this device does not still hold**: an ephemeral message
+  was never saved (8.7), a deleted-for-everyone one was destroyed with its target
+  (8.6), and a message marked failed is skipped on purpose, because its sender has
+  been told it never left and quietly delivering it now would make the two devices
+  disagree about what was said.
+- **Older builds ignore the request entirely.** A client that predates this reads
+  kind `0x04` as an unknown record, renders and stores nothing, and still promotes
+  the session the request rode in on, so asking a contact who has not updated
+  degrades to exactly the pre-existing behavior instead of failing.
+- **Answering costs a full history scan.** Deciding what to resend opens every
+  saved row, on the main thread, triggered by a remote peer. The per-requester
+  throttle bounds it, and it is the same cost the delivery catch-up (8.8) and the
+  boot hydration already pay, but it is a cost a contact can ask this device to
+  incur.
+
 ---
 
 ## 9. Metadata: the complete leak list and our honest posture
@@ -1136,6 +1221,12 @@ An operator who chooses to log, or anyone who can compel us, can learn:
   which tells the relay which of that sender's own recent envelope ids it is asking
   about, bounded per request (section 14).
 - **Presence** (persistent WebSocket).
+- **A recovery in progress** (8.10). A retry-request is a distinctively small
+  envelope, and honoring one produces a burst of same-sized-ish envelopes back to
+  the requester shortly after, all marked do-not-notify. The operator cannot read
+  any of it, but the shape says "these two devices just repaired a conversation",
+  which usually means one of them is new. It joins the do-not-notify signal already
+  disclosed for deletes (8.6).
 - **Message length** (no padding in v1; ciphertext length leaks plaintext length).
 - **Source IP** (unless VPN/Tor).
 - **Push (only if the user opts in, P6).** Opting a device into Web Push has two
@@ -1548,6 +1639,9 @@ Native (Tauri) is **not** on the critical path; it is a demand-gated v2 (10.5).
 | `MAX_SKIP` (compute + storage) | 1000 per session, checked before derivation | 5.3 |
 | `MAX_SESSIONS_PER_PEER` (session book) | 5 (1 current + <=4 archived); LRU-evict the non-current on overflow | 6.4, 8.3 |
 | `POISON_MAX_ATTEMPTS` (receive) | 10 failed decrypts before an undecryptable envelope is acked-and-dropped | 5.3 |
+| Retry-receipt: asking (politeness, not a control) | ask after `RETRY_REQUEST_AFTER_ATTEMPTS` = 2 failed decrypts (far below the poison bound, because a queue drains only on connect); at most one ask per contact per `RETRY_REQUEST_MIN_INTERVAL_MS` = 15 min; stop after `RETRY_REQUEST_MAX_ATTEMPTS` = 3 unanswered; known, non-deleted contacts only | 8.10 |
+| Retry-receipt: answering (**the bound that holds**) | one honored request per requester per `RETRY_HONOR_MIN_INTERVAL_MS` = 15 min, recorded durably BEFORE anything is sent; at most `RETRY_RESEND_MAX_MESSAGES` = 50 messages from at most `RETRY_RESEND_WINDOW_MS` = 48 h, whichever binds first. The window is also the cap on what a stolen identity can pull (1.3) | 8.10 |
+| Retry ledger | per-peer, app-lock-sealed, `MAX_RETRY_LEDGER` = 200 newest entries, aged out at the 30-day envelope TTL; never carried by a restore or a move | 8.10 |
 | Skipped-key expiry | 14 days (`SKIPPED_KEY_EXPIRY_MS`); each skipped key is timestamped on receipt and pruned past this. Chain: outbox retry (7d) < seen-id TTL (8d) < skip expiry (14d) | 5.3, 7.2 |
 | Outbox retry horizon | 7 days (`OUTBOX_RETRY_HORIZON_MS`); < skip expiry | 7.2 |
 | Undelivered envelope TTL | 30 days | 7.1 |
@@ -1568,7 +1662,7 @@ Native (Tauri) is **not** on the critical path; it is a demand-gated v2 (10.5).
 | Backup blob format | magic `"NJBK"`, format version `0x01`, then m/t/p/salt header, then AEAD body; download-only in v1 | 8.3 |
 | Move file format | magic `"NJMV"`, format version `0x01`, same m/t/p/salt header + AEAD body as the backup blob but key+nonce via HKDF info `"Nightjar_Move_v1"` (domain-separated from the backup); passphrase is generated-only (~100 bits) and canonicalized (NFC, lowercase, base32-alphabet only) before the KDF; payload cap 16 MiB (checked against file size before read, header before KDF, and before parse), <= 90000 messages, <= 1000 contacts, <= 200 deletion markers; refuse-over-cap, never truncate | 8.3 |
 | Portable history unit | `{ t: "njhist", hv: 1, messages: [...] }` embedded in the move payload; self-bounding (own row and total-text budgets, not the envelope's) and self-versioning so a future multi-device link reuses it without the passphrase envelope; per-row `kind` reserved | 8.3 |
-| Message payload format | magic `"NJM1"`, format version `0x01`, kind (`0x01` text / `0x02` delete / `0x03` session-refresh), 16-B content msgId, then (text) a flags byte (bit0 = ephemeral, other bits reserved) + utf8 body; the ratchet plaintext. A payload with no magic is legacy plain text; a magic-but-invalid/unknown-version/unknown-kind payload is clean-ignored (never thrown or rendered), which is exactly how kind `0x03` renders on every build: nothing, while the fresh session it rides still promotes | 8.5 |
+| Message payload format | magic `"NJM1"`, format version `0x01`, kind (`0x01` text / `0x02` delete / `0x03` session-refresh / `0x04` retry-request), 16-B content msgId, then (text) a flags byte (bit0 = ephemeral, other bits reserved) + utf8 body; the ratchet plaintext. A payload with no magic is legacy plain text; a magic-but-invalid/unknown-version/unknown-kind payload is clean-ignored (never thrown or rendered), which is exactly how kind `0x03` renders on every build: nothing, while the fresh session it rides still promotes. Kind `0x04` is the one control the receiver acts on, and reads as that same clean-ignored nothing on any build older than it (8.10). A `0x04` record carries no target, because a device that could not decrypt never learned a content id | 8.5, 8.10 |
 | Content vs transport id | the 16-B content msgId lives inside the ratchet plaintext (history key / delete target); the relay-visible transport envelope id is separate (dedup/ack/outbox). A first-send text may reuse its content id as the transport id (brand-new, safe); a delete gets its own fresh transport id | 8.5 |
 | Delete-for-everyone | `delete{targetContentId}` (kind `0x02`) sent on the current session with its OWN fresh transport id; receiver removes only the compound (this peer, dir=in, target id), records a **tombstone** (opaque history key, TTL = envelope TTL 30 d) so a target arriving after its delete is suppressed; removal + tombstone ride the same tx as the ratchet advance. A still-outboxed target is cancelled, not chased. Best-effort, honest-client-dependent; UI says "delete sent" | 8.6 |
 | Session-only (ephemeral) | NJM1 text with flags bit0 set; **never** sealed to history on either device (send-side seal skipped, receive-side persist gate fails closed). RAM-only, cleared on reload/lock. Delivered EXACTLY like any message (same outbox + ack + retransmit, so a session-establishing initial is reliable); it removes only the persistent history row and leaves no EXTRA at-rest trace (the unencrypted session state any message updates still keys on the peer + stamps the send time). Encrypted identically in transit; does not hide relay metadata or the push nudge; off-the-record courtesy, not a guarantee; delete-for-everyone hidden on ephemeral bubbles; rendered live in other open **unlocked** tabs via a same-origin render `BroadcastChannel` (render-only, never leaves the browser, closed while locked), so the remaining miss is only a tab closed/locked/reloaded at arrival | 8.7 |
