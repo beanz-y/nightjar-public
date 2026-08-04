@@ -42,6 +42,7 @@ import {
   LINK_SECRET_BYTES,
   MAX_DELIVERED_CHECK_IDS,
   MAX_DEVICES_PER_ACCOUNT,
+  MAX_PENDING_LINK_TRANSFERS,
   MOVE_MAX_MESSAGES,
   OPK_BATCH,
   OPK_REPLENISH_THRESHOLD,
@@ -252,6 +253,10 @@ export class NightjarClient {
    *  it on restart costs nothing that matters: the durable ledger still throttles,
    *  and it ages out on its own. */
   private readonly askedRetryFrom = new Set<string>()
+  /** Which DEVICE of each peer the outstanding ask was addressed to, so a
+   *  readable message from a different device of theirs does not read as proof
+   *  that the broken session was repaired. */
+  private readonly askedRetryDevice = new Map<string, string>()
   /** Peers already told about this connect, once, that asking them has stopped
    *  (mirrors `notedUnreadableFrom`, kept separate so the two notices cannot
    *  suppress each other: they say different things and only one is actionable). */
@@ -380,6 +385,13 @@ export class NightjarClient {
     if (this.authed?.registered) {
       void this.maybeRotateSpk().catch(() => {})
     }
+    // Learn our own devices before any of them can send us a copy. A freshly
+    // linked device has no cached list of its own, and the self-only gate on
+    // synced records is keyed on resolving a sibling to THIS account, so without
+    // this the first copies from our own other devices arrive unattributable and
+    // are dropped rather than saved. Cheap: one roster fetch per connect, and a
+    // no-op for the single-device accounts that never publish a list.
+    void this.resolveDevices(this.account.accountId).catch(() => {})
     // Age out expired deleted-peer markers on disk, not just on read (8.9).
     void this.contacts.pruneDismissals().catch(() => {})
     // Age out client-side dedup/failure rows (P8). Best-effort maintenance;
@@ -738,11 +750,6 @@ export class NightjarClient {
    */
   async sendText(to: string, text: string, msgId?: string, uiTs?: number, ephemeral = false): Promise<string> {
     const contentIdHex = msgId ?? bytesToHex(newMsgId())
-    // A linked device introduces itself before its first message on a session, so
-    // the receiver can file what follows under the right person rather than under
-    // a device id it has never seen. A no-op on a first device, which is every
-    // device until an account links a second one.
-    await this.maybeSendHello(to).catch(() => {})
 
     // One message becomes one envelope per device the recipient reads on (Sesame).
     // For a recipient with no roster this is exactly [to], so everything below
@@ -773,6 +780,11 @@ export class NightjarClient {
 
     for (const deviceId of devices) {
       try {
+        // Introduce this device to THIS device of theirs, before the first message
+        // on that session. It opens the session as its own opening message, so it
+        // cannot arrive after the message it exists to make attributable, and it
+        // is a no-op both on a first device and on a session that already exists.
+        await this.maybeSendHello(deviceId).catch(() => {})
         // The history row rides the FIRST device's commit, so "a saved message
         // implies at least one envelope was durably queued" stays true. A later
         // device failing leaves a partially sent message, which is honest: some of
@@ -1740,9 +1752,43 @@ export class NightjarClient {
   async accountForDevice(deviceId: string): Promise<string> {
     try {
       const known = await this.contacts.listKnownRosters()
-      for (const [accountId, roster] of Object.entries(known)) {
-        if (roster.devices.includes(deviceId)) return accountId
+      const naming = Object.entries(known)
+        .filter(([, roster]) => roster.devices.includes(deviceId))
+        .map(([accountId]) => accountId)
+
+      if (naming.length === 0) return deviceId // answer 3: it is its own account
+      // OUR OWN account needs no corroboration, and this is not a shortcut: that
+      // list was verified under our OWN account key, which means we signed it.
+      // Asking our own devices to separately vouch for a list we authored adds
+      // nothing, and refusing them until they do is worse than nothing: the
+      // self-only gate on synced records would reject copies from our own third
+      // device until it happened to introduce itself, which is how a freshly
+      // linked device starts life.
+      if (naming.includes(this.account.accountId)) return this.account.accountId
+      // The first-device exemption. An account's own first device has the account
+      // key as its device key, so the two ids are the same string and the answer
+      // is already correct. It also never introduces itself, having nothing to
+      // add, so requiring corroboration from it would un-attribute the primary
+      // device of every multi-device account.
+      if (naming.includes(deviceId)) return deviceId
+      // Two accounts naming one device is a CONFLICT, not a race. Taking the
+      // first was the whole defect: the map is insertion-ordered, so whoever
+      // named the device EARLIEST won permanently, which let a hostile contact
+      // capture somebody else's messages and, worse, silently switch off that
+      // person's own cross-device sync by making their devices resolve to a
+      // stranger. Neither claim is honored, and the user is told.
+      if (naming.length > 1) {
+        this.cb.onSecurity?.(
+          `two accounts (${naming[0].slice(0, 12)}…, ${naming[1].slice(0, 12)}…) both claim the same device. ` +
+            `Messages from it are not being filed under either of them. Only one can be right, and it is worth ` +
+            `asking both in person which.`,
+        )
+        return deviceId
       }
+      // One account names it. Attribute only if the DEVICE says the same thing:
+      // the list is the account's word, and this is the device's.
+      const claimed = await this.contacts.deviceClaim(deviceId)
+      if (claimed === naming[0]) return naming[0]
     } catch {
       /* an unreadable cache must not stop a message being filed somewhere sane */
     }
@@ -1765,30 +1811,70 @@ export class NightjarClient {
     if (accountId === fromDeviceId) return // a first device announcing itself: already true
     try {
       const devices = await this.resolveDevices(accountId)
-      if (devices.includes(fromDeviceId)) return // verified, and now cached
-      this.cb.onSecurity?.(
-        `a device claimed to belong to ${accountId.slice(0, 12)}…, but that account has not listed it. ` +
-          `Its messages are not being filed under them.`,
-      )
+      if (!devices.includes(fromDeviceId)) {
+        this.cb.onSecurity?.(
+          `a device claimed to belong to ${accountId.slice(0, 12)}…, but that account has not listed it. ` +
+            `Its messages are not being filed under them.`,
+        )
+        return
+      }
+      // BOTH halves now agree: the account's signed list names this device, and
+      // the device itself said which account it belongs to, over a session that
+      // runs on its own device key. Record the device's half; attribution needs
+      // it (see accountForDevice), and nothing else can produce it.
+      await this.contacts.recordDeviceClaim(fromDeviceId, accountId)
+      // Heal what arrived before the introduction did. Until the claim existed
+      // this device's messages were filed under its bare device id, which reads
+      // as a stranger sharing the conversation with the person they actually
+      // are. This is the moment the truth is known, so it is the moment to move
+      // them, using the same re-key a rotation uses.
+      await this.renameHistory(fromDeviceId, accountId).catch(() => 0)
     } catch {
       /* best-effort: an unverifiable claim is simply not acted on */
     }
   }
 
-  /** Announce this device to `peer` on a new session, if it is a device whose id
-   *  is not already its account id. A first device never needs to: its two ids are
-   *  the same, so a receiver reads it correctly with no help. */
-  private async maybeSendHello(peer: string): Promise<void> {
+  /** The single account whose cached device list names `deviceId`, or the device
+   *  id itself when none does or more than one does.
+   *
+   *  Deliberately weaker than `accountForDevice`: it asks only the ACCOUNT's half
+   *  of the question, with no corroboration from the device. That is enough to
+   *  decide who to ASK something of, and not enough to decide whose conversation
+   *  a message belongs in, which is why the two are separate functions rather
+   *  than one with a flag. */
+  private async accountNamingDevice(deviceId: string): Promise<string> {
+    try {
+      const known = await this.contacts.listKnownRosters()
+      const naming = Object.entries(known)
+        .filter(([, roster]) => roster.devices.includes(deviceId))
+        .map(([accountId]) => accountId)
+      if (naming.length === 1) return naming[0]
+    } catch {
+      /* fall through */
+    }
+    return deviceId
+  }
+
+  /** Announce this device to one DEVICE of a peer, on a new session, if this is a
+   *  device whose id is not already its account id. A first device never needs to:
+   *  its two ids are the same, so a receiver reads it correctly with no help.
+   *
+   *  Addressed per device, not per account, because that is where the sessions
+   *  are. Sending it only on the session with the peer's account id introduced
+   *  this device to their FIRST device and to nothing else, so on every other
+   *  device they read on, the same messages arrived from an id that had never
+   *  said who it belonged to and were filed as a stranger. */
+  private async maybeSendHello(peerDeviceId: string): Promise<void> {
     const me = this.account
     if (me.accountId === this.deviceId) return
     const plaintext = encodeHelloMessage(newMsgId(), me.accountId)
-    const entry = await this.lock.withLock(sessionLock(peer), async () => {
+    const entry = await this.lock.withLock(sessionLock(peerDeviceId), async () => {
       const now = Date.now()
-      const book = await this.store.loadBook(peer)
+      const book = await this.store.loadBook(peerDeviceId)
       if (currentSession(book)) return null // already introduced on this session
       // Sent as the session-OPENING message, not as a follow-up, so it cannot
       // arrive after the first real message and leave it unattributable.
-      return this.openInitiatorEntry(peer, plaintext, bytesToHex(newMsgId()), { book, now, silent: true })
+      return this.openInitiatorEntry(peerDeviceId, plaintext, bytesToHex(newMsgId()), { book, now, silent: true })
     })
     if (entry) this.fire(entry)
   }
@@ -2007,7 +2093,13 @@ export class NightjarClient {
       // A message this device was told to delete stays deleted. The sending
       // device may never have heard about that delete, and a transfer must not
       // become a way to undo one.
-      if (tombstoned.has(key)) {
+      //
+      // Checked against the snapshot AND against the store, because an import of
+      // any size yields to the event loop between batches, and a delete arriving
+      // during those seconds is precisely the delete most worth honoring: it is
+      // the one the user just performed. The snapshot alone would let it be
+      // undone by rows already parsed before it landed.
+      if (tombstoned.has(key) || (await this.store.hasTombstone(key).catch(() => false))) {
         skippedDeleted++
         continue
       }
@@ -2115,7 +2207,14 @@ export class NightjarClient {
     // rotation changes who the account IS, not what it reads on, which is why
     // every running session survives it untouched.
     onProgress?.('republishing your devices')
-    const current = await this.directory.fetchRoster(me.accountId).catch(() => null)
+    // Not caught either, same reason as authorizeDevice: this list gets signed,
+    // and a swallowed failure would sign away every device but this one at the
+    // exact moment the account is least able to notice. Verified before it is
+    // copied, for the same reason again: the successor is about to vouch for
+    // whatever is in it, and a rotation is the worst possible moment to have a
+    // relay-chosen device carried across into the new account.
+    const current = await this.directory.fetchRoster(me.accountId)
+    if (current) verifyRoster(current, me.accountKey.publicKey, Date.now())
     const devices: RosterDevice[] = current
       ? current.devices.map((d) => ({ deviceId: d.deviceId, dkSigPub: d.dkSigPub, addedAt: d.addedAt }))
       : [{ deviceId: this.deviceId, dkSigPub: this.identity.ikSig.publicKey, addedAt: Date.now() }]
@@ -2132,6 +2231,10 @@ export class NightjarClient {
     // self-only gate on synced copies then rejects our own devices' messages and
     // cross-device sync silently stops working.
     await this.contacts.forgetKnownRoster(me.accountId).catch(() => {})
+    // Our own devices corroborated the id we just retired. Same reasoning as a
+    // contact's rotation: without this our siblings stop being recognized as
+    // ours, and the self-only gate then rejects their synced copies.
+    await this.contacts.repointDeviceClaims(me.accountId, statement.newAccountId).catch(() => {})
 
     // Tell everyone. Contacts need it to keep talking to us; our OWN devices need
     // it because they hold the retired key and would otherwise go on signing and
@@ -2259,6 +2362,10 @@ export class NightjarClient {
     await this.contacts.setPendingRename(oldId, { newId, ikSig: newIkSig })
     const moved = await this.renameHistory(oldId, newId, onProgress)
     await this.contacts.renameAccount(oldId, newId, newIkSig)
+    // Their devices corroborated the id they had then. Carry that across, or
+    // every one of their devices stops being attributable to them the moment
+    // they rotate, and their conversation splits again one message later.
+    await this.contacts.repointDeviceClaims(oldId, newId).catch(() => {})
     // A message QUEUED across the rotation keeps the old conversation label. It
     // is deliberately left alone: the only writer for an outbox row is the
     // atomic save that commits a ratchet advance with it, and widening that API
@@ -2325,7 +2432,15 @@ export class NightjarClient {
     Array<{ deviceId: string; addedAt: number; isThisDevice: boolean; isFirstDevice: boolean }>
   > {
     const me = this.account
-    const roster = await this.directory.fetchRoster(me.accountId).catch(() => null)
+    // Deliberately NOT caught. This is the one screen a person is sent to after
+    // being told a device appeared on their account, so "I could not reach the
+    // relay" and "you have exactly one device, this one" must not look identical:
+    // the second is an all-clear, and rendering it for the first would answer the
+    // question they came to ask with a reassuring lie. A thrown error surfaces as
+    // an error. Compare resolveDevices, which keeps its last good answer instead,
+    // because failing to resolve there means failing to DELIVER; here it means
+    // failing to inform.
+    const roster = await this.directory.fetchRoster(me.accountId)
     if (!roster) {
       // No roster published means an account of exactly one device: this one, which
       // is therefore also the first.
@@ -2393,9 +2508,17 @@ export class NightjarClient {
   }
 
   /** A link chunk arrived. Buffer it, and open the transfer once it is complete.
-   *  Bounded on both axes: chunks are grouped by the transfer id inside their own
-   *  authenticated header, and a transfer that never completes simply never
-   *  fires. Nothing is persisted, so an abandoned link leaves nothing behind. */
+   *
+   *  Nothing is persisted, so an abandoned link leaves nothing behind. What is
+   *  bounded, and had to be: the relay will carry a chunk from any registered
+   *  caller to any device id, and the id of a device being linked is public the
+   *  moment its account lists it, which happens BEFORE the transfer. So a third
+   *  party can push chunks at a phone sitting on the link screen. Each chunk is
+   *  size-bounded by its own header, but the number of distinct transfer ids was
+   *  not, so the buffer could grow without limit while the comment here claimed
+   *  otherwise. It now keeps only a small number of in-flight transfers, evicting
+   *  the oldest, which costs an honest link nothing: it sends one transfer, and
+   *  a real one that gets evicted is retried by showing a fresh code. */
   private handleLinkChunk(chunkB64: string): void {
     const pending = this.linkAwait
     if (!pending) return // not linking: a stray chunk is nothing to us
@@ -2406,6 +2529,13 @@ export class NightjarClient {
       header = readLinkChunkHeader(chunk)
     } catch {
       return // not one of ours, or malformed: ignore rather than surface noise
+    }
+    if (!pending.chunks.has(header.transferId)) {
+      while (pending.chunks.size >= MAX_PENDING_LINK_TRANSFERS) {
+        const oldest = pending.chunks.keys().next()
+        if (oldest.done) break
+        pending.chunks.delete(oldest.value)
+      }
     }
     const forTransfer = pending.chunks.get(header.transferId) ?? new Map<number, Uint8Array>()
     forTransfer.set(header.index, chunk)
@@ -2449,7 +2579,21 @@ export class NightjarClient {
       throw new Error('that device code does not match the key inside it')
     }
     const me = this.account
-    const current = await this.directory.fetchRoster(me.accountId).catch(() => null)
+    // Also NOT caught, and for a sharper reason than listDevices above: this list
+    // is about to be SIGNED. Treating an unreachable relay as "no devices yet"
+    // would sign a version-1 list holding only this device and the new one, which
+    // is a silent removal of every other device the account has. The only thing
+    // standing between that and a real erasure is the relay's own monotonicity
+    // check, which is a fail-safe supplied by the component the design says must
+    // not be trusted. Failing the link is the honest outcome; the user retries.
+    const current = await this.directory.fetchRoster(me.accountId)
+    // VERIFY BEFORE YOU SIGN. What comes back is a relay answer, and the next
+    // thing that happens to it is that this account SIGNS it. Copying it
+    // unchecked would let a hostile relay hand back a list with its own device in
+    // it and have the account itself vouch for that device, producing a genuinely
+    // account-signed roster the account never agreed to. `removeDevice` already
+    // checks; these two did not, which made them the way in.
+    if (current) verifyRoster(current, me.accountKey.publicKey, Date.now())
     // Start from what is published, so a device linked from another of this
     // account's devices is not silently dropped by this one.
     const devices: RosterDevice[] = current
@@ -2653,10 +2797,25 @@ export class NightjarClient {
   private async maybeRequestRetry(peer: string, toDevice = peer): Promise<void> {
     if (this.askedRetryFrom.has(peer)) return // one ask per run per peer; the ledger covers restarts
     try {
-      // Same gate as the unreadable notice: only a contact we still hold, and not
-      // one the user deleted. A deleted peer's backlog must stay anonymous AND must
-      // not cause this device to reach out to them on its own initiative.
-      if ((await this.contacts.trustLevel(peer)) === null) return
+      // Recovery is asked for at the ONE moment attribution is least likely to
+      // work: an envelope that will not decrypt is, by definition, a device we
+      // have no readable session with, so no introduction from it can have
+      // arrived and `peer` may still be the bare device id. Reading the gate
+      // strictly then would silently end post-loss recovery for exactly the
+      // population it exists for: the second device of a multi-device contact.
+      //
+      // So when the device is unattributed, fall back to the account whose signed
+      // list names it. That list is the account's word alone, which is not enough
+      // to FILE somebody's messages under them, but it is enough to decide whether
+      // to ask a device for a resend: the request goes to that device either way,
+      // and the worst case is telling a stranger's device that something did not
+      // decrypt.
+      let account = peer
+      if ((await this.contacts.trustLevel(account)) === null) {
+        account = await this.accountNamingDevice(toDevice)
+        if (account === toDevice || (await this.contacts.trustLevel(account)) === null) return
+      }
+      peer = account
       if ((await this.contacts.dismissedAt(peer)) !== null) return
 
       const now = Date.now()
@@ -2693,6 +2852,7 @@ export class NightjarClient {
       }
       if (!proceed) return
       this.askedRetryFrom.add(peer)
+      this.askedRetryDevice.set(peer, toDevice)
       try {
         await this.sendRetryRequest(toDevice)
       } catch (e) {
@@ -2744,9 +2904,18 @@ export class NightjarClient {
 
   /** Something from `peer` decrypted, so whatever this device was asking them to
    *  repair is repaired. Clears the ask-state so a future break can ask again.
-   *  Gated on the in-RAM set so an ordinary inbound message costs no ledger write. */
-  private async clearRetryAsk(peer: string): Promise<void> {
+   *  Gated on the in-RAM set so an ordinary inbound message costs no ledger write.
+   *
+   *  `fromDevice` is which of their devices the readable message came from, and it
+   *  matters for anyone reading on more than one: the ask was made of ONE device,
+   *  and a message from a DIFFERENT, perfectly healthy device is no evidence that
+   *  the broken one was repaired. Clearing on any traffic from the account reset
+   *  the throttle on every healthy message, so the attempt cap and the interval
+   *  never bound and the "we stopped asking" notice could never fire. */
+  private async clearRetryAsk(peer: string, fromDevice = peer): Promise<void> {
+    if (this.askedRetryDevice.get(peer) !== undefined && this.askedRetryDevice.get(peer) !== fromDevice) return
     if (!this.askedRetryFrom.delete(peer)) return
+    this.askedRetryDevice.delete(peer)
     this.notedRetryExhausted.delete(peer)
     await this.contacts
       .mutateRetryState(peer, (r) => {
@@ -3050,7 +3219,10 @@ export class NightjarClient {
       // All keyed by the person: a contact record, a recovery ledger entry and a
       // resend are about somebody, not about one of their devices.
       void this.recoverContact(account, now)
-      void this.clearRetryAsk(account)
+      // The DEVICE is passed too: a readable message repairs the session it came
+      // from, and says nothing about a different device of theirs that is still
+      // broken.
+      void this.clearRetryAsk(account, from)
       if (retryRequested) void this.honorRetryRequest(account, from)
       if (helloFrom) void this.handleHello(from, helloFrom)
       if (rotation) void this.handleRotation(account, rotation)

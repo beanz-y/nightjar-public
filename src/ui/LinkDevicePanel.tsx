@@ -29,7 +29,16 @@ export function LinkDevicePanel({ onAuthorize, onSeal, onSendOverRelay, onDone, 
   const [busy, setBusy] = useState(false)
   const [target, setTarget] = useState<{ deviceId: string; secret: Uint8Array } | null>(null)
   const [blob, setBlob] = useState<Uint8Array | null>(null)
-  const [transferId] = useState(() => crypto.getRandomValues(new Uint8Array(8)))
+  /** Belongs to the SEALED PAYLOAD, not to this screen being open.
+   *
+   *  It names a stream on the receiving side, which locks onto the first id it
+   *  sees and treats every later frame under that id as more of the same
+   *  transfer. Generating it once per mount meant that going back and showing a
+   *  code again streamed a DIFFERENT seal under the SAME id: the receiver mixed
+   *  blocks from two payloads, and the result either failed to open or never
+   *  completed, with nothing on screen to say why. A fresh id per seal makes the
+   *  second attempt a second transfer, which is what it is. */
+  const [transferId, setTransferId] = useState<Uint8Array | null>(null)
 
   async function authorize(codeText: string) {
     if (!codeText.trim()) return
@@ -51,6 +60,9 @@ export function LinkDevicePanel({ onAuthorize, onSeal, onSendOverRelay, onDone, 
     setBusy(false)
     if (!sealed) return
     setBlob(sealed)
+    // A fresh id for this seal, so a second showing is a second transfer rather
+    // than more frames of the first one.
+    setTransferId(crypto.getRandomValues(new Uint8Array(8)))
     setMode('optical')
   }
 
@@ -100,7 +112,7 @@ export function LinkDevicePanel({ onAuthorize, onSeal, onSendOverRelay, onDone, 
     )
   }
 
-  if (mode === 'optical' && blob) {
+  if (mode === 'optical' && blob && transferId) {
     return (
       <div className="link-panel">
         <div className="sheet-head">

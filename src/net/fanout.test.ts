@@ -42,7 +42,7 @@ function deviceOf(id: Identity): RosterDevice {
   return { deviceId: deviceIdOf(id.ikSig.publicKey), dkSigPub: id.ikSig.publicKey, addedAt: Date.now() }
 }
 
-async function harness(peers: Identity[]) {
+async function harness(peers: Identity[], accountKey?: { privateKey: Uint8Array; publicKey: Uint8Array }) {
   const identity = generateIdentity()
   const keys = new MemoryKeyStore()
   const lock = new InMemoryLock()
@@ -78,6 +78,9 @@ async function harness(peers: Identity[]) {
     lock,
     { onMessage: () => {}, onError: (d) => notices.push(d) },
     history,
+    // An account key distinct from the device identity makes this a LINKED
+    // device, which is the only shape that introduces itself to anybody.
+    accountKey,
   )
   const bundles = new Map(peers.map((p) => [deviceIdOf(p.ikSig.publicKey), bundleFor(p)]))
   let served: ReturnType<typeof signRoster> | null = null
@@ -174,6 +177,33 @@ describe('sending to a person with several devices', () => {
     // (Only true when the account id differs from every device id, which it does
     // not here, since a first device IS its account. So assert the laptop only.)
     expect(deviceIdOf(laptop.ikSig.publicKey)).not.toBe(phone.userId)
+  })
+
+  it('introduces a linked sender to EVERY device of the recipient, not just the first', async () => {
+    // A linked device has to say which account it belongs to, or its messages
+    // arrive from an id the receiver has never seen and are filed as a stranger.
+    // The introduction used to be sent once, on a session addressed to the
+    // recipient's ACCOUNT id, which reaches their first device and nothing else:
+    // on every other device they read on, the same messages stayed unattributable.
+    // It is now sent per device, because that is where the sessions are.
+    const phone = generateIdentity()
+    const laptop = generateIdentity()
+    const accountKey = generateIdentity().ikSig // an account this device belongs to
+    const h = await harness([phone, laptop], accountKey)
+    await h.know(phone)
+    h.serve(signRoster(phone.userId, 1, [deviceOf(phone), deviceOf(laptop)], phone.ikSig.privateKey))
+
+    await h.client.sendText(phone.userId, 'to both of you')
+
+    // Two devices, each getting an introduction and then the message itself.
+    const out = await h.queued()
+    const perDevice = (id: string) => out.filter((e) => e.to === id).length
+    expect(perDevice(deviceIdOf(phone.ikSig.publicKey))).toBe(2)
+    expect(perDevice(deviceIdOf(laptop.ikSig.publicKey))).toBe(2)
+    // And nothing is addressed to the account id, which is a person rather than
+    // an endpoint. (The phone's own device id equals the account id here, since it
+    // is their first device, so this asserts the laptop's session is real too.)
+    expect(await h.store.loadBook(deviceIdOf(laptop.ikSig.publicKey))).not.toBeNull()
   })
 
   it('still saves and sends when only some of their devices can be reached', async () => {

@@ -72,6 +72,10 @@ const ROSTERS_KEY = 'contacts.rosters.v1'
 /** Account renames (rotation) that are in progress. Sealed with the rest: it is a
  *  list of who this device talks to, in two forms. */
 const RENAME_KEY = 'contacts.renames.v1'
+/** What each DEVICE said its own account is, recorded only after that claim was
+ *  checked against the account's signed device list. Sealed with the rest: it is a
+ *  map of who this device talks to and how many machines they read on. */
+const DEVICE_CLAIMS_KEY = 'contacts.deviceclaims.v1'
 /** Peers owed a session-refresh ping after a move (Phase D, 8.3), drained by the
  *  client once the post-move re-registration succeeds. Durable so a crash between
  *  the move and the first connect cannot lose the list.
@@ -944,6 +948,66 @@ export class ContactStore {
     for (const [k, v] of Object.entries(m)) {
       if (typeof v?.newId === 'string' && typeof v?.ikSig === 'string') out[k] = { newId: v.newId, ikSig: v.ikSig }
     }
+    return out
+  }
+
+  // --- what each device says it belongs to (Sesame, corroboration) ---------
+  //
+  // A device list says "these devices are mine". It is signed, but signing it
+  // proves only that the account SAID it: a device id is the hash of a public
+  // key, and every key here is public, so any account can name any device. That
+  // one-sidedness is what let a hostile contact capture a third party's messages
+  // into their own conversation, and worse, silently switch off the victim's own
+  // cross-device sync by making their devices resolve to somebody else.
+  //
+  // So attribution needs BOTH halves: the account claims the device, and the
+  // device claims the account. This is the second half. It is recorded only after
+  // a device said so over a session that runs on ITS OWN device key, and only
+  // after the named account's signed list was checked to contain it, so neither
+  // side alone can produce an entry here.
+
+  /** What this device recorded `deviceId` as claiming, or null. */
+  async deviceClaim(deviceId: string): Promise<string | null> {
+    try {
+      const map = await this.loadDeviceClaims()
+      return map[deviceId] ?? null
+    } catch {
+      return null // an unreadable map means no corroboration, never a free pass
+    }
+  }
+
+  /** Record a device's own statement of which account it belongs to. */
+  async recordDeviceClaim(deviceId: string, accountId: string): Promise<void> {
+    await this.lock.withLock(CONTACTS_LOCK, async () => {
+      const map = await this.loadDeviceClaims().catch(() => ({}) as Record<string, string>)
+      if (map[deviceId] === accountId) return
+      map[deviceId] = accountId
+      await this.putSealed(DEVICE_CLAIMS_KEY, DEVICE_CLAIMS_KEY, encoder.encode(JSON.stringify(map)))
+    })
+  }
+
+  /** Move every claim that points at `oldId` to `newId` (an account-key rotation).
+   *  Without this a rotated contact's devices keep corroborating an id that no
+   *  longer exists, so nothing they send is attributable to them again. */
+  async repointDeviceClaims(oldId: string, newId: string): Promise<void> {
+    await this.lock.withLock(CONTACTS_LOCK, async () => {
+      const map = await this.loadDeviceClaims().catch(() => ({}) as Record<string, string>)
+      let changed = false
+      for (const [deviceId, accountId] of Object.entries(map)) {
+        if (accountId !== oldId) continue
+        map[deviceId] = newId
+        changed = true
+      }
+      if (changed) await this.putSealed(DEVICE_CLAIMS_KEY, DEVICE_CLAIMS_KEY, encoder.encode(JSON.stringify(map)))
+    })
+  }
+
+  private async loadDeviceClaims(): Promise<Record<string, string>> {
+    const bytes = await this.getSealed(DEVICE_CLAIMS_KEY, DEVICE_CLAIMS_KEY)
+    if (!bytes) return {}
+    const m = JSON.parse(decoder.decode(bytes)) as Record<string, string>
+    const out: Record<string, string> = {}
+    for (const [k, v] of Object.entries(m)) if (typeof v === 'string') out[k] = v
     return out
   }
 

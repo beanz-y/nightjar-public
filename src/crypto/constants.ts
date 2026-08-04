@@ -330,6 +330,12 @@ export const MAX_ROTATION_CHAIN = 8
 /** Code shown by the device being linked: magic, version, its signing key, the
  *  secret. The device id is NOT in it, because a device id IS the hash of that
  *  key; deriving it removes a whole class of mismatch by construction. */
+/** How many part-finished link transfers a device showing a link code will hold
+ *  at once. An honest ceremony sends exactly one, so this is headroom for a
+ *  retry rather than a working limit; what it actually bounds is a third party
+ *  pushing chunks under transfer ids of their own choosing at a device whose id
+ *  is public by the time the transfer starts. */
+export const MAX_PENDING_LINK_TRANSFERS = 4
 export const LINK_CODE_MAGIC = 'NJLC'
 export const LINK_CODE_VERSION = 0x01
 export const LINK_SECRET_BYTES = 32

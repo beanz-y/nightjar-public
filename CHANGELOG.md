@@ -9,6 +9,69 @@ or the commit page on the repository host). The format is loosely based on
 [Keep a Changelog](https://keepachangelog.com/); version headings correspond to the
 release tags cut by the deploy pipeline. Dates are the tag dates.
 
+## [1.14.2] - 2026-08-03
+
+### Fixed
+- **A message is filed under somebody only if BOTH of you say so.** Your device list is
+  signed by you, but signing it only proves you said it: a device is named by a public
+  value, so anyone could list anyone's device in their own. Someone you already talk to
+  could use that to make a third person's messages appear inside THEIR conversation with
+  you, wearing the name and the verified check you gave them. It now takes two: the account
+  has to list the device, and the device itself has to say which account it belongs to, over
+  a connection only that device can hold. When two accounts claim the same device, neither
+  gets it and you are told, because only one of them can be right.
+- **The same trick could quietly stop your own devices talking to each other.** Because that
+  attribution decides which copies your devices accept from each other, a stranger naming
+  your laptop could switch off the copies your phone sends it, with nothing shown and no
+  recovery. That is closed by the same change.
+- Messages that arrived before a device introduced itself are moved into the right
+  conversation when it does, instead of sitting in a thread that looks like a stranger.
+- **Nobody can make somebody else unreachable any more.** Listing a stranger's device on
+  your own device list and then dropping it deleted the keys other people need to start a
+  conversation with them, leaving that person unable to accept a new conversation from
+  anyone until they next opened the app. Naming a device proves nothing about owning it, so
+  the relay now retires only devices it actually watched register, and a device it never saw
+  join is left alone.
+- **One invitation can no longer become any number of them.** Adding a device costs no
+  invitation, deliberately, but the record that made a device reachable also counted as a
+  member: it could invite people, and it could act as an account in its own right. So one
+  invited person could manufacture unlimited identities, each with a fresh supply of
+  invitations. Invitations are the only thing keeping this a closed group, so that gate is
+  now held where it was meant to be.
+- **A device you added is now introduced to every device the other person reads on.** It
+  said who it belonged to only to their first device, so on any other device of theirs your
+  messages arrived from something they had never seen and were filed as a stranger.
+- **The devices screen no longer answers a question it could not reach the relay to ask.**
+  When it could not check, it said "you have one device, this one", which is the same thing
+  it says when everything is fine. That is the screen people are sent to after being told a
+  device appeared on their account, so it now reports the failure instead.
+- Adding a device, or replacing your account key, will no longer quietly drop your other
+  devices from your list if the relay cannot be reached while doing it.
+- What the relay stores for you is now written in the shape this app produced, rather than
+  kept as the exact text a client sent, so nothing unexpected can ride along in it and be
+  handed to somebody else later.
+- **Your device list is now checked before your own key signs it.** Adding a device, or
+  replacing your account key, copied the existing list straight from the relay and signed
+  what came back, so a dishonest one could have had you vouch for a device you never added.
+- **Forgetting your app-lock secret on a device you added now takes that device off the
+  account.** It used to keep its place: still listed, still receiving that account's
+  messages including the copies your other devices send it, while no longer holding what it
+  would need to remove itself. Take it off your device list from another device, then add it
+  again.
+- Backups and move files are no longer offered on a device you added to an account. Both
+  formats carry the device and not the account it belongs to, so restoring one elsewhere
+  produced a device claiming an identity another account still lists. Do both from the device
+  that started the account.
+- Asking somebody to resend after a lost conversation no longer resets itself every time any
+  of their other devices says anything, which meant the limit on how often it could ask never
+  actually applied.
+- Showing the linking code again after going back now starts a new transfer rather than
+  adding to the previous one, which the receiving device could not make sense of.
+- A device waiting to be added now holds only a few part-finished transfers at once. Anyone
+  could push data at it while it waits, and it kept all of it.
+- Carrying saved messages between your devices now honors a delete that happens while the
+  transfer is running, rather than only ones that had already happened when it started.
+
 ## [1.14.1] - 2026-08-03
 
 ### Fixed

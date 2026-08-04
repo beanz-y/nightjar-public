@@ -29,7 +29,7 @@ import { openBackup, parseBackupHeader, sealBackup } from '../crypto/backup'
 import { type LinkPayload, openLink } from '../crypto/link'
 import { ed25519Public } from '../crypto/primitives'
 import { newHistoryCode, newLinkCode, parseHistoryCode, parseLinkCode } from '../trust/linkCode'
-import { clearAccountKey, loadAccountKey, saveAccountKey } from '../storage/accountKeyStore'
+import { clearAccountKey, hasAccountKey, loadAccountKey, saveAccountKey } from '../storage/accountKeyStore'
 import { type OpenedMove, encodeMovePayload, openMove, parseMoveHeader, sealMove } from '../crypto/move'
 import { bytesToHex } from '@noble/hashes/utils.js'
 import { newMsgId } from '../crypto/message'
@@ -68,6 +68,28 @@ export type LinkState = 'idle' | 'waiting' | 'joining' | 'done'
 
 /** Lock the app after this long hidden (idle). */
 const IDLE_LOCK_MS = 5 * 60 * 1000
+
+/**
+ * Whether this device belongs to an account it did not start: it holds an
+ * account key that is not derived from its own identity.
+ *
+ * It gates the two file exports, and the reason is that both formats predate
+ * multi-device and carry only the DEVICE identity. Restoring one elsewhere would
+ * produce a device holding this device's id, which this account's published list
+ * still names, but no account key: it would boot as an account of one whose id is
+ * a device somebody else claims, which is the corrupt state the whole attribution
+ * fix exists to keep off the board. A backup taken here would also be a promise
+ * it cannot keep, since it restores an identity without the account it belonged
+ * to. The honest instruction is to do both from the device that started the
+ * account.
+ */
+function isLinkedDevice(live: { client: { account: { accountId: string }; deviceId: string } }): boolean {
+  return live.client.account.accountId !== live.client.deviceId
+}
+
+const LINKED_EXPORT_REFUSAL =
+  'this device was added to an account rather than starting one, and a backup or move file carries only the ' +
+  'device, not the account it belongs to. Do this from the device that started the account.'
 
 /** Left behind when erasing this device could not remove everything. It has to
  *  outlive the reload that erasing ends with, which is why it is not React state:
@@ -887,6 +909,12 @@ export function useNightjar() {
     const stores = storesRef.current
     if (!stores) return
     teardownLive()
+    // Read BEFORE the wipe, and without opening it: a stored account key means
+    // this device was added to somebody's account rather than starting one, which
+    // changes what a reset has to do (see below). Best-effort, and false is the
+    // safe reading: it keeps the identity, which is recoverable, rather than
+    // discarding one that was not meant to go.
+    const linked = await hasAccountKey(stores.keys).catch(() => false)
     try {
       // EVERYTHING local is sealed under the Local Data Key being discarded here, so
       // it is all unrecoverable ciphertext the moment this runs and must be cleared,
@@ -908,7 +936,20 @@ export function useNightjar() {
       // linked device that resets its lock stops being part of the account and has
       // to be linked again, which is the honest consequence of losing the secret.
       await clearAccountKey(stores.keys)
-      await stores.keys.put(RESTORE_PENDING_KEY, Uint8Array.from([1]))
+      if (linked) {
+        // A LINKED device's forgotten-secret escape has to be a DEPARTURE, not a
+        // re-enrollment. Keeping the identity is right for a device that IS its
+        // own account: people can still reach it. It is wrong here, because this
+        // device stays on the account's published list, re-registers on the next
+        // connect, and goes on receiving that account's mail (including the
+        // copies its siblings send it) as a device with no contacts and no way to
+        // read anything, while no longer holding the key it would need to take
+        // itself off the list. So it leaves instead.
+        await stores.keys.delete(IDENTITY_KEY)
+        await stores.sentinel.unmark()
+      } else {
+        await stores.keys.put(RESTORE_PENDING_KEY, Uint8Array.from([1]))
+      }
       // A pending move-refresh list would re-add (via first-contact recording) the
       // very contacts this reset just wiped. It dies with them inside
       // wipeLocalData above, which is where it lives now that it is sealed (8.5).
@@ -937,8 +978,17 @@ export function useNightjar() {
     movePayloadRef.current = null
     setMoveProgress(null)
     setRestorePending(false)
-    setNotice('the app-lock was reset. Every conversation on this device ended: message each contact again to reopen one, and until you do they cannot reach you.')
-    setPhase('enroll')
+    if (linked) {
+      setNotice(
+        'the app-lock was reset, and this device has left the account it was added to: without the secret there ' +
+          'was no way to keep its half of it. Remove it from your device list on another of your devices, then add ' +
+          'this one again.',
+      )
+      setPhase('onboarding')
+    } else {
+      setNotice('the app-lock was reset. Every conversation on this device ended: message each contact again to reopen one, and until you do they cannot reach you.')
+      setPhase('enroll')
+    }
   }, [teardownLive])
 
   // --- messaging actions (unchanged behaviour) -----------------------------
@@ -1283,6 +1333,10 @@ export function useNightjar() {
   const exportBackup = useCallback(async (passphrase: string): Promise<boolean> => {
     const live = liveRef.current
     if (!live) return false
+    if (isLinkedDevice(live)) {
+      setNotice(LINKED_EXPORT_REFUSAL)
+      return false
+    }
     try {
       const list = await live.client.listContacts()
       const blob = await sealBackup(live.identity, list, passphrase, { kdf: createBackupKdf() })
@@ -1424,6 +1478,10 @@ export function useNightjar() {
   > => {
     const live = liveRef.current
     if (!live) return null
+    if (isLinkedDevice(live)) {
+      setNotice(LINKED_EXPORT_REFUSAL)
+      return null
+    }
     try {
       const data = await live.client.exportMoveData()
       const bytes = encodeMovePayload(live.identity, data.contacts, data.aliases, data.dismissals, data.messages, Date.now()).length
@@ -1448,6 +1506,10 @@ export function useNightjar() {
     const live = liveRef.current
     const stores = storesRef.current
     if (!live || !stores) return false
+    if (isLinkedDevice(live)) {
+      setNotice(LINKED_EXPORT_REFUSAL)
+      return false
+    }
     try {
       const data = await live.client.exportMoveData()
       const blob = await sealMove(

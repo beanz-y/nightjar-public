@@ -38,6 +38,8 @@ import {
   b64encode,
   decodeDeviceRoster,
   decodeRotationStatement,
+  encodeDeviceRoster,
+  encodeRotationStatement,
   decodePublishedBundle,
   decodeSignedPrekey,
   encodePublishedBundle,
@@ -146,6 +148,12 @@ export class Directory {
         blob TEXT NOT NULL,
         updated_at INTEGER NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS device_claims (
+        device_id TEXT PRIMARY KEY,
+        account_id TEXT NOT NULL,
+        claimed_at INTEGER NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_device_claims_account ON device_claims(account_id);
       CREATE TABLE IF NOT EXISTS rotations (
         old_account_id TEXT PRIMARY KEY,
         new_account_id TEXT NOT NULL,
@@ -207,6 +215,16 @@ export class Directory {
     if (body.inviter !== '@admin') {
       const user = this.sql.exec('SELECT user_id FROM users WHERE user_id = ?', body.inviter).toArray()[0]
       if (!user) throw new DirectoryError('not_registered', 'register before minting invites')
+      // A registered row is not the same thing as an invited PERSON. Adding a
+      // device deliberately costs no invite, so it writes a users row for the
+      // device too, and until this check existed that row could mint invites of
+      // its own: one invited account could add devices for keypairs it generated
+      // on the spot and hand each one a fresh invite budget, without limit. The
+      // invite gate is the spine of the whole anti-abuse story, so a device is
+      // held to be what it is: part of somebody's account, not a member.
+      if (this.deviceClaim(body.inviter)) {
+        throw new DirectoryError('not_registered', 'a device cannot mint invites; use the account it belongs to')
+      }
       // Cap outstanding (unused, unexpired) invites per inviter so a single
       // account cannot flood the shared Directory (P4 review).
       const outstanding = this.sql
@@ -433,8 +451,48 @@ export class Directory {
     const user = this.sql.exec('SELECT ik_sig_pub FROM users WHERE user_id = ?', accountId).toArray()[0] as
       | { ik_sig_pub: string }
       | undefined
-    if (user) return { key: b64decode(user.ik_sig_pub, 32), chainLen: 0 }
+    // A row written by /registerDevice is a DEVICE, not an account root. Treating
+    // one as an account would let anybody who can add a device (which costs no
+    // invite, by design) mint account ids without limit, and each of those could
+    // publish a roster and rotate, which is the same hole from three directions.
+    if (user && !this.deviceClaim(accountId)) return { key: b64decode(user.ik_sig_pub, 32), chainLen: 0 }
     return null
+  }
+
+  /** Which account the Directory OBSERVED this device register under, if any.
+   *
+   *  This is a record of something that happened here, not an opinion about
+   *  ownership: the device authenticated as itself and named the account, and the
+   *  account's own signed roster had to list it already. Absence means "we never
+   *  saw it register", which every caller must read as a reason to do LESS, never
+   *  as permission to act. Devices registered before this table existed have no
+   *  row, so the rules below fail safe for them rather than newly refusing them. */
+  /** Whether `accountId` is what `deviceId` became, following the recorded
+   *  rotations forward.
+   *
+   *  This is the retired first device's case, and it is the one entry a rotated
+   *  account must still be able to retire: its device key WAS the old account key,
+   *  so it has a users row written by /register and no device claim at all. The
+   *  walk is bounded by the same chain cap the Directory enforces on publish, so a
+   *  cycle or a long chain cannot spin here. */
+  private rotatedInto(deviceId: string, accountId: string): boolean {
+    let at = deviceId
+    for (let hop = 0; hop < MAX_ROTATION_CHAIN; hop++) {
+      const row = this.sql.exec('SELECT new_account_id FROM rotations WHERE old_account_id = ?', at).toArray()[0] as
+        | { new_account_id: string }
+        | undefined
+      if (!row) return false
+      if (row.new_account_id === accountId) return true
+      at = row.new_account_id
+    }
+    return false
+  }
+
+  private deviceClaim(deviceId: string): string | null {
+    const row = this.sql.exec('SELECT account_id FROM device_claims WHERE device_id = ?', deviceId).toArray()[0] as
+      | { account_id: string }
+      | undefined
+    return row ? row.account_id : null
   }
 
   // --- device rosters (Sesame) -------------------------------------------
@@ -497,19 +555,27 @@ export class Directory {
     // Storing the new list and retiring the prekeys of devices it drops are one
     // change, so they commit together: a crash between them would leave an account
     // whose stored list disagrees with which of its devices are reachable.
+    // Stored as the CANONICAL re-encode of what was decoded and verified, never
+    // as the caller's raw JSON. Two reasons, and the second is the one that bites:
+    // unknown properties would otherwise survive in a blob this Directory hands
+    // back to third parties, making it a small free-form store somebody else's
+    // client reads; and the stored bytes would be an unbounded string chosen by
+    // the caller rather than a shape this code has already agreed to. What is
+    // served is then exactly what was verified.
+    const canon = encodeDeviceRoster(roster)
     return this.ctx.storage.transactionSync(() => {
       this.sql.exec(
         'INSERT INTO rosters (account_id, version, blob, updated_at) VALUES (?, ?, ?, ?) ' +
           'ON CONFLICT(account_id) DO UPDATE SET version = excluded.version, blob = excluded.blob, updated_at = excluded.updated_at',
         roster.accountId,
         roster.version,
-        JSON.stringify(body.roster),
+        JSON.stringify(canon),
         Date.now(),
       )
       this.dropUnlistedDevices(
         roster.accountId,
         current ? (JSON.parse(current.blob) as WireDeviceRoster) : null,
-        body.roster,
+        canon,
       )
       return { version: roster.version }
     })
@@ -589,6 +655,19 @@ export class Directory {
           body.now,
         )
       }
+      // Record what just happened, in the same transaction as the registration it
+      // describes: this device authenticated as itself and registered under this
+      // account, whose signed roster already listed it. Everything downstream that
+      // needs to know a device is a device rather than an account reads this, and
+      // it is the only ownership statement in the Directory that is a MEMORY of an
+      // event rather than a claim somebody made.
+      this.sql.exec(
+        'INSERT INTO device_claims (device_id, account_id, claimed_at) VALUES (?, ?, ?) ' +
+          'ON CONFLICT(device_id) DO UPDATE SET account_id = excluded.account_id, claimed_at = excluded.claimed_at',
+        body.deviceId,
+        body.accountId,
+        body.now,
+      )
       this.storeBundle(body.deviceId, canon)
       return { opkCount: this.opkCount(body.deviceId) }
     })
@@ -614,6 +693,20 @@ export class Directory {
     const kept = new Set(after.devices.map((d) => d.deviceId))
     for (const d of before.devices) {
       if (kept.has(d.deviceId) || d.deviceId === accountId) continue
+      // DROP ONLY WHAT THIS DIRECTORY WATCHED REGISTER HERE.
+      //
+      // Listing a device in your own roster is not evidence that it is yours: any
+      // account can name any device, because a device id is the hash of a public
+      // key and every key here is public. Without this check, publishing a list
+      // naming a stranger's device and then publishing one without it deleted
+      // THEIR published prekeys, so nobody could open a new session with them
+      // until they next connected. Two frames, repeatable, against anybody.
+      //
+      // Absence of a claim means DO NOT DROP. That is the safe direction: the
+      // worst case is a retired device whose prekeys linger until it is asked to
+      // re-register, and it is what keeps devices that registered before this
+      // record existed working instead of being newly refused.
+      if (this.deviceClaim(d.deviceId) !== accountId && !this.rotatedInto(d.deviceId, accountId)) continue
       this.sql.exec('DELETE FROM spks WHERE user_id = ?', d.deviceId)
       this.sql.exec('DELETE FROM opks WHERE user_id = ?', d.deviceId)
       this.sql.exec('DELETE FROM vends WHERE target = ?', d.deviceId)
@@ -729,9 +822,22 @@ export class Directory {
       // is kept verbatim, because that is what gets served for others to check.
       b64encode(st.newAccountKey),
       chainLen,
-      JSON.stringify(body.statement),
+      // Canonical re-encode, same discipline as the roster above: this blob is
+      // served to anyone who asks where an account went, so it must be a shape
+      // this code produced rather than a string the caller chose.
+      JSON.stringify(encodeRotationStatement(st)),
       Date.now(),
     )
+    // Carry the observed device claims across, or the account loses the ability
+    // to retire its own devices the moment it rotates.
+    this.sql.exec('UPDATE device_claims SET account_id = ? WHERE account_id = ?', st.newAccountId, st.oldAccountId)
+    // The retired FIRST device is deliberately NOT given a claim row here, even
+    // though it is the device the successor most needs to be able to retire. A
+    // claim row answers "is this a device rather than an account", and writing one
+    // for a retired account id would make that account stop being an account: its
+    // own later rotation calls would fail to find a key for it. The successor's
+    // authority over it is expressed where it belongs, as a rotation ANCESTOR
+    // check in dropUnlistedDevices.
     return { newAccountId: st.newAccountId, chainLen }
   }
 

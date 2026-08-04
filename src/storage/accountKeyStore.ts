@@ -44,6 +44,17 @@ export async function loadAccountKey(keys: KeyStore, lock: AppLockStore): Promis
   return { privateKey, publicKey: ed25519Public(privateKey) }
 }
 
+/** Whether this device holds an account key at all, WITHOUT opening it.
+ *
+ *  Presence alone answers a question the app-lock cannot: a first device derives
+ *  its account key from its own identity and stores nothing, so a stored blob
+ *  means this device was ADDED to somebody's account. That has to be readable
+ *  while the app is locked, because the forgotten-secret path runs there and its
+ *  correct behavior differs for the two cases. */
+export async function hasAccountKey(keys: KeyStore): Promise<boolean> {
+  return (await keys.get(ACCOUNT_KEY)) !== null
+}
+
 /** Forget the account key. Used by the reset paths, which discard the key that
  *  seals it and so must clear what it sealed. */
 export async function clearAccountKey(keys: KeyStore): Promise<void> {
