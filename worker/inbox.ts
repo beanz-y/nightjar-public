@@ -20,7 +20,14 @@ import {
   SEEN_ID_TTL_MS,
 } from '../src/crypto/constants'
 import { type AuthChallenge, verifyAuthResponse } from '../src/wire/auth'
-import { type WireDeviceRoster, type WireEnvelope, type WireFetchedBundle, b64decode, decodeEnvelope } from '../src/wire/codec'
+import {
+  type WireDeviceRoster,
+  type WireEnvelope,
+  type WireFetchedBundle,
+  type WireRotationStatement,
+  b64decode,
+  decodeEnvelope,
+} from '../src/wire/codec'
 import { buildChallenge } from '../src/wire/auth'
 import type {
   AckMsg,
@@ -28,9 +35,11 @@ import type {
   DeliveredCheckMsg,
   FetchBundleMsg,
   FetchRosterMsg,
+  FetchRotationMsg,
   PresenceMsg,
   PublishBundleMsg,
   PublishRosterMsg,
+  PublishRotationMsg,
   PushSubscribeMsg,
   PushUnsubscribeMsg,
   RegisterDeviceMsg,
@@ -245,6 +254,10 @@ export class Inbox {
         return this.doPublishRoster(ws, msg)
       case 'fetchRoster':
         return this.doFetchRoster(ws, msg)
+      case 'publishRotation':
+        return this.doPublishRotation(ws, msg)
+      case 'fetchRotation':
+        return this.doFetchRotation(ws, msg)
       case 'registerDevice':
         return this.doRegisterDevice(ws, userId, msg)
       case 'sendLink':
@@ -311,10 +324,46 @@ export class Inbox {
 
   private async doFetchRoster(ws: WebSocket, msg: FetchRosterMsg): Promise<void> {
     try {
-      const r = await callDO<{ roster: WireDeviceRoster | null }>(directoryStub(this.env), '/fetchRoster', {
+      const r = await callDO<{ roster: WireDeviceRoster | null; rotation: WireRotationStatement | null }>(
+        directoryStub(this.env),
+        '/fetchRoster',
+        { accountId: msg.accountId },
+      )
+      this.sendTo(ws, {
+        t: 'roster',
+        reqId: msg.reqId,
+        accountId: msg.accountId,
+        roster: r.roster,
+        rotation: r.rotation ?? null,
+      })
+    } catch (e) {
+      this.replyError(ws, e, msg.reqId)
+    }
+  }
+
+  // Rotation ops (Sesame), forwarded without the authenticated user id for the
+  // same reason the roster ops are: the statement is signed by the account being
+  // rotated and counter-signed by the key taking over, so it authorizes itself,
+  // and it may legitimately be relayed by any device of that account. Fetching
+  // one reveals nothing either: the Directory tells anyone, because a contact who
+  // was offline while it happened has to be able to find out.
+  private async doPublishRotation(ws: WebSocket, msg: PublishRotationMsg): Promise<void> {
+    try {
+      const r = await callDO<{ newAccountId: string }>(directoryStub(this.env), '/publishRotation', {
+        statement: msg.statement,
+      })
+      this.sendTo(ws, { t: 'rotationPublished', reqId: msg.reqId, newAccountId: r.newAccountId })
+    } catch (e) {
+      this.replyError(ws, e, msg.reqId)
+    }
+  }
+
+  private async doFetchRotation(ws: WebSocket, msg: FetchRotationMsg): Promise<void> {
+    try {
+      const r = await callDO<{ statement: WireRotationStatement | null }>(directoryStub(this.env), '/fetchRotation', {
         accountId: msg.accountId,
       })
-      this.sendTo(ws, { t: 'roster', reqId: msg.reqId, accountId: msg.accountId, roster: r.roster })
+      this.sendTo(ws, { t: 'rotation', reqId: msg.reqId, accountId: msg.accountId, statement: r.statement })
     } catch (e) {
       this.replyError(ws, e, msg.reqId)
     }

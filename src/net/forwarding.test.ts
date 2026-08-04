@@ -127,7 +127,7 @@ async function harness(peers: Identity[]) {
   const rosters = new Map<string, ReturnType<typeof signRoster>>()
   ;(client as unknown as { directory: unknown }).directory = {
     fetchBundle: async (target: string) => ({ bundle: kits.get(target)?.bundle ?? null }),
-    fetchRoster: async (accountId: string) => rosters.get(accountId) ?? null,
+    fetchRosterWithRotation: async (accountId: string) => ({ roster: rosters.get(accountId) ?? null, rotation: null }),
     deliveredCheck: async () => [],
   }
   return {

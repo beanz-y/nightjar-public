@@ -32,6 +32,8 @@ interface Props {
   onSeal: (secret: Uint8Array) => Promise<Uint8Array | null>
   onSendOverRelay: (deviceId: string, secret: Uint8Array) => Promise<boolean>
   onErase: () => Promise<void>
+  /** Replace this account's key. Resolves with the new account id. */
+  onRotate: () => Promise<string | null>
   history: HistoryTransferProps
   onClose: () => void
 }
@@ -59,6 +61,7 @@ export function DevicesPanel({
   onSeal,
   onSendOverRelay,
   onErase,
+  onRotate,
   history,
   onClose,
 }: Props) {
@@ -68,6 +71,9 @@ export function DevicesPanel({
   const [confirming, setConfirming] = useState<string | null>(null)
   const [startingOver, setStartingOver] = useState(false)
   const [eraseConfirm, setEraseConfirm] = useState('')
+  const [rotating, setRotating] = useState(false)
+  const [rotateConfirm, setRotateConfirm] = useState('')
+  const [rotateBusy, setRotateBusy] = useState(false)
 
   const refresh = useCallback(async () => {
     setDevices(await onList())
@@ -204,6 +210,85 @@ export function DevicesPanel({
         contact who verified you stays verified, and equally, a device of yours that someone else got hold of would
         still show them a matching safety number.
       </p>
+
+      {/* Replacing the account key. The copy here is the feature: rotation is
+          routinely misread as "revoke a stolen device", and it is not that. It
+          helps when the old key is GONE but not in use; it does not beat somebody
+          actively using it, because they can sign a rotation exactly as validly
+          as you can. So the screen says that before the button, not after. */}
+      <div className="field-label small muted">replacing your account key</div>
+      {!rotating ? (
+        <>
+          <button className="ghost small" onClick={() => setRotating(true)}>
+            replace my account key
+          </button>
+          <p className="muted tiny">
+            For a phone you lost, or a key whose storage you no longer trust. Your contacts keep this conversation and
+            everything in it instead of meeting a stranger, and your messages keep flowing to the devices you already
+            have.
+          </p>
+        </>
+      ) : (
+        <>
+          <p className="small">
+            This gives you a new account key and a new id, and tells your contacts to follow it. What it does NOT do:
+            it does not lock out anyone who is <em>already using</em> your old key. They hold the same key, so they can
+            make a statement exactly as valid as yours, and nothing in it tells the two apart. Treat this as useful
+            when the old key is gone and not in use, and not as a way to take an account back from somebody who has it.
+          </p>
+          <p className="small">
+            Everyone who has verified you will show as <em>unverified</em> afterwards and has to compare safety numbers
+            with you again, in person. That is deliberate: carrying a verification across would hand it to whoever
+            wrote the statement.
+          </p>
+          {/* Only worth saying when there is something to lose: the other devices
+              keep the retired key and cannot act for the account afterwards. */}
+          {(devices?.length ?? 0) > 1 && (
+            <p className="small">
+              Your other devices keep the old key and will not be able to act for this account afterwards. Add them
+              again once this is done.
+            </p>
+          )}
+          <p className="muted tiny">Type REPLACE to confirm.</p>
+          <input
+            className="mono"
+            value={rotateConfirm}
+            onChange={(e) => setRotateConfirm(e.target.value)}
+            autoCapitalize="characters"
+            autoCorrect="off"
+            spellCheck={false}
+            aria-label="type REPLACE to confirm"
+          />
+          <div className="row">
+            <button
+              className="danger"
+              disabled={rotateConfirm !== 'REPLACE' || rotateBusy}
+              onClick={() => {
+                setRotateBusy(true)
+                void onRotate()
+                  .then(() => refresh())
+                  .finally(() => {
+                    setRotateBusy(false)
+                    setRotating(false)
+                    setRotateConfirm('')
+                  })
+              }}
+            >
+              {rotateBusy ? 'replacing…' : 'replace my account key'}
+            </button>
+            <button
+              className="link"
+              disabled={rotateBusy}
+              onClick={() => {
+                setRotating(false)
+                setRotateConfirm('')
+              }}
+            >
+              cancel
+            </button>
+          </div>
+        </>
+      )}
 
       {/* Adding a device THAT ALREADY HAS ITS OWN ACCOUNT is refused, because
           linking keeps what a device holds rather than replacing it, so joining

@@ -17,6 +17,7 @@ import type {
   WireEnvelope,
   WireOneTimePrekey,
   WirePublishedBundle,
+  WireRotationStatement,
   WireSignedPrekey,
 } from './codec'
 import type { AuthChallenge } from './auth'
@@ -108,6 +109,26 @@ export interface FetchRosterMsg {
   accountId: string
 }
 
+/** Record which key replaces this account's (Sesame, account-key rotation). Like
+ *  the roster, the statement carries its own authorization: it is signed by the
+ *  account being rotated and counter-signed by the key taking over, and the
+ *  Directory verifies both against a key it already holds for that account. */
+export interface PublishRotationMsg {
+  t: 'publishRotation'
+  reqId: string
+  statement: WireRotationStatement
+}
+
+/** Ask whether an account rotated, and to what. Answered with null for every
+ *  account that never did, which is almost all of them. ONE hop: a chain is
+ *  followed by asking again, because each hop has to be verified under the key
+ *  the hop before it introduced, and the relay cannot do that for anyone. */
+export interface FetchRotationMsg {
+  t: 'fetchRotation'
+  reqId: string
+  accountId: string
+}
+
 export interface SendMsg {
   t: 'send'
   to: string
@@ -174,6 +195,8 @@ export type ClientMessage =
   | InviteRedemptionsMsg
   | PublishRosterMsg
   | FetchRosterMsg
+  | PublishRotationMsg
+  | FetchRotationMsg
   | RegisterDeviceMsg
   | SendLinkMsg
   | SendMsg
@@ -250,6 +273,29 @@ export interface RosterMsg {
   /** null: this account has never published a roster, so it is the single device
    *  at its own account id. Not an error, and the common case. */
   roster: WireDeviceRoster | null
+  /** Set when this account rotated its key away: the signed statement naming the
+   *  successor, so whoever is asking where to send can find out they moved in the
+   *  same round trip. Optional on the wire, since a relay that predates it will
+   *  not send one. Never believed without verifying it under the key the caller
+   *  already holds. */
+  rotation?: WireRotationStatement | null
+}
+
+export interface RotationPublishedMsg {
+  t: 'rotationPublished'
+  reqId: string
+  /** Echoed back so the caller can see the Directory recorded the successor it
+   *  meant. A repeat of a rotation already recorded answers here rather than
+   *  failing, so retrying an interrupted rotation is safe. */
+  newAccountId: string
+}
+
+export interface RotationMsg {
+  t: 'rotation'
+  reqId: string
+  accountId: string
+  /** null: this account never rotated, which is almost all of them. */
+  statement: WireRotationStatement | null
 }
 
 export interface RedemptionsMsg {
@@ -316,6 +362,8 @@ export type ServerMessage =
   | RedemptionsMsg
   | RosterPublishedMsg
   | RosterMsg
+  | RotationPublishedMsg
+  | RotationMsg
   | LinkChunkMsg
   | DeliverMsg
   | SentMsg

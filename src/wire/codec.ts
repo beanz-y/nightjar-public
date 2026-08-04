@@ -12,6 +12,7 @@ import { base64urlnopad } from '@scure/base'
 import { MAX_DEVICES_PER_ACCOUNT } from '../crypto/constants'
 import type { FetchedBundle, OneTimePrekey, SignedPrekey } from '../crypto/prekeys'
 import type { DeviceRoster } from '../crypto/roster'
+import type { RotationStatement } from '../crypto/rotation'
 import type { InitialHeader } from '../crypto/x3dh'
 import type { MessageHeader } from '../crypto/ratchet'
 
@@ -223,6 +224,44 @@ export function decodeDeviceRoster(w: WireDeviceRoster): DeviceRoster {
       addedAt: uint(d.addedAt, Number.MAX_SAFE_INTEGER, 'roster.device.addedAt'),
     })),
     sig: b64decode(w.sig, ED_SIG),
+  }
+}
+
+// --- account-key rotation (Sesame) ---------------------------------------
+//
+// Same discipline as the roster above it: this decodes SHAPE, and nothing more.
+// A statement that decodes is not a statement that is true. `verifyRotation`
+// checks it under a key the caller already holds, and both the client and the
+// Directory run that check before believing a word of it.
+
+export interface WireRotationStatement {
+  oldAccountId: string
+  newAccountId: string
+  newAccountKey: string
+  rotatedAt: number
+  oldSig: string
+  newSig: string
+}
+
+export function encodeRotationStatement(st: RotationStatement): WireRotationStatement {
+  return {
+    oldAccountId: st.oldAccountId,
+    newAccountId: st.newAccountId,
+    newAccountKey: b64encode(st.newAccountKey),
+    rotatedAt: st.rotatedAt,
+    oldSig: b64encode(st.oldSig),
+    newSig: b64encode(st.newSig),
+  }
+}
+
+export function decodeRotationStatement(w: WireRotationStatement): RotationStatement {
+  return {
+    oldAccountId: userId(w.oldAccountId, 'rotation.oldAccountId'),
+    newAccountId: userId(w.newAccountId, 'rotation.newAccountId'),
+    newAccountKey: b64decode(w.newAccountKey, ED_PUB),
+    rotatedAt: uint(w.rotatedAt, Number.MAX_SAFE_INTEGER, 'rotation.rotatedAt'),
+    oldSig: b64decode(w.oldSig, ED_SIG),
+    newSig: b64decode(w.newSig, ED_SIG),
   }
 }
 

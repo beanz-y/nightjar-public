@@ -14,6 +14,7 @@ import { type Identity, verifyIdkbind } from './identity'
 import {
   bytesEqual,
   domainSeparate,
+  ed25519KeyUsable,
   ed25519Sign,
   ed25519Verify,
   u32be,
@@ -103,6 +104,14 @@ export function verifyFetchedBundle(
   }
   if (knownPeerIkSig && !bytesEqual(knownPeerIkSig, bundle.ikSigPub)) {
     throw new Error('x3dh: peer identity key changed; verify the safety number')
+  }
+  // Every signature below is checked under a key that came WITH the bundle, so a
+  // degenerate key would make all of them meaningless: a small-order key verifies
+  // an all-zero signature, and nobody holds a private half for it. Registration
+  // and device registration both run this check server-side, so it also keeps
+  // such a key out of the Directory in the first place.
+  if (!ed25519KeyUsable(bundle.ikSigPub)) {
+    throw new Error('x3dh: peer identity key is not a key anybody can hold')
   }
   // IK_dh authenticity rests entirely on this binding (DESIGN 3, 4.2): check it
   // before the DH that uses IK_dh.

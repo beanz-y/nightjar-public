@@ -18,6 +18,12 @@ export const TAG_AUTH = 'Nightjar-auth-v1'
  *  distinct length-framed tag here, one of those uses would be an oracle for
  *  another, which is the exact v0.1 bug the design caught on paper. */
 export const TAG_ROSTER = 'Nightjar-roster-v1'
+/** Account-key rotation (Sesame, roadmap 7b). Its own tag for the same reason the
+ *  roster has one: on a first device the account key also signs auth challenges,
+ *  prekeys and rosters, and a rotation statement is the single most consequential
+ *  thing that key can say, so it must not be producible as a side effect of any
+ *  other signing use. */
+export const TAG_ROTATION = 'Nightjar-rotation-v1'
 
 // KDF info strings, one per derivation, all versioned (DESIGN 4.2, 5.1).
 export const INFO_X3DH = 'Nightjar_X3DH_v1'
@@ -299,6 +305,18 @@ export const LOCK_PRF_INPUT = 'Nightjar-applock-prf-v1'
  *  and each of the sender's own, and each device holds its own prekey pool, so
  *  this bounds both the fan-out and what one account can make the Directory hold. */
 export const MAX_DEVICES_PER_ACCOUNT = 8
+
+// Account-key rotation (Sesame, roadmap 7b). A rotation is one signed statement:
+// the old account key says which key replaces it, and the new key signs back.
+/** How many times one account may be rotated, counted from the registered
+ *  account it began as. Two jobs, and the second is the reason for the number.
+ *  It bounds what one invited account can make the Directory store, since every
+ *  rotation mints an account id out of nothing but a fresh keypair. And it bounds
+ *  how far a client will follow a chain of statements before giving up, so a
+ *  hostile Directory cannot hand out a walk that never ends. Rotation is a rare
+ *  and disruptive act (every contact re-verifies), so a small number costs
+ *  nothing real. */
+export const MAX_ROTATION_CHAIN = 8
 
 // Linking a device (Sesame). A new device shows a code; the existing device
 // scans it and sends that device everything it needs to join the account.

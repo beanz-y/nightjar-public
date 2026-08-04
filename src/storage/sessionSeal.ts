@@ -120,21 +120,37 @@ export class SessionSealer {
     const { key, nonce } = this.keyNonce(salt)
     const body: Record<string, unknown> = { to: entry.to, env: entry.env }
     if (entry.silent) body.silent = true
+    // The two fields multi-device added, and they have to survive the round trip:
+    // once a message is fanned out to several devices the entry id is a per-copy
+    // TRANSPORT id, so `contentId` is the only remaining link to the logical
+    // message and `account` the only link to the conversation. Without them a
+    // queued copy read back from disk cannot be cancelled by a delete, marked
+    // delivered, or marked failed, because every one of those looks the message
+    // up by (account, contentId).
+    //
+    // They go INSIDE the sealed body rather than beside it: `account` names a
+    // peer, which is exactly what this seal exists to hide (see the header).
+    if (entry.contentId) body.contentId = entry.contentId
+    if (entry.account) body.account = entry.account
     const ct = aeadSeal(key, nonce, utf8(JSON.stringify(body)), this.outboxAad(entry.id, entry.createdAt))
     return { id: entry.id, createdAt: entry.createdAt, salt, ct }
   }
 
   openOutbox(rec: SealedOutboxRecord): OutboxEntry {
     const { key, nonce } = this.keyNonce(rec.salt)
-    let body: { to: string; env: unknown; silent?: boolean }
+    let body: { to: string; env: unknown; silent?: boolean; contentId?: string; account?: string }
     try {
       const plain = aeadOpen(key, nonce, rec.ct, this.outboxAad(rec.id, rec.createdAt))
-      body = JSON.parse(decoder.decode(plain)) as { to: string; env: unknown; silent?: boolean }
+      body = JSON.parse(decoder.decode(plain)) as typeof body
     } catch {
       throw new SessionSealError('a queued message')
     }
     const e: OutboxEntry = { id: rec.id, to: body.to, env: body.env as OutboxEntry['env'], createdAt: rec.createdAt }
     if (body.silent) e.silent = true
+    // Absent on rows sealed before this fix, which is why every reader falls back
+    // to the single-device meaning (`e.account ?? e.to`, `e.contentId ?? e.id`).
+    if (body.contentId) e.contentId = body.contentId
+    if (body.account) e.account = body.account
     return e
   }
 }

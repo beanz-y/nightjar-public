@@ -7,7 +7,7 @@
 // (send, verify, invite pinning, trust badges) is unchanged; only the shell is.
 
 import { useEffect, useMemo, useRef, useState } from 'react'
-import type { Identity } from '../crypto/identity'
+import { accountIdOf } from '../crypto/identity'
 import type { Contact } from '../trust/contactStore'
 import type { CanaryResult } from '../verify/canary'
 import { Conversation } from './Conversation'
@@ -20,7 +20,10 @@ import type { Message, MintedInvite, NotifyState } from './useNightjar'
 type Overlay = 'none' | 'newchat' | 'settings'
 
 interface Props {
-  identity: Identity
+  /** This ACCOUNT's public signing key, which is the key a safety number covers
+   *  (DESIGN 6.2). Equal to `identity.ikSig.publicKey` on a first device and
+   *  different on a linked one, where the device has a key of its own. */
+  accountIkSigPub: Uint8Array
   contacts: Contact[]
   aliases: Record<string, string>
   conversations: Record<string, Message[]>
@@ -63,6 +66,7 @@ interface Props {
     >
     createMove: (passphrase: string) => Promise<boolean>
     eraseThisDevice: () => Promise<void>
+    rotateAccount: () => Promise<string | null>
     listDevices: () => Promise<DeviceRow[]>
     removeDevice: (deviceId: string) => Promise<boolean>
     authorizeNewDevice: (codeText: string) => Promise<{ deviceId: string; secret: Uint8Array } | null>
@@ -85,7 +89,7 @@ function shortId(id: string): string {
   return `${id.slice(0, 6)}…${id.slice(-4)}`
 }
 
-export function Messenger({ identity, connected, removedPeer, contacts, aliases, conversations, notify, storagePersisted, canary, bioAvailable, lockMethods, moveExported, moveProgress, historyProgress, actions }: Props) {
+export function Messenger({ accountIkSigPub, connected, removedPeer, contacts, aliases, conversations, notify, storagePersisted, canary, bioAvailable, lockMethods, moveExported, moveProgress, historyProgress, actions }: Props) {
   const displayName = (peer: string): string => aliases[peer]?.trim() || shortId(peer)
   const [selected, setSelected] = useState<string | null>(null)
   const [chatView, setChatView] = useState<'chat' | 'verify'>('chat')
@@ -201,7 +205,7 @@ export function Messenger({ identity, connected, removedPeer, contacts, aliases,
     return (
       <div className="msgr">
         <Settings
-          identity={identity}
+          accountId={accountIdOf(accountIkSigPub)}
           notify={notify}
           storagePersisted={storagePersisted}
           canary={canary}
@@ -213,6 +217,7 @@ export function Messenger({ identity, connected, removedPeer, contacts, aliases,
           onPrepareMove={actions.prepareMove}
           onCreateMove={actions.createMove}
           onEraseDevice={actions.eraseThisDevice}
+          onRotateAccount={actions.rotateAccount}
           onListDevices={actions.listDevices}
           onRemoveDevice={actions.removeDevice}
           onAuthorizeDevice={actions.authorizeNewDevice}
@@ -301,7 +306,7 @@ export function Messenger({ identity, connected, removedPeer, contacts, aliases,
           </div>
         ) : chatView === 'verify' && selectedContact ? (
           <SafetyNumberView
-            myIkSigPub={identity.ikSig.publicKey}
+            myIkSigPub={accountIkSigPub}
             contact={selectedContact}
             name={aliases[selectedContact.peerId]?.trim() || ''}
             onVerify={() => actions.markVerified(selectedContact.peerId)}

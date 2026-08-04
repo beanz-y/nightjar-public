@@ -46,6 +46,18 @@ const snap: RatchetSnapshot = {
 
 const entry = (id: string, to: string, createdAt: number): OutboxEntry => ({ id, to, env: { k: id }, createdAt })
 
+/** A copy queued for ONE device of a multi-device peer: the entry id is a
+ *  per-copy transport id, so `contentId` and `account` are the only links back to
+ *  the logical message and the conversation. */
+const fannedEntry = (id: string, to: string, createdAt: number, contentId: string, account: string): OutboxEntry => ({
+  id,
+  to,
+  env: { k: id },
+  createdAt,
+  contentId,
+  account,
+})
+
 async function unlockedSealer(): Promise<{ sealer: SessionSealer; appLock: AppLockStore }> {
   const keys = new MemoryKeyStore()
   const lock = new InMemoryLock()
@@ -308,6 +320,47 @@ describe('session sealing at rest (P11)', () => {
     const pending = await store.pendingOutbox()
     expect(pending.entries.map((e) => e.id)).toEqual(['good']) // the good one still flushes
     expect(pending.unreadable).toEqual(['bad']) // and the bad one is reported, not dropped
+  })
+
+  it('keeps the fields a fanned copy needs to be found again', async () => {
+    // Once a message is fanned out to several devices the entry id is a per-copy
+    // TRANSPORT id, so `contentId` is the only link back to the logical message
+    // and `account` the only link to the conversation. A copy read back from disk
+    // without them cannot be cancelled by a delete, marked delivered or marked
+    // failed, because all three look the message up by (account, contentId).
+    //
+    // This goes through the real IdbSessionStore rather than a memory one on
+    // purpose: a memory store hands the same object back by reference and would
+    // pass whatever the seal did.
+    const { sealer } = await unlockedSealer()
+    const store = new IdbSessionStore()
+    store.useSealer(sealer)
+    await store.saveBookWithOutbox(
+      PEER_A,
+      singleSessionBook(snap, 1000),
+      fannedEntry('transport-1', PEER_B, 100, 'content-9', PEER_A),
+    )
+
+    const [back] = (await store.pendingOutbox()).entries
+    expect(back.id).toBe('transport-1') // the copy's own transport id
+    expect(back.to).toBe(PEER_B) // the device it is addressed to
+    expect(back.contentId).toBe('content-9') // the logical message
+    expect(back.account).toBe(PEER_A) // the conversation
+  })
+
+  it('opens a queued send from before those fields were sealed', async () => {
+    // Rows sealed by an earlier build carry neither field, and every reader falls
+    // back to the single-device meaning, so they must open cleanly rather than
+    // fail closed.
+    const { sealer } = await unlockedSealer()
+    const store = new IdbSessionStore()
+    store.useSealer(sealer)
+    await store.saveBookWithOutbox(PEER_A, singleSessionBook(snap, 1000), entry('plain', PEER_A, 100))
+
+    const [back] = (await store.pendingOutbox()).entries
+    expect(back.contentId).toBeUndefined()
+    expect(back.account).toBeUndefined()
+    expect(back.to).toBe(PEER_A)
   })
 
   it('marks an emptied store as sealed, so a wipe never leaves the marker lying', async () => {

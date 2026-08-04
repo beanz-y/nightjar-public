@@ -83,7 +83,7 @@ async function harness(peers: Identity[]) {
   let served: ReturnType<typeof signRoster> | null = null
   ;(client as unknown as { directory: unknown }).directory = {
     fetchBundle: async (target: string) => ({ bundle: bundles.get(target) ?? null }),
-    fetchRoster: async () => served,
+    fetchRosterWithRotation: async () => ({ roster: served, rotation: null }),
   }
   return {
     client,

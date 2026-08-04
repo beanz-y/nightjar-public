@@ -9,6 +9,65 @@ or the commit page on the repository host). The format is loosely based on
 [Keep a Changelog](https://keepachangelog.com/); version headings correspond to the
 release tags cut by the deploy pipeline. Dates are the tag dates.
 
+## [1.14.0] - 2026-08-03
+
+### Added
+- **You can replace your account key.** For a phone you lost, or a key whose storage you
+  no longer trust. Your contacts keep the conversation and everything in it instead of
+  meeting a stranger, your messages keep flowing to the devices you already have, and none
+  of your running conversations has to be re-established.
+- What it does not do, said plainly on the screen that offers it rather than buried here:
+  it does not lock out somebody who is *already using* your old key. They hold the same
+  key, so they can make a statement exactly as valid as yours, and nothing in it tells the
+  two apart. It is useful when the old key is gone and not in use. It is not a way to take
+  an account back from someone who has it.
+- Everyone who verified you shows as unverified afterwards and has to compare safety
+  numbers with you again, in person. That is deliberate: carrying a verification across
+  would hand it to whoever wrote the statement.
+- A contact who was offline when you did it finds out anyway. The change is announced over
+  your existing conversations, and it is also recorded so that anyone asking where to send
+  you something learns you moved in the same breath. Either way, their device checks it
+  against the key it already had for you before following it, and says so if it does not
+  add up.
+- Your other devices keep the old key and have to be added again afterwards. The account
+  key is deliberately not sent over the network for this, for the same reason adding a
+  device does not send it either.
+
+### Fixed
+- **Verifying a contact on a device you added now works at all.** It was comparing that
+  device's own key against your contact's account key, so every contact on a linked device
+  read as an active key-substitution attack, and the only way past it was to confirm a
+  comparison the app had just said did not match. The digits shown were wrong, not the
+  keys.
+- **Your code and your id, shown on a device you added, were that device's rather than
+  yours.** Anyone who scanned it got a conversation with one machine instead of with you:
+  not checkable against your safety number, and invisible to your other devices.
+- **A message you cancelled could still be sent.** For a conversation that reads on more
+  than one device, a queued message lost its link to the delete the moment it was written
+  to disk, so cancelling it before it left did nothing and the message went out anyway,
+  chased by a delete. The same missing link also stopped "sent" and "not sent" appearing
+  on those messages after a reconnect.
+- **You are now told when a contact adds their first extra device.** The alert fired for
+  the second and every later one, but not the first, which is the only shape that event
+  ever has in practice. The same gap covered your OWN account: a device appearing on it
+  that you did not add was the one case that said nothing at all.
+- **A device that fails part-way through being added no longer keeps the account key.** It
+  used to hold on to it silently and go on acting as that account afterwards, including
+  after a restore.
+- Deleting a conversation now cancels the queued messages addressed to every device the
+  other person reads on, not just the first.
+- Carrying saved messages between your devices no longer walks a message's delivery state
+  backwards or clears a failure mark, which could re-arm a resend for a message you were
+  told never left.
+- The record of which devices a contact has is now kept at the highest version this device
+  has ever accepted, and taken from what your own device signed rather than from what the
+  relay reported back.
+
+### Changed
+- A key nobody can hold (the degenerate all-zero Ed25519 key, which verifies an all-zero
+  signature) is now refused wherever a signature is checked against a key that arrived with
+  it: registering, adding a device, fetching somebody's keys, and replacing an account key.
+
 ## [1.13.1] - 2026-08-03
 
 ### Fixed

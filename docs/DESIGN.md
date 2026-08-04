@@ -504,6 +504,15 @@ holds a copy of. Two consequences, and the second one is the uncomfortable one:
   machines are they reading this on and are they all still theirs". The signal for
   that is the device-list alert (8.11), and it is a different question.
 
+Because the number is over the ACCOUNT key, every screen that renders or scans one
+must be handed the account key rather than the key of the device it is running on.
+On a first device those are the same key and the distinction is invisible; on a
+linked device they are not, and using the device key there makes every contact
+read as a key-substitution attack, which trains people to click past the one
+warning that matters. Replacing an account key (8.13) DOES change the number, by
+design: the new binding is unverified and the comparison has to be performed
+again, in person.
+
 **Verification never syncs, deliberately.** Each device verifies for itself: a
 device you add starts with every contact UNVERIFIED and the comparison is redone
 there. Unlike Signal, nothing remote can mark a contact verified, not even another
@@ -1436,6 +1445,65 @@ Honest limits:
   moment it is done. Nothing keeps them aligned afterwards, and messages from
   before a device was added still exist only where they were received.
 
+### 8.13 Replacing an account key (rotation)
+
+An account id IS `base32(SHA-256(account key))` (section 3), so a new key is a new
+id, and a new id is a stranger to everybody. Rotation is the one statement that
+carries a relationship across that gap: the OLD account key says "the account you
+know as X is now Y", and the NEW key signs the same bytes back.
+
+**What it is for, stated before what it does.** It helps when the old key is GONE
+but not in use: a phone that was lost or handed on, storage you no longer trust.
+It does **not** beat an attacker who is actively USING the old key. They hold the
+same key, so they can sign a competing rotation that is exactly as valid, and
+nothing in the bytes tells the two apart. Rotation preserves the RELATIONSHIP; it
+never preserves the TRUST, and any screen that offers it has to say so rather than
+letting it read as "revoke a stolen device", which it is not.
+
+**Two signatures, and the second is load-bearing.** The old key attests the new
+one, which is the continuity. The new key counter-signs to prove somebody holds
+its private half. Without that, a statement could name a key its author does not
+own: Mallory rotates "to" a contact's published account key, and every one of
+Mallory's contacts re-files that conversation under the victim's id, inheriting
+whatever trust and safety number the victim had earned. The counter-signature is
+what makes that unproducible rather than merely unlikely.
+
+**The Directory's part, which is not authority.** It RECORDS the successor, which
+is what lets a rotated account publish a device list at all (the new id belongs to
+no device, so without the record there is no key to verify a roster against), and
+it SERVES the statement to anyone who asks about the old id, so a contact who was
+offline can catch up. It refuses a second, different successor for one account, a
+rotation into an account that has itself rotated away, and more than
+`MAX_ROTATION_CHAIN` hops from the registered account it began as. All of that is
+LIVENESS, not security: a hostile operator owns this code. The binding defence is
+that every client verifies each hop under the key it already holds, and that the
+new binding is unverified until a human re-checks it.
+
+**What moves on the receiving side.** Saved messages, the contact record, the name
+you gave them, a dismissal and the retry throttle. Sessions deliberately do NOT:
+they are keyed by DEVICE, and a rotation changes the account key rather than the
+devices, so every running ratchet keeps working and nobody re-establishes
+anything. Trust never moves.
+
+Honest limits:
+
+- **Your own other devices do not follow it.** They hold the retired key and
+  cannot act for the account afterwards, so they have to be added again. The
+  account private key is deliberately not distributed over the relay for the same
+  reason the link ceremony refuses to (section 8.11): a 30-day queue is the wrong
+  place for it.
+- **Tombstones cannot move.** They are opaque HMACs with no stored preimage, so a
+  message deleted BEFORE a contact rotated is no longer protected from being
+  re-imported by a later saved-message transfer (8.12).
+- **A message queued across a rotation keeps the old conversation label.** The
+  only writer for a queued send is the atomic save that commits a ratchet advance
+  with it, and relabelling one would put a second writer on the most
+  safety-critical write in the app. Delivery is unaffected; only the delivery
+  indicator degrades, in the direction of showing less.
+- **An interrupted follow leaves the person as two threads** until the next
+  connect finishes it. The marker that makes that recoverable is written before
+  the first row moves and cleared after the last.
+
 ---
 
 ## 9. Metadata: the complete leak list and our honest posture
@@ -1472,6 +1540,14 @@ An operator who chooses to log, or anyone who can compel us, can learn:
   who might send to that account, so this is unavoidable rather than a choice: a
   sender cannot deliver to a device it is not allowed to learn about. It carries
   no device names for the same reason. No account publishes one yet.
+- **That an account replaced its key, and which id it became** (8.13). The
+  Directory records the forwarding pointer and serves it to anyone who asks about
+  the old id, so the old and new identities are publicly linkable, along with the
+  time it happened. That is deliberate rather than incidental: a contact who was
+  offline when it happened has no other way to find out, and the alternative
+  (telling nobody) means a rotated account quietly loses the people it could not
+  reach. The operator already sees the same event as traffic, so this retains a
+  link it could otherwise have inferred.
 - **A recovery in progress** (8.10). A retry-request is a distinctively small
   envelope, and honoring one produces a burst of same-sized-ish envelopes back to
   the requester shortly after, all marked do-not-notify. The operator cannot read
@@ -1936,6 +2012,7 @@ Native (Tauri) is **not** on the critical path; it is a demand-gated v2 (10.5).
 | Device link transfer | `NJLK` ‖ version ‖ transfer id (16 B) ‖ index ‖ count ‖ per-chunk salt (16 B) ‖ AEAD, header as AAD, key+nonce = HKDF(scanned secret, salt, `"Nightjar_Link_v1"`). Each chunk sealed INDEPENDENTLY, so reorder/duplicate/drop can only fail to complete, and splicing two transfers is refused (the transfer id is in the AAD). Chunk size is a property of the TRANSPORT: the relay path cuts at 32 KiB to stay inside its envelope cap, the optical path seals ONE unit. Carries the account key, contacts and nicknames, and **no trust field at all** (6.2). Relay delivery is LIVE-ONLY and never queued (an account key must not sit in a 30-day mail queue); the sender must be registered, the recipient need not be | 8.11 |
 | Saved-messages transfer | code `NJHC` ‖ version ‖ device signing key (32 B) ‖ fresh secret (32 B), shown by the device that WANTS the messages; a DIFFERENT magic from the linking code so the two ceremonies cannot be crossed by a camera that cannot tell them apart. Envelope `NJHT` ‖ version ‖ salt (16 B) ‖ AEAD, header as AAD, key+nonce = HKDF(scanned secret, salt, `"Nightjar_HistoryXfer_v1"`), sealed as ONE piece (the fountain layer splits it). Payload is the Phase D portable history unit (8.3) plus the sending account's id. `HISTORY_XFER_MAX_BYTES` = 512 KiB, which is a TIME budget (~5 KB/s optically) wearing a size's clothes: over it the app offers a shorter span rather than truncating, since a truncated history arrives looking complete. **Optical only, no relay path at all.** Sender checks the destination is on its own device list; receiver checks the transfer names its own account, refuses to resurrect a message it holds a delete tombstone for, and drops rows whose peer it holds no contact for. Merges by (peer, dir, content id), so running it twice changes nothing | 8.12 |
 | Optical stream | fountain-coded frames as base64url TEXT in QR version 40 at EC level L (~2.1 KB payload per frame). Frames MUST be text: a camera-side decoder returns a string, and the native `BarcodeDetector` exposes only `rawValue` read as UTF-8, so binary would survive the pure-JS fallback and be mangled on the fast native path. Frames `0..K-1` ARE the raw blocks (a clean capture costs exactly K), later frames are XORs of a subset derived from `sha256(transferId ‖ seq)` so both sides agree with nothing shared but the header, and roughly one frame in eight covers a SINGLE block (belief propagation cannot start without one, so a receiver joining late could otherwise never decode). NO cryptography in this layer: it carries already-sealed bytes, so a wrong reassembly simply fails the AEAD above it | 8.11 |
+| Account-key rotation | statement = `TAG_ROTATION` ‖ old accountId ‖ new accountId ‖ new account key (32 B) ‖ `rotatedAt`, length-framed and canonical like every other signed blob here, signed by the OLD account key and **counter-signed by the NEW one**. The counter-signature is the proof of possession that stops a statement naming a key its author does not hold (which would drag a contact list onto somebody else's identity). Both keys are checked to be non-small-order: an all-zero Ed25519 key verifies an all-zero signature, so a degenerate successor would be an account anybody could sign for. The Directory records the FIRST valid rotation per account (a second, different successor is refused), refuses rotating into an account that has itself rotated away (that would close the chain into a cycle) and caps `MAX_ROTATION_CHAIN` = 8 hops from the registered account, which also bounds what one invite can make it store. A rotated account's old device list is frozen: still served, no longer changed, and `registerDevice` refuses it too. All of that is liveness; the binding defence is per-client verification under a key already held, and the new binding is UNVERIFIED regardless of what the old one was | 8.13 |
 | Version octet | starts at `0x01` (classical X25519) | 4.4 |
 | Reproducible build inputs | digest-pinned container (Node + OS + arch), committed lockfile (`npm ci`), no build-time dynamic values (`__APP_VERSION__` injected, never a clock). *`SOURCE_DATE_EPOCH`/`strip-nondeterminism` are inert here (vite emits no timestamps; the manifest hashes content only) and kept only as documented no-ops* | 10.1, P7 |
 | Release hash | `sha256(manifest.txt)`; `manifest.txt` = each `dist/` file as `<sha256-hex>  <relpath>\n`, byte-sorted, LF (one recipe: `scripts/release-hash.mjs` == the pure-shell pipeline). Hashes the **build output**, so the honest claim is "rebuild and diff", not "diff the served bytes" | 10.1, P7 |

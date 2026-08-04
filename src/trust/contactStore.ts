@@ -69,6 +69,9 @@ const RETRY_KEY = 'contacts.retry.v1'
 /** Known device rosters, per account (Sesame). Sealed like the others: it is a
  *  list of which contacts have how many devices. */
 const ROSTERS_KEY = 'contacts.rosters.v1'
+/** Account renames (rotation) that are in progress. Sealed with the rest: it is a
+ *  list of who this device talks to, in two forms. */
+const RENAME_KEY = 'contacts.renames.v1'
 /** Peers owed a session-refresh ping after a move (Phase D, 8.3), drained by the
  *  client once the post-move re-registration succeeds. Durable so a crash between
  *  the move and the first connect cannot lose the list.
@@ -563,7 +566,16 @@ export class ContactStore {
   }
 
   /** Record an accepted roster. The caller has already verified the signature and
-   *  checked the version against `getKnownRoster`; this only stores the result. */
+   *  checked the version against `getKnownRoster`.
+   *
+   *  The stored version is CLAMPED to the highest ever seen, which is what makes
+   *  the field the monotonic mark its type says it is rather than a promise the
+   *  callers have to keep. Two ways it was not: the caller's check-then-write
+   *  straddles a network round trip, so two overlapping resolves can land out of
+   *  order; and the self-account writers store a version the RELAY reported back
+   *  from a publish. Neither can now lower the mark. A LOWER version arriving
+   *  with a different device list is refused wholesale rather than half-applied,
+   *  since a rolled-back list is exactly what the mark exists to catch. */
   async putKnownRoster(accountId: string, roster: KnownRoster): Promise<void> {
     await this.lock.withLock(CONTACTS_LOCK, async () => {
       let readOk = true
@@ -573,6 +585,8 @@ export class ContactStore {
       } catch {
         readOk = false
       }
+      const known = map[accountId]
+      if (known && roster.version < known.version) return
       map[accountId] = { version: roster.version, devices: [...roster.devices] }
       if (Object.keys(map).length === 0) {
         if (readOk) await this.store.delete(ROSTERS_KEY)
@@ -827,6 +841,152 @@ export class ContactStore {
       if (kept.length === 0) await this.store.delete(ALIASES_KEY)
       else await this.putSealed(ALIASES_KEY, ALIASES_KEY, encoder.encode(JSON.stringify(Object.fromEntries(kept))))
     })
+  }
+
+  /**
+   * Move everything filed under one account id to another (account-key rotation).
+   *
+   * A rotated contact is the SAME PERSON with a new account id, and this is what
+   * makes that true of the stored state rather than merely of the protocol: the
+   * contact record, the name you gave them, a dismissal, the retry throttle and
+   * the device list all move across together. Sessions deliberately do NOT: they
+   * are keyed by DEVICE, and a rotation changes the account key, not the devices,
+   * so the ratchets keep running untouched. Saved messages are handled separately
+   * (they are sealed under per-row keys, so moving them is a batched re-seal).
+   *
+   * TRUST IS NOT CARRIED. The new binding lands as 'unverified' no matter what
+   * the old one was, and the caller must say so out loud. Rotation preserves the
+   * relationship; it never preserves the verification, because an attacker
+   * holding the old key can sign a rotation exactly as validly as the owner can.
+   * Carrying a verified badge across would hand that attacker the badge.
+   *
+   * Refuses to overwrite: if `newId` is already a contact, this does nothing and
+   * returns false, because merging two conversations is a decision for the user
+   * rather than something to do silently underneath them.
+   */
+  async renameAccount(oldId: string, newId: string, newIkSig: string): Promise<boolean> {
+    if (oldId === newId) return false
+    // The binding, checked here as well as by the caller's signature check: an id
+    // IS the hash of its key, so a rename that does not satisfy it is nonsense.
+    try {
+      if (accountIdOf(b64decode(newIkSig, 32)) !== newId) return false
+    } catch {
+      return false
+    }
+    return this.lock.withLock(CONTACTS_LOCK, async () => {
+      const map = await this.read()
+      const old = map[oldId]
+      if (!old || map[newId]) return false
+      map[newId] = { peerId: newId, ikSig: newIkSig, trust: 'unverified', firstSeen: old.firstSeen, verifiedAt: null }
+      delete map[oldId]
+      await this.write(map)
+
+      // The small per-account maps. Each is read, re-keyed and written back only
+      // if it actually held something for the old id, so a rotation never
+      // rewrites blobs it has no business touching.
+      await this.moveKeyed(ALIASES_KEY, oldId, newId)
+      await this.moveKeyed(DISMISSED_KEY, oldId, newId)
+      await this.moveKeyed(RETRY_KEY, oldId, newId)
+      // The device list does NOT move: it belongs to the old account key, which
+      // signed it, and the new account has to publish its own. Dropping it also
+      // resets the rollback high-water mark, which is correct: the new account's
+      // versions start again at 1 and are not comparable with the old ones.
+      await this.dropKeyed(ROSTERS_KEY, oldId)
+      // A pending post-move refresh still owes this person a ping; it is a list
+      // of ids, not a map, so it is rewritten in place.
+      await this.renameInList(MOVE_REFRESH_KEY, oldId, newId)
+      return true
+    })
+  }
+
+  /**
+   * Renames that have started but not finished, so one that is interrupted can be
+   * picked up again rather than leaving a person split across two ids forever.
+   *
+   * Written BEFORE any row moves and cleared only after the last one, which makes
+   * an interruption recoverable in the one direction that matters: a resume can
+   * always finish, and re-running a finished step is a no-op because a row that
+   * already moved is no longer at the old key.
+   */
+  async setPendingRename(oldId: string, to: { newId: string; ikSig: string }): Promise<void> {
+    await this.lock.withLock(CONTACTS_LOCK, async () => {
+      const map = await this.loadPendingRenames()
+      map[oldId] = to
+      await this.putSealed(RENAME_KEY, RENAME_KEY, encoder.encode(JSON.stringify(map)))
+    })
+  }
+
+  async clearPendingRename(oldId: string): Promise<void> {
+    await this.lock.withLock(CONTACTS_LOCK, async () => {
+      const map = await this.loadPendingRenames()
+      if (!(oldId in map)) return
+      delete map[oldId]
+      if (Object.keys(map).length === 0) await this.store.delete(RENAME_KEY)
+      else await this.putSealed(RENAME_KEY, RENAME_KEY, encoder.encode(JSON.stringify(map)))
+    })
+  }
+
+  /** Fail-CLOSED to "none pending": an unreadable blob must not make a caller
+   *  believe a rename is outstanding and re-run it against unknown ids. */
+  async pendingRenames(): Promise<Record<string, { newId: string; ikSig: string }>> {
+    try {
+      return await this.loadPendingRenames()
+    } catch {
+      return {}
+    }
+  }
+
+  private async loadPendingRenames(): Promise<Record<string, { newId: string; ikSig: string }>> {
+    const bytes = await this.getSealed(RENAME_KEY, RENAME_KEY)
+    if (!bytes) return {}
+    const m = JSON.parse(decoder.decode(bytes)) as Record<string, { newId: string; ikSig: string }>
+    const out: Record<string, { newId: string; ikSig: string }> = {}
+    for (const [k, v] of Object.entries(m)) {
+      if (typeof v?.newId === 'string' && typeof v?.ikSig === 'string') out[k] = { newId: v.newId, ikSig: v.ikSig }
+    }
+    return out
+  }
+
+  /** Move one entry of a sealed `Record<string, unknown>` blob to a new key. */
+  private async moveKeyed(blobKey: string, oldId: string, newId: string): Promise<void> {
+    try {
+      const bytes = await this.getSealed(blobKey, blobKey)
+      if (!bytes) return
+      const map = JSON.parse(decoder.decode(bytes)) as Record<string, unknown>
+      if (!(oldId in map)) return
+      if (!(newId in map)) map[newId] = map[oldId]
+      delete map[oldId]
+      await this.putSealed(blobKey, blobKey, encoder.encode(JSON.stringify(map)))
+    } catch {
+      /* an unreadable side blob must not stop the rename that matters */
+    }
+  }
+
+  private async dropKeyed(blobKey: string, oldId: string): Promise<void> {
+    try {
+      const bytes = await this.getSealed(blobKey, blobKey)
+      if (!bytes) return
+      const map = JSON.parse(decoder.decode(bytes)) as Record<string, unknown>
+      if (!(oldId in map)) return
+      delete map[oldId]
+      if (Object.keys(map).length === 0) await this.store.delete(blobKey)
+      else await this.putSealed(blobKey, blobKey, encoder.encode(JSON.stringify(map)))
+    } catch {
+      /* as above */
+    }
+  }
+
+  private async renameInList(blobKey: string, oldId: string, newId: string): Promise<void> {
+    try {
+      const bytes = await this.getSealed(blobKey, blobKey)
+      if (!bytes) return
+      const list = JSON.parse(decoder.decode(bytes)) as string[]
+      if (!Array.isArray(list) || !list.includes(oldId)) return
+      const next = [...new Set(list.map((p) => (p === oldId ? newId : p)))]
+      await this.putSealed(blobKey, blobKey, encoder.encode(JSON.stringify(next)))
+    } catch {
+      /* as above */
+    }
   }
 
   /** The user completed the out-of-band safety-number check (6.2): this userId is

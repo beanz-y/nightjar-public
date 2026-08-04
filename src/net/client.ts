@@ -15,8 +15,9 @@
 
 import { bytesToHex, hexToBytes } from '@noble/hashes/utils.js'
 import { type Identity, accountIdOf, deriveUserId, deviceIdOf } from '../crypto/identity'
-import type { KeyPair } from '../crypto/primitives'
+import { type KeyPair, ed25519Generate } from '../crypto/primitives'
 import { type RosterDevice, isRosterNewer, rosterDeviceIds, rosterDiff, signRoster, verifyRoster } from '../crypto/roster'
+import { type RotationStatement, signRotation, verifyRotation } from '../crypto/rotation'
 import { type AccountIdentity, accountIdentityOf } from '../trust/accountIdentity'
 import { type LinkPayload, openLink, readLinkChunkHeader, sealLink } from '../crypto/link'
 import type { PushSubscriptionInfo } from '../platform'
@@ -26,6 +27,7 @@ import {
   encodeHelloMessage,
   encodeRefreshMessage,
   encodeRetryRequest,
+  encodeRotationMessage,
   encodeSyncDeleteMessage,
   encodeSyncRecvDeleteMessage,
   encodeSyncRecvMessage,
@@ -72,6 +74,7 @@ import {
   decodeEnvelope,
   encodeInitialHeader,
   encodeDeviceRoster,
+  encodeRotationStatement,
   encodeMessageHeaderWire,
   encodeOneTimePrekey,
   encodePublishedBundle,
@@ -184,11 +187,17 @@ export interface ClientCallbacks {
    *  `accountId` is who it was sent TO; the message is yours, not theirs. */
   onSyncedSent?: (accountId: string, msg: { id: string; text: string; ts: number }) => void
   /** Optional (Sesame): the set of devices an account claims has changed since
-   *  this device last looked. Fired only when something actually differs, never on
-   *  a first sighting, because a first sighting differs from nothing. An operator
-   *  cannot cause this, so it is the signal that distinguishes a link the person
-   *  really made from something that already holds their account key. */
-  onDevicesChanged?: (accountId: string, change: { added: string[]; removed: string[] }) => void
+   *  this device last looked, measured against the single device we addressed them
+   *  as before any list existed. An operator cannot cause this, so it is the signal
+   *  that distinguishes a link the person really made from something that already
+   *  holds their account key.
+   *
+   *  `first` marks the first list ever seen for that account, which is a real event
+   *  (their first extra device) but reads differently for somebody just added, so
+   *  the wording is the UI's to choose. It is NOT a reason to stay quiet: for your
+   *  OWN account a first list you did not publish is what a stolen account key
+   *  produces, and it used to be the one case that was silent. */
+  onDevicesChanged?: (accountId: string, change: { added: string[]; removed: string[]; first: boolean }) => void
   /** Optional (8.10): this device honored a resend request from `peerId` and sent
    *  `count` of its own recent messages again. NEVER silent: it is the only signal
    *  the user gets that someone holding their contact's identity pulled recent
@@ -282,9 +291,14 @@ export class NightjarClient {
   }
 
   /** Adopt an account key after linking, so the rest of this session signs and
-   *  resolves as the account rather than as a device of one. */
-  setAccountKey(pair: KeyPair): void {
-    this.accountKeyPair = pair
+   *  resolves as the account rather than as a device of one.
+   *
+   *  Passing null puts it back to being its own account, which is what a link
+   *  that FAILED after the key was staged has to do: an adopted key is preferred
+   *  over this device's own everywhere (see `account`), so a half-linked device
+   *  that kept one would go on acting as an account it never joined. */
+  setAccountKey(pair: KeyPair | null): void {
+    this.accountKeyPair = pair ?? undefined
   }
 
   get userId(): string {
@@ -1314,7 +1328,15 @@ export class NightjarClient {
       // nobody, so it is neither cancelled nor counted here, exactly as an
       // unopenable history row is not counted as deleted.
       for (const e of (await this.store.pendingOutbox()).entries) {
-        if (e.to === peer) {
+        // Match the CONVERSATION, not the routing label. Once a message is fanned
+        // out, each copy is addressed to one of the peer's devices, so `to` is a
+        // device id and only `account` names the conversation. Matching on `to`
+        // alone left every copy but the first queued, and the next flush sent
+        // them to a conversation the user had just deleted. `account` is written
+        // only in the multi-device case and always names the conversation, so
+        // this cannot over-match; it is the same rule `deleteForEveryone` and
+        // `fire` already use.
+        if (e.to === peer || e.account === peer) {
           await this.store.removeOutbox(e.id).catch(() => {})
           cancelled++
         }
@@ -1951,6 +1973,14 @@ export class NightjarClient {
     }
     const contacts = new Set((await this.contacts.list()).map((c) => c.peerId))
     const tombstoned = new Set(await this.store.tombstoneKeys())
+    // What this device already holds, so an incoming row can ADD to a message
+    // rather than overwrite it. Merge-not-replace holds per ROW below; without
+    // this it did not hold per FIELD, and the sending device is often the LESS
+    // informed one: it may have queued a copy this device has since seen
+    // delivered, or never learned that a send failed here. Overwriting walked
+    // the delivery status backwards and cleared a `failed` flag, which re-arms a
+    // resend for a message the user was told never left.
+    const prior = new Map((await this.store.historyLoadAll()).map((r) => [r.key, r]))
     let imported = 0
     let skippedUnknownPeer = 0
     let skippedDeleted = 0
@@ -1983,11 +2013,286 @@ export class NightjarClient {
       }
       const msg: HistoryMessage = { id: m.id, peerId: m.peer, dir: m.dir, ts: m.ts, text: m.text }
       if (m.status) msg.status = m.status
-      batch.push(history.seal(msg, m.failed))
+      let failed = m.failed
+      const had = prior.get(key)
+      if (had) {
+        // Keep whichever side knows more. `failed` is sticky because only this
+        // device can know its own send failed, and the status follows the same
+        // monotonic rule markDelivery uses: 'delivered' is never walked back, and
+        // a row that reached a state here is not reset by a copy that predates it.
+        if (had.failed) failed = true
+        try {
+          const local = history.open(had)
+          if (local.status === 'delivered' || (local.status && !msg.status)) msg.status = local.status
+        } catch {
+          /* an unopenable local row tells us nothing; take the incoming one */
+        }
+      }
+      batch.push(history.seal(msg, failed))
       if (batch.length >= HISTORY_IMPORT_BATCH) await flush()
     }
     await flush()
     return { imported, skippedUnknownPeer, skippedDeleted }
+  }
+
+  // --- following a contact's account-key rotation ---------------------------
+  //
+  // A rotation gives one person a new account id. Everything filed under the old
+  // one has to move, or "rotation preserves the relationship" is a claim about
+  // the protocol that the stored state does not honor: the conversation would
+  // split into a dead half and a live half with nothing saying they are the same
+  // person.
+  //
+  // What moves and what does not, and why:
+  //   - saved messages move, which is the expensive part: their storage key is an
+  //     HMAC over the peer id and their AAD binds that key, so every row is
+  //     re-sealed rather than relabelled;
+  //   - the contact record, the name you gave them, a dismissal and the retry
+  //     throttle move (contactStore.renameAccount);
+  //   - SESSIONS DO NOT MOVE, and that is the good news: they are keyed by DEVICE,
+  //     and a rotation changes the account key, not the devices, so every running
+  //     ratchet keeps working and nobody re-establishes anything;
+  //   - TOMBSTONES CANNOT MOVE. They are opaque HMACs with no stored preimage, so
+  //     there is nothing to recompute a new key from. The honest consequence is
+  //     narrow and worth stating: a message you deleted BEFORE this contact
+  //     rotated is no longer protected from being re-imported by a later history
+  //     transfer from another of your devices.
+  //
+  // Interruption is survivable rather than prevented. A pending-rename marker is
+  // written first and cleared last, so a resume finishes the job; re-running a
+  // completed step is a no-op because a row that already moved is not at the old
+  // key any more. While a rename is half done the person shows as two threads,
+  // which the resume collapses.
+
+  /**
+   * Replace this account's key, keeping the relationships.
+   *
+   * What this is FOR: a key that is gone but not in use. A phone that was lost or
+   * handed on, storage you no longer trust. Contacts keep the conversation, the
+   * history and the name they gave you instead of meeting a stranger.
+   *
+   * What it does NOT do, and the UI must say so in these words: it does not beat
+   * somebody who is ACTIVELY USING the old key. They hold it too, so they can
+   * sign a competing rotation that is exactly as valid as this one, and nothing
+   * in the bytes tells the two apart. Every contact lands on the new key as
+   * UNVERIFIED and has to re-compare safety numbers in person. Rotation preserves
+   * the relationship; it never preserves the trust.
+   *
+   * The order is the whole safety argument. The Directory records the successor
+   * FIRST, because a rotated account cannot publish a device list until it does
+   * (its id belongs to no device, so there is no key to verify a roster against),
+   * and only then is the new list published. If anything after the first step
+   * fails, the rotation is already durable and the caller can simply run this
+   * again: publishRotation is idempotent for the same successor, and refuses a
+   * DIFFERENT one, so a retry can never fork the account.
+   */
+  async rotateAccount(onProgress?: (step: string) => void): Promise<{ accountId: string }> {
+    const me = this.account
+    const next = ed25519Generate()
+    const statement = signRotation(me.accountId, me.accountKey.privateKey, next, Date.now())
+
+    onProgress?.('recording the change')
+    await this.directory.publishRotation(encodeRotationStatement(statement))
+
+    // The device list, republished under the new account id. Same devices: a
+    // rotation changes who the account IS, not what it reads on, which is why
+    // every running session survives it untouched.
+    onProgress?.('republishing your devices')
+    const current = await this.directory.fetchRoster(me.accountId).catch(() => null)
+    const devices: RosterDevice[] = current
+      ? current.devices.map((d) => ({ deviceId: d.deviceId, dkSigPub: d.dkSigPub, addedAt: d.addedAt }))
+      : [{ deviceId: this.deviceId, dkSigPub: this.identity.ikSig.publicKey, addedAt: Date.now() }]
+    const roster = signRoster(statement.newAccountId, 1, devices, next.privateKey)
+    await this.directory.publishRoster(encodeDeviceRoster(roster))
+
+    // Adopt it locally only after the relay has both halves, so a device that
+    // fails part-way through is still the old account and retries cleanly.
+    this.accountKeyPair = next
+    await this.contacts
+      .putKnownRoster(statement.newAccountId, { version: 1, devices: devices.map((d) => d.deviceId) })
+      .catch(() => {})
+
+    // Tell everyone. Contacts need it to keep talking to us; our OWN devices need
+    // it because they hold the retired key and would otherwise go on signing and
+    // announcing as an account that has moved.
+    onProgress?.('telling your contacts')
+    const plaintext = encodeRotationMessage(newMsgId(), statement)
+    const peers = await this.contacts.list().catch(() => [])
+    for (const c of peers) {
+      await this.sendControlTo(c.peerId, plaintext).catch(() => {})
+    }
+    for (const deviceId of devices) {
+      if (deviceId.deviceId === this.deviceId) continue
+      await this.sendControlTo(deviceId.deviceId, plaintext).catch(() => {})
+    }
+    return { accountId: statement.newAccountId }
+  }
+
+  /** Queue one control message to every device of `peer`, on the current session.
+   *  Best-effort per device: a rotation that reaches three of a contact's four
+   *  devices is still worth sending, and the Directory pointer covers the rest. */
+  private async sendControlTo(peer: string, plaintext: Uint8Array): Promise<void> {
+    const devices = await this.resolveDevices(peer).catch(() => [peer])
+    for (const deviceId of devices) {
+      const entry = await this.queueControl(deviceId, plaintext).catch(() => null)
+      if (entry) this.fire(entry)
+    }
+  }
+
+  /**
+   * The Directory says this account moved. Verify that under the key we hold and,
+   * if it is theirs, follow it. Returns the new account id, or null.
+   *
+   * This is the same check `handleRotation` runs, deliberately: a pointer served
+   * by the relay is worth exactly as much as one announced over a session, which
+   * is nothing until it verifies under a key this device already holds. The relay
+   * is the untrusted party in both cases, and the signature is what settles it.
+   */
+  private async followRotation(oldId: string, st: RotationStatement): Promise<string | null> {
+    if (st.oldAccountId !== oldId) return null
+    const contact = await this.contacts.get(oldId).catch(() => null)
+    if (!contact) return null // nobody we hold a key for: nothing to verify against
+    try {
+      verifyRotation(st, b64decode(contact.ikSig, 32), Date.now())
+    } catch {
+      // A pointer that does not verify is the relay saying something false about
+      // somebody, which is worth telling the user about rather than swallowing.
+      this.cb.onSecurity?.(
+        `the relay said ${oldId.slice(0, 12)}… changed their account key, but the statement did not verify as ` +
+          `theirs. It was ignored.`,
+      )
+      return null
+    }
+    await this.applyRotation(st.oldAccountId, st.newAccountId, b64encode(st.newAccountKey))
+    this.cb.onSecurity?.(
+      `${st.oldAccountId.slice(0, 12)}… changed their account key and is now ${st.newAccountId.slice(0, 12)}…. ` +
+        `Your conversation moved with them, but the new key is UNVERIFIED: compare safety numbers with them in ` +
+        `person before sending anything sensitive. A stolen key can sign this too.`,
+    )
+    return st.newAccountId
+  }
+
+  /**
+   * A contact says their account key changed. Check it, then follow it.
+   *
+   * Three things have to hold before anything moves, and each closes a different
+   * way of being moved somewhere you did not agree to go:
+   *
+   *   1. the statement must be ABOUT the account this message came from, so a
+   *      contact cannot announce a rotation on somebody else's behalf;
+   *   2. it must verify under the account key THIS DEVICE ALREADY HOLDS for them,
+   *      never one that arrived with the message, which is the same rule the
+   *      Directory and the roster follow;
+   *   3. the successor must not already be a contact, because merging two
+   *      conversations is the user's decision (renameAccount refuses it).
+   *
+   * Then it is applied and the user is TOLD, every time, with the honest framing:
+   * their new binding is unverified, and it has to be re-checked in person. An
+   * attacker holding the old key can sign a rotation exactly as validly as the
+   * owner, so this notice is not decoration, it is the whole defence.
+   */
+  private async handleRotation(fromAccount: string, st: RotationStatement): Promise<void> {
+    try {
+      if (st.oldAccountId !== fromAccount) {
+        this.cb.onSecurity?.(
+          `${fromAccount.slice(0, 12)}… sent a key change for a different account (${st.oldAccountId.slice(0, 12)}…). ` +
+            `It was ignored.`,
+        )
+        return
+      }
+      const contact = await this.contacts.get(fromAccount)
+      if (!contact) return // nobody we hold a key for: nothing to verify against
+      try {
+        verifyRotation(st, b64decode(contact.ikSig, 32), Date.now())
+      } catch (e) {
+        this.cb.onSecurity?.(
+          `a key change claimed for ${fromAccount.slice(0, 12)}… did not verify as theirs (${
+            e instanceof Error ? e.message : String(e)
+          }). It was ignored, and messages keep going to the account you already had.`,
+        )
+        return
+      }
+      const applied = await this.applyRotation(st.oldAccountId, st.newAccountId, b64encode(st.newAccountKey))
+      if (applied.moved >= 0) {
+        this.cb.onSecurity?.(
+          `${st.oldAccountId.slice(0, 12)}… changed their account key and is now ${st.newAccountId.slice(0, 12)}…. ` +
+            `Your conversation moved with them, but the new key is UNVERIFIED: compare safety numbers with them in ` +
+            `person before sending anything sensitive. A stolen key can sign this too.`,
+        )
+      }
+    } catch {
+      /* best-effort: a failure here leaves the conversation exactly where it was */
+    }
+  }
+
+  /**
+   * Re-file everything this device holds for `oldId` under `newId`.
+   *
+   * The CALLER is responsible for having verified the rotation statement under
+   * the account key it already holds for `oldId`. This method does not verify
+   * anything: it is the storage half, and it will happily move a conversation
+   * anywhere it is told to, which is exactly why nothing may call it without a
+   * checked signature behind it.
+   */
+  async applyRotation(oldId: string, newId: string, newIkSig: string, onProgress?: (done: number, total: number) => void): Promise<{ moved: number }> {
+    await this.contacts.setPendingRename(oldId, { newId, ikSig: newIkSig })
+    const moved = await this.renameHistory(oldId, newId, onProgress)
+    await this.contacts.renameAccount(oldId, newId, newIkSig)
+    // A message QUEUED across the rotation keeps the old conversation label. It
+    // is deliberately left alone: the only writer for an outbox row is the
+    // atomic save that commits a ratchet advance with it, and widening that API
+    // to relabel a queue entry would put a second writer on the most
+    // safety-critical write in the app. The row is still addressed to a DEVICE,
+    // which a rotation does not change, so the message is delivered normally and
+    // the row is removed on ack. What is left stale is the label a delivery
+    // indicator uses, and it fails the way indicators already fail (silently, in
+    // the direction of showing less).
+    await this.contacts.clearPendingRename(oldId)
+    return { moved }
+  }
+
+  /** Finish any rename that was interrupted. Called on connect, where a resumed
+   *  device is already doing other catch-up work. */
+  async resumePendingRenames(): Promise<void> {
+    const pending = await this.contacts.pendingRenames()
+    for (const [oldId, to] of Object.entries(pending)) {
+      try {
+        await this.applyRotation(oldId, to.newId, to.ikSig)
+      } catch {
+        /* left pending on purpose: the next connect tries again */
+      }
+    }
+  }
+
+  /** Re-seal every saved message for `oldId` under `newId`. Batched, and each row
+   *  is written at its new key BEFORE the old one is removed, so an interruption
+   *  can only duplicate a row (which the next load dedups by content id), never
+   *  lose one. */
+  private async renameHistory(oldId: string, newId: string, onProgress?: (done: number, total: number) => void): Promise<number> {
+    const history = this.history
+    if (!history) return 0
+    return this.lock.withLock(sessionLock(oldId), async () => {
+      const rows = await this.store.historyLoadAll()
+      const mine: Array<{ rec: HistoryRecord; msg: HistoryMessage }> = []
+      for (const rec of rows) {
+        try {
+          const msg = history.open(rec)
+          if (msg.peerId === oldId) mine.push({ rec, msg })
+        } catch {
+          /* an unopenable row names nobody, so it belongs to no rename */
+        }
+      }
+      let done = 0
+      for (let i = 0; i < mine.length; i += HISTORY_IMPORT_BATCH) {
+        const slice = mine.slice(i, i + HISTORY_IMPORT_BATCH)
+        await this.store.historyPutMany(slice.map(({ rec, msg }) => history.seal({ ...msg, peerId: newId }, rec.failed)))
+        for (const { rec } of slice) await this.store.historyRemove(rec.key).catch(() => {})
+        done += slice.length
+        onProgress?.(done, mine.length)
+        await new Promise((r) => setTimeout(r, 0))
+      }
+      return mine.length
+    })
   }
 
   /**
@@ -2046,10 +2351,12 @@ export class NightjarClient {
       .filter((d) => d.deviceId !== deviceId)
       .map((d) => ({ deviceId: d.deviceId, dkSigPub: d.dkSigPub, addedAt: d.addedAt }))
     if (devices.length === current.devices.length) throw new Error('that device is not on this account')
-    const roster = signRoster(me.accountId, current.version + 1, devices, me.accountKey.privateKey)
+    const version = current.version + 1
+    const roster = signRoster(me.accountId, version, devices, me.accountKey.privateKey)
     const published = await this.directory.publishRoster(encodeDeviceRoster(roster))
+    // The version we SIGNED, not the one the relay echoed (see authorizeDevice).
     await this.contacts
-      .putKnownRoster(me.accountId, { version: published, devices: devices.map((d) => d.deviceId) })
+      .putKnownRoster(me.accountId, { version, devices: devices.map((d) => d.deviceId) })
       .catch(() => {})
     return published
   }
@@ -2136,9 +2443,13 @@ export class NightjarClient {
     const version = (current?.version ?? 0) + 1
     const roster = signRoster(me.accountId, version, devices, me.accountKey.privateKey)
     const published = await this.directory.publishRoster(encodeDeviceRoster(roster))
-    // Our own view of our own devices, so a later resolve does not read as a change.
+    // Our own view of our own devices, so a later resolve does not read as a
+    // change. Recorded at the version we SIGNED, never the one the relay echoed
+    // back: this value is our own rollback high-water mark, and taking the
+    // relay's number would let it hand back a low one and defeat the mark with
+    // no attack more sophisticated than answering.
     await this.contacts
-      .putKnownRoster(me.accountId, { version: published, devices: devices.map((d) => d.deviceId) })
+      .putKnownRoster(me.accountId, { version, devices: devices.map((d) => d.deviceId) })
       .catch(() => {})
     return published
   }
@@ -2219,10 +2530,27 @@ export class NightjarClient {
     }
 
     let roster
+    let rotation
     try {
-      roster = await this.directory.fetchRoster(accountId)
+      const answer = await this.directory.fetchRosterWithRotation(accountId)
+      roster = answer.roster
+      rotation = answer.rotation
     } catch {
       return fallback // offline or relay trouble: keep using what we know
+    }
+    // They rotated their account key while we were not listening, and the
+    // announcement never reached us (offline past the queue's TTL, or a session
+    // that could not be read). Following it here is the repair, and it happens at
+    // the one moment it matters: somebody is about to send them something.
+    //
+    // NOT followed for our OWN account. A rotation performed on another of this
+    // account's devices leaves this one holding the retired PRIVATE key, and
+    // adopting the new id without the key to sign for it would produce a device
+    // that claims an account it cannot act for. That device has to be added
+    // again, which is the honest cost recorded on the rotate screen.
+    if (rotation && accountId !== this.account.accountId) {
+      const followed = await this.followRotation(accountId, rotation).catch(() => null)
+      if (followed) return this.resolveDevices(followed)
     }
     if (!roster) {
       // No roster published. Only meaningful if we had one before, which would
@@ -2253,14 +2581,26 @@ export class NightjarClient {
     }
 
     const devices = rosterDeviceIds(roster)
-    const { added, removed } = rosterDiff(known?.devices ?? null, devices)
+    // The baseline for a FIRST sighting is the one device we have been addressing
+    // them as, not nothing. This is the whole alert, not a detail: an account
+    // publishes no roster until it links a second device, and the publisher always
+    // seeds the list with its own device, so an account's first roster is ALWAYS
+    // version 1 with two devices. Diffing that against nothing and then suppressing
+    // it (the old `known &&`) silenced the only shape this event ever has, for
+    // contacts AND for your own account, where a first roster you did not publish
+    // is precisely what a stolen account key produces.
+    const { added, removed } = rosterDiff(known?.devices ?? [accountId], devices)
     await this.contacts.putKnownRoster(accountId, { version: roster.version, devices }).catch(() => {})
-    if (known && (added.length > 0 || removed.length > 0)) {
+    if (added.length > 0 || removed.length > 0) {
       // The event a contact has to be told about. An operator cannot cause it: a
       // roster is signed by the account key. So it is either a device that account
       // really linked, or something already holding their account key, and only
       // the person can tell which.
-      this.cb.onDevicesChanged?.(accountId, { added, removed })
+      //
+      // `first` says this is the first list we have ever seen for them, so the UI
+      // can say "reads on N devices" rather than "added a device" for somebody we
+      // only just met, without the security case losing its alert.
+      this.cb.onDevicesChanged?.(accountId, { added, removed, first: !known })
     }
     return devices
   }
@@ -2571,6 +2911,7 @@ export class NightjarClient {
     // `dropped` are just acked (the latter stops a poison redelivery).
     let retryRequested = false
     let helloFrom: string | null = null
+    let rotation: RotationStatement | null = null
     /** Work for this account's OTHER devices, run strictly after the ack. */
     let forward: (() => void) | null = null
     // Who this is FROM, as a person. `from` is a routing label naming one of their
@@ -2647,6 +2988,11 @@ export class NightjarClient {
         // (planHistory classifies it as nothing to store); it is answered below,
         // strictly after the ack.
         retryRequested = true
+      } else if (decoded.kind === 'rotation') {
+        // A contact saying their account key changed. Verified and applied after
+        // the ack, like every other convenience here: re-filing a conversation
+        // must never sit between a decrypted message and its acknowledgement.
+        rotation = decoded.statement
       }
       // decoded.kind 'malformed': clean-ignored (forward-compat).
       if (res.consumedOpk) {
@@ -2686,6 +3032,7 @@ export class NightjarClient {
       void this.clearRetryAsk(account)
       if (retryRequested) void this.honorRetryRequest(account, from)
       if (helloFrom) void this.handleHello(from, helloFrom)
+      if (rotation) void this.handleRotation(account, rotation)
       // Passing a copy to this account's own other devices is housekeeping too,
       // and the most expensive of it (an encrypt and a commit per sibling), so it
       // waits behind the acknowledgement like everything else here.

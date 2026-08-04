@@ -16,6 +16,7 @@ import {
   MAX_INVITE_REDEMPTIONS,
   MAX_OPKS_PER_REQUEST,
   MAX_OUTSTANDING_INVITES,
+  MAX_ROTATION_CHAIN,
   OPK_VEND_TTL_MS,
   SPK_MAX_AGE_MS,
   TAG_SPK,
@@ -25,14 +26,18 @@ import { deriveUserId, deviceIdOf } from '../src/crypto/identity'
 import { domainSeparate, ed25519Verify, u32be, u64be } from '../src/crypto/primitives'
 import { type FetchedBundle, type SignedPrekey, verifyFetchedBundle } from '../src/crypto/prekeys'
 import { verifyRoster } from '../src/crypto/roster'
+import { verifyRotation } from '../src/crypto/rotation'
 import {
   type WireDeviceRoster,
   type WireFetchedBundle,
   type WireOneTimePrekey,
   type WirePublishedBundle,
+  type WireRotationStatement,
   type WireSignedPrekey,
   b64decode,
+  b64encode,
   decodeDeviceRoster,
+  decodeRotationStatement,
   decodePublishedBundle,
   decodeSignedPrekey,
   encodePublishedBundle,
@@ -55,6 +60,9 @@ interface PublishBody {
 }
 interface PublishRosterBody {
   roster: WireDeviceRoster
+}
+interface PublishRotationBody {
+  statement: WireRotationStatement
 }
 interface RegisterDeviceBody {
   /** Server-verified: the id of the socket that asked, never a body claim. */
@@ -138,6 +146,15 @@ export class Directory {
         blob TEXT NOT NULL,
         updated_at INTEGER NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS rotations (
+        old_account_id TEXT PRIMARY KEY,
+        new_account_id TEXT NOT NULL,
+        new_account_key TEXT NOT NULL,
+        chain_len INTEGER NOT NULL,
+        blob TEXT NOT NULL,
+        created_at INTEGER NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_rotations_new ON rotations(new_account_id);
     `)
   }
 
@@ -169,6 +186,10 @@ export class Directory {
           return json(this.registerDevice((await req.json()) as RegisterDeviceBody))
         case '/fetchRoster':
           return json(this.fetchRoster((await req.json()) as { accountId: string }))
+        case '/publishRotation':
+          return json(this.publishRotation((await req.json()) as PublishRotationBody))
+        case '/fetchRotation':
+          return json(this.fetchRotation((await req.json()) as { accountId: string }))
         default:
           return json({ code: 'not_found', msg: 'unknown directory op' }, 404)
       }
@@ -383,6 +404,39 @@ export class Directory {
 
   // --- bundle fetch + OPK vend ------------------------------------------
 
+  /**
+   * The account key this Directory knows for an account id, and how many
+   * rotations that account is from the registered one it began as.
+   *
+   * Two sources, and the second exists because of rotation. An account normally
+   * IS a registered user: its first device's identity key is its account key, and
+   * that is what lets every single-device user become a one-device account with
+   * nothing moving. After a rotation the new account id belongs to no device and
+   * has no user row, so the key comes from the rotation the Directory recorded.
+   *
+   * Rotations are consulted first. If an id ever answers from both (which needs
+   * somebody to rotate onto a key that is also a registered device's, so they
+   * hold both private halves anyway), the two agree about the KEY, because an
+   * account id is the hash of it. They can disagree about the chain length, and
+   * taking the longer one is the conservative half of that choice.
+   *
+   * Returning null means "no such account", and that is the gate that keeps the
+   * account namespace invite-gated: without it, anyone could mint ids out of
+   * fresh keypairs and fill the one shared Directory with rosters for accounts
+   * that do not exist.
+   */
+  private accountKeyOf(accountId: string): { key: Uint8Array; chainLen: number } | null {
+    const rotated = this.sql
+      .exec('SELECT new_account_key, chain_len FROM rotations WHERE new_account_id = ?', accountId)
+      .toArray()[0] as { new_account_key: string; chain_len: number } | undefined
+    if (rotated) return { key: b64decode(rotated.new_account_key, 32), chainLen: rotated.chain_len }
+    const user = this.sql.exec('SELECT ik_sig_pub FROM users WHERE user_id = ?', accountId).toArray()[0] as
+      | { ik_sig_pub: string }
+      | undefined
+    if (user) return { key: b64decode(user.ik_sig_pub, 32), chainLen: 0 }
+    return null
+  }
+
   // --- device rosters (Sesame) -------------------------------------------
   //
   // An account's roster says which devices are its own, so a sender knows every
@@ -410,17 +464,27 @@ export class Directory {
     } catch (e) {
       throw new DirectoryError('bad_roster', String(e instanceof Error ? e.message : e), 400)
     }
-    // The account key is the identity key registered under the account id. On an
-    // account's first device those are the same key, which is what lets an
-    // existing single-device user become a one-device account with nothing moving.
-    const owner = this.sql.exec('SELECT ik_sig_pub FROM users WHERE user_id = ?', roster.accountId).toArray()[0] as
-      | { ik_sig_pub: string }
-      | undefined
+    // Verified under the key this Directory ALREADY holds for that account id,
+    // never one carried in with the roster, which would only prove the roster was
+    // signed by whoever wrote it.
+    const owner = this.accountKeyOf(roster.accountId)
     if (!owner) throw new DirectoryError('not_registered', 'no such account')
     try {
-      verifyRoster(roster, b64decode(owner.ik_sig_pub, 32), Date.now())
+      verifyRoster(roster, owner.key, Date.now())
     } catch (e) {
       throw new DirectoryError('bad_roster', String(e instanceof Error ? e.message : e), 400)
+    }
+    // An account that has rotated is finished, and its old list stops changing.
+    // What is already stored keeps being SERVED, so contacts who have not heard
+    // about the rotation still reach the devices they know. What is refused is
+    // any CHANGE to it, including a removal: the honest consequence is that a
+    // device the rotation was meant to retire stays on the list un-followed
+    // contacts use, until they follow the rotation, which is the thing that
+    // actually retires it. Liveness rather than security, like the monotonicity
+    // below, and `registerDevice` refuses the same account for the same reason.
+    const moved = this.sql.exec('SELECT 1 AS x FROM rotations WHERE old_account_id = ?', roster.accountId).toArray()[0]
+    if (moved) {
+      throw new DirectoryError('account_rotated', 'that account has rotated; publish under the new account key', 409)
     }
     // Monotonic, and equal versions are refused for the same reason the client
     // refuses them: two different rosters at one version means something is wrong.
@@ -467,6 +531,14 @@ export class Directory {
    * has no roster entry for it, and the roster is signed.
    */
   private registerDevice(body: RegisterDeviceBody): { opkCount: number } {
+    // An account that has rotated is finished here too. Its roster is frozen, so
+    // without this a device listed on that frozen list could keep registering
+    // itself under the retired account forever, which is a right the freeze was
+    // meant to end. Registering under the NEW account id is unaffected.
+    const moved = this.sql.exec('SELECT 1 AS x FROM rotations WHERE old_account_id = ?', body.accountId).toArray()[0]
+    if (moved) {
+      throw new DirectoryError('account_rotated', 'that account has rotated; register under the new account id', 409)
+    }
     const roster = this.sql.exec('SELECT blob FROM rosters WHERE account_id = ?', body.accountId).toArray()[0] as
       | { blob: string }
       | undefined
@@ -530,7 +602,13 @@ export class Directory {
    *
    *  The account's own row is never dropped, whatever a roster says. It holds the
    *  account key that every future roster is verified against, so deleting it
-   *  would leave the account unable to change its own device list ever again. */
+   *  would leave the account unable to change its own device list ever again.
+   *
+   *  After an account-key ROTATION that protection no longer applies, and that is
+   *  the point rather than a gap: the new account id belongs to no device, its key
+   *  comes from the recorded rotation instead of a user row, and so the device that
+   *  used to hold the account key becomes an ordinary device the account can drop.
+   *  Rotation is what makes a first device removable at all. */
   private dropUnlistedDevices(accountId: string, before: WireDeviceRoster | null, after: WireDeviceRoster): void {
     if (!before) return
     const kept = new Set(after.devices.map((d) => d.deviceId))
@@ -545,11 +623,127 @@ export class Directory {
   /** The account's current roster, or null if it has never published one (which
    *  is every account until it links a second device). A null is not an error:
    *  the caller treats the account as a single device at its account id. */
-  private fetchRoster(body: { accountId: string }): { roster: WireDeviceRoster | null } {
+  private fetchRoster(body: { accountId: string }): {
+    roster: WireDeviceRoster | null
+    rotation: WireRotationStatement | null
+  } {
     const row = this.sql.exec('SELECT blob FROM rosters WHERE account_id = ?', body.accountId).toArray()[0] as
       | { blob: string }
       | undefined
-    return { roster: row ? (JSON.parse(row.blob) as WireDeviceRoster) : null }
+    // The forwarding pointer rides along, because this is the moment it is needed:
+    // a sender asking where somebody's devices are is exactly who has to find out
+    // that they moved. Answering both in one round trip is what keeps the follow
+    // off the hot path, and an older client simply ignores the extra field.
+    const moved = this.sql
+      .exec('SELECT blob FROM rotations WHERE old_account_id = ?', body.accountId)
+      .toArray()[0] as { blob: string } | undefined
+    return {
+      roster: row ? (JSON.parse(row.blob) as WireDeviceRoster) : null,
+      rotation: moved ? (JSON.parse(moved.blob) as WireRotationStatement) : null,
+    }
+  }
+
+  // --- account-key rotation (Sesame) -------------------------------------
+  //
+  // An account id is the hash of its account key, so replacing the key means
+  // replacing the id, and every contact would otherwise be looking at a stranger.
+  // A rotation statement is what carries the relationship across: signed by the
+  // account being rotated, counter-signed by the key taking over.
+  //
+  // The Directory does exactly two things with it, and neither makes it an
+  // authority. It RECORDS the successor, which is what lets a rotated account
+  // publish a roster at all: without a recorded rotation there is no user row for
+  // the new id and no key to verify anything against, so a rotated account could
+  // never say where its devices are. And it SERVES the statement to anyone who
+  // asks about the old id, so a contact who was offline while it happened can
+  // still find out, verify it under the key they already hold, and follow.
+  //
+  // Authorization is the SIGNATURE, exactly as for rosters: the caller is
+  // irrelevant, because it may be any device of the account, and a stranger
+  // relaying a genuinely signed statement achieves nothing the account did not
+  // already say.
+  //
+  // What the Directory refuses is narrow and worth stating, because all of it is
+  // LIVENESS, not security. A hostile operator owns this code and can serve
+  // whatever it likes; a client's defence is that it verifies every hop under the
+  // key it already holds, and that the binding a rotation produces is UNVERIFIED
+  // until a human re-does the safety-number comparison.
+  private publishRotation(body: PublishRotationBody): { newAccountId: string; chainLen: number } {
+    // Shape first, signatures below. A malformed statement is the caller's
+    // mistake, so it is a 400 rather than the 500 a raw decode throw would be.
+    let st
+    try {
+      st = decodeRotationStatement(body.statement)
+    } catch (e) {
+      throw new DirectoryError('bad_rotation', String(e instanceof Error ? e.message : e), 400)
+    }
+    const from = this.accountKeyOf(st.oldAccountId)
+    // The account namespace stays invite-gated through rotation: a statement can
+    // only start from an account this Directory already knows.
+    if (!from) throw new DirectoryError('not_registered', 'no such account')
+    try {
+      verifyRotation(st, from.key, Date.now())
+    } catch (e) {
+      throw new DirectoryError('bad_rotation', String(e instanceof Error ? e.message : e), 400)
+    }
+    const chainLen = from.chainLen + 1
+    if (chainLen > MAX_ROTATION_CHAIN) {
+      throw new DirectoryError(
+        'too_many_rotations',
+        `an account may be rotated at most ${MAX_ROTATION_CHAIN} times`,
+        409,
+      )
+    }
+    // Rotating INTO an account that has itself rotated away would make the chain
+    // a cycle, and a client walking it would never arrive anywhere.
+    const targetMoved = this.sql.exec('SELECT 1 AS x FROM rotations WHERE old_account_id = ?', st.newAccountId).toArray()[0]
+    if (targetMoved) {
+      throw new DirectoryError('rotation_target_stale', 'that account has itself rotated away', 409)
+    }
+    // First valid rotation wins, like an invite redemption. A second one to a
+    // DIFFERENT key is refused: allowing it would let whoever holds the old key
+    // flip a whole contact list back and forth between successors. Repeating the
+    // one already recorded answers normally, so retrying an interrupted rotation
+    // is safe. Neither is a security control (an attacker holding the old key can
+    // simply be the one who publishes first, and can tell contacts directly
+    // without the Directory at all); it keeps the record stable and small.
+    const existing = this.sql
+      .exec('SELECT new_account_id, chain_len FROM rotations WHERE old_account_id = ?', st.oldAccountId)
+      .toArray()[0] as { new_account_id: string; chain_len: number } | undefined
+    if (existing) {
+      if (existing.new_account_id !== st.newAccountId) {
+        throw new DirectoryError('rotation_exists', 'that account has already rotated to a different key', 409)
+      }
+      return { newAccountId: existing.new_account_id, chainLen: existing.chain_len }
+    }
+    // One write after the reads above, and the DO's turn is single-threaded with
+    // nothing awaited in between, so the check and the insert are already atomic.
+    this.sql.exec(
+      'INSERT INTO rotations (old_account_id, new_account_id, new_account_key, chain_len, blob, created_at) ' +
+        'VALUES (?, ?, ?, ?, ?, ?)',
+      st.oldAccountId,
+      st.newAccountId,
+      // Re-encoded from the DECODED bytes rather than stored as the caller wrote
+      // it, so the column this Directory later verifies rosters against cannot
+      // depend on an encoding quirk in the string it arrived as. The blob below
+      // is kept verbatim, because that is what gets served for others to check.
+      b64encode(st.newAccountKey),
+      chainLen,
+      JSON.stringify(body.statement),
+      Date.now(),
+    )
+    return { newAccountId: st.newAccountId, chainLen }
+  }
+
+  /** The rotation an account published, or null if it never did (almost all of
+   *  them). ONE hop: a chain is followed by asking again for the successor,
+   *  because each hop has to be verified under the key the hop before it
+   *  introduced, and no server can do that on anyone's behalf. */
+  private fetchRotation(body: { accountId: string }): { statement: WireRotationStatement | null } {
+    const row = this.sql.exec('SELECT blob FROM rotations WHERE old_account_id = ?', body.accountId).toArray()[0] as
+      | { blob: string }
+      | undefined
+    return { statement: row ? (JSON.parse(row.blob) as WireRotationStatement) : null }
   }
 
   private fetchBundle(body: FetchBody): { bundle: WireFetchedBundle | null; degraded: boolean } {

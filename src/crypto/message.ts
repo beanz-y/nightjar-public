@@ -40,6 +40,7 @@
 // commit, so a malformed record can never roll back protocol state.
 
 import { concatBytes, randomBytes, u64be, utf8 } from './primitives'
+import type { RotationStatement } from './rotation'
 
 export const MSG_MAGIC = utf8('NJM1') // 0x4e 0x4a 0x4d 0x31
 export const MSG_VERSION = 0x01
@@ -52,6 +53,10 @@ export const MSG_KIND_SYNC_SENT = 0x06
 export const MSG_KIND_SYNC_DELETE = 0x07
 export const MSG_KIND_SYNC_RECV = 0x08
 export const MSG_KIND_SYNC_RECV_DELETE = 0x09
+/** Account-key rotation: "the account you know as X is now Y". Carries the whole
+ *  signed statement, so it is checkable on its own under the key the receiver
+ *  already holds rather than on the say-so of the session it arrived over. */
+export const MSG_KIND_ROTATION = 0x0a
 /** A user id is 52 base32 characters (DESIGN 3), and a hello carries exactly one. */
 const ACCOUNT_ID_LEN = 52
 const ACCOUNT_ID_RE = /^[a-z2-7]{52}$/
@@ -85,6 +90,7 @@ export type DecodedMessage =
   | { kind: 'syncDelete'; id: Uint8Array; accountId: string }
   | { kind: 'syncRecv'; id: Uint8Array; accountId: string; ts: number; body: string }
   | { kind: 'syncRecvDelete'; id: Uint8Array; accountId: string }
+  | { kind: 'rotation'; id: Uint8Array; statement: RotationStatement }
   | { kind: 'legacy'; body: string }
   | { kind: 'malformed' }
 
@@ -269,6 +275,40 @@ export function encodeSyncRecvDeleteMessage(id: Uint8Array, accountId: string): 
   return concatBytes(MSG_MAGIC, Uint8Array.from([MSG_VERSION, MSG_KIND_SYNC_RECV_DELETE]), id, utf8(accountId))
 }
 
+/**
+ * Encode an account-key rotation announcement: "the account you know as X is now
+ * Y, and here is the statement that proves it".
+ *
+ * The whole statement rides inside, because it has to be checkable on its own:
+ * the receiver verifies it under the account key it ALREADY holds for X, not
+ * under anything this message or its session says. That is what makes the
+ * announcement a delivery mechanism rather than an authority, and it is why the
+ * same bytes can arrive over a session, be fetched from the Directory later by
+ * somebody who was offline, or be handed over by one of your own devices, and
+ * mean exactly the same thing in all three cases.
+ *
+ * Fixed-width fields in a pinned order, like every other kind here.
+ */
+export function encodeRotationMessage(id: Uint8Array, st: RotationStatement): Uint8Array {
+  if (id.length !== 16) throw new Error('message: msgId must be 16 bytes')
+  if (!ACCOUNT_ID_RE.test(st.oldAccountId) || !ACCOUNT_ID_RE.test(st.newAccountId)) {
+    throw new Error('message: rotation needs full-width account ids')
+  }
+  if (st.newAccountKey.length !== 32) throw new Error('message: rotation key must be 32 bytes')
+  if (st.oldSig.length !== 64 || st.newSig.length !== 64) throw new Error('message: rotation sigs must be 64 bytes')
+  return concatBytes(
+    MSG_MAGIC,
+    Uint8Array.from([MSG_VERSION, MSG_KIND_ROTATION]),
+    id,
+    utf8(st.oldAccountId),
+    utf8(st.newAccountId),
+    st.newAccountKey,
+    u64be(st.rotatedAt),
+    st.oldSig,
+    st.newSig,
+  )
+}
+
 /** Total decoder, never throws. See the file header for the classification. */
 export function decodeMessage(bytes: Uint8Array): DecodedMessage {
   if (!hasMagic(bytes)) {
@@ -332,6 +372,32 @@ export function decodeMessage(bytes: Uint8Array): DecodedMessage {
     // It is still only a CLAIM: the roster check is what makes it mean anything.
     if (!ACCOUNT_ID_RE.test(accountId)) return { kind: 'malformed' }
     return { kind: 'hello', id, accountId }
+  }
+  if (kind === MSG_KIND_ROTATION) {
+    // Exact length: every field is fixed-width, so anything else is not one of
+    // ours. Shape only, as everywhere in this decoder. Both signatures are
+    // checked by verifyRotation under a key the CALLER already holds.
+    const want = HEADER_LEN + ACCOUNT_ID_LEN * 2 + 32 + 8 + 64 + 64
+    if (bytes.length !== want) return { kind: 'malformed' }
+    let at = HEADER_LEN
+    const oldAccountId = decoder.decode(bytes.slice(at, at + ACCOUNT_ID_LEN))
+    at += ACCOUNT_ID_LEN
+    const newAccountId = decoder.decode(bytes.slice(at, at + ACCOUNT_ID_LEN))
+    at += ACCOUNT_ID_LEN
+    if (!ACCOUNT_ID_RE.test(oldAccountId) || !ACCOUNT_ID_RE.test(newAccountId)) return { kind: 'malformed' }
+    const newAccountKey = bytes.slice(at, at + 32)
+    at += 32
+    let rotatedAt = 0
+    for (const b of bytes.slice(at, at + 8)) rotatedAt = rotatedAt * 256 + b
+    at += 8
+    if (!Number.isSafeInteger(rotatedAt)) return { kind: 'malformed' }
+    const oldSig = bytes.slice(at, at + 64)
+    const newSig = bytes.slice(at + 64, at + 128)
+    return {
+      kind: 'rotation',
+      id,
+      statement: { oldAccountId, newAccountId, newAccountKey, rotatedAt, oldSig, newSig },
+    }
   }
   return { kind: 'malformed' } // unknown kind -> clean-ignore
 }

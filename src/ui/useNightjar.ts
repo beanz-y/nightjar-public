@@ -189,6 +189,15 @@ export function useNightjar() {
   const [notice, setNotice] = useState<string | null>(null)
   const [securityNotices, setSecurityNotices] = useState<string[]>([])
   const [identity, setIdentity] = useState<Identity | null>(null)
+  /** This account's public signing key, which is what a safety number covers.
+   *
+   *  Kept separate from `identity` deliberately. `identity` is the DEVICE, and on
+   *  a linked device its key is NOT the account key, so a screen that compares
+   *  identities out of band has to be handed this one: a contact record always
+   *  holds the peer's ACCOUNT key, so comparing a device key against it fails on
+   *  every contact and reads as an attack. On a first device the two are the same
+   *  key and nobody's digits move. */
+  const [accountIkSigPub, setAccountIkSigPub] = useState<Uint8Array | null>(null)
   const [connected, setConnected] = useState(false)
   const [registered, setRegistered] = useState(false)
   const [contacts, setContacts] = useState<Contact[]>([])
@@ -495,11 +504,21 @@ export function useNightjar() {
             // signed by the account key, so it is either a device that person
             // really linked or something already holding their account key, and
             // only they can tell which. Sticky, and never auto-dismissed.
-            const who = accountId === liveRef.current?.client.account.accountId ? 'your account' : `${accountId.slice(0, 12)}…`
+            const mine = accountId === liveRef.current?.client.account.accountId
+            const who = mine ? 'your account' : `${accountId.slice(0, 12)}…`
             const parts: string[] = []
             if (change.added.length > 0) parts.push(`added ${change.added.length} device(s)`)
             if (change.removed.length > 0) parts.push(`removed ${change.removed.length} device(s)`)
-            const detail = `${who} ${parts.join(' and ')}. If that was not expected, check with them in person before sending anything sensitive.`
+            // The first list ever seen for a CONTACT is worded as a fact rather
+            // than as a change: for somebody just added it is not news that they
+            // read on two devices, and calling that "added a device" would be the
+            // kind of false alarm that teaches people to ignore this notice. Your
+            // OWN account never gets that softening: a first list you did not
+            // publish yourself is exactly what a stolen account key looks like.
+            const detail =
+              change.first && !mine
+                ? `${who} reads on ${change.added.length + 1} devices. If you expected one, check with them in person before sending anything sensitive.`
+                : `${who} ${parts.join(' and ')}. If that was not expected, check with them in person before sending anything sensitive.`
             setSecurityNotices((prev) => (prev.includes(detail) ? prev : [...prev, detail]))
           },
           onConnection: (up) => {
@@ -514,6 +533,13 @@ export function useNightjar() {
             }
             void completeRestoreIfPending(client, stores.keys)
               .then(() => drainMoveRefresh(client, stores.keys, stores.contacts))
+              // A rename interrupted part-way (a contact rotated their account key
+              // and the device was closed mid-move) leaves that person split
+              // across two ids. Finishing it belongs here with the rest of the
+              // catch-up work a reconnecting device does, and it re-reads the
+              // contact list afterwards so an open window stops showing both.
+              .then(() => client.resumePendingRenames())
+              .then(() => listContacts())
               .catch(() => {})
             setRegistered(client.isRegistered)
             void listContacts().catch(() => {})
@@ -525,6 +551,7 @@ export function useNightjar() {
       )
       liveRef.current = { client, identity: id }
       setIdentity(id)
+      setAccountIkSigPub(client.account.accountKey.publicKey)
 
       // Open the cross-tab render channel now that we are unlocked. Sibling tabs of
       // this same user apply appends/deletes/failures to their in-RAM view ONLY (no
@@ -1020,7 +1047,10 @@ export function useNightjar() {
     const raw = input.trim()
     if (USER_ID_RE.test(raw.toLowerCase())) {
       const id = raw.toLowerCase()
-      if (id === live.identity.userId) {
+      // Both ids, because on a linked device they differ: the account is what
+      // people add, and the device id is what this device authenticates as.
+      // Opening a chat with either of your own is a mistake worth catching.
+      if (id === live.client.account.accountId || id === live.identity.userId) {
         setNotice('that is your own id')
         return null
       }
@@ -1278,6 +1308,34 @@ export function useNightjar() {
   // the service worker) so the device boots factory-fresh, and disconnects so it
   // stops draining mail meant for the new device. Nothing can revoke it remotely;
   // this is the honest local half of that.
+  /**
+   * Replace this account's key, keeping the relationships (rotation).
+   *
+   * The honest framing lives on the screen that offers this, not here: it helps
+   * when the old key is gone but not in use, and it does not beat somebody
+   * actively using it. What this does is drive the client and then re-read the
+   * contact list, because every contact's trust has just been reset to unverified
+   * and the UI would otherwise go on showing badges that are no longer true.
+   */
+  const rotateAccount = useCallback(async (): Promise<string | null> => {
+    const live = liveRef.current
+    if (!live) return null
+    try {
+      const { accountId } = await live.client.rotateAccount()
+      if (!mountedRef.current) return accountId
+      setAccountIkSigPub(live.client.account.accountKey.publicKey)
+      await listContacts()
+      setNotice(
+        `your account key was replaced. Everyone you talk to now sees you as unverified and has to compare safety ` +
+          `numbers with you again, in person.`,
+      )
+      return accountId
+    } catch (e) {
+      setNotice(`could not replace your account key: ${String(e instanceof Error ? e.message : e)}`)
+      return null
+    }
+  }, [listContacts])
+
   const eraseThisDevice = useCallback(async (): Promise<void> => {
     const stores = storesRef.current
     if (!stores) return
@@ -1465,6 +1523,10 @@ export function useNightjar() {
         privateKey: payload.accountKeyPriv,
         publicKey: ed25519Public(payload.accountKeyPriv),
       })
+      // The account key just changed, so the key a safety number covers changed
+      // with it. Without this the verify screen would keep comparing this
+      // DEVICE's key against every contact's account key and report a mismatch.
+      setAccountIkSigPub(live.client.account.accountKey.publicKey)
       await live.client.registerAsDevice(payload.accountId)
       linkSecretRef.current = null
       if (!mountedRef.current) return
@@ -1478,6 +1540,20 @@ export function useNightjar() {
         'this device is now part of your account. It starts with no messages, and every contact shows as unverified until you compare safety numbers here: a verification belongs to the device that did it.',
       )
     } catch (e) {
+      // Undo the half that already committed. `stageLink` writes the account key
+      // before `registerAsDevice`, which needs the network and can fail (a dropped
+      // socket mid-ceremony, a relay rejection). Leaving the key behind is not a
+      // harmless remnant: it is loaded on every later boot and PREFERRED over this
+      // device's own, so the device would report the other account forever, sign
+      // rosters as it, announce it to contacts, and copy everything it sends and
+      // receives to that account's devices. The user's next move from this screen
+      // is usually "linking failed, I will just join with an invite instead",
+      // which never touches the key.
+      //
+      // Retrying the ceremony is safe either way, because stageLink overwrites.
+      await clearAccountKey(stores.keys).catch(() => {})
+      live.client.setAccountKey(null)
+      setAccountIkSigPub(live.client.account.accountKey.publicKey)
       setLinkState('idle')
       linkSecretRef.current = null
       setNotice(`could not finish linking this device: ${String(e instanceof Error ? e.message : e)}`)
@@ -1753,6 +1829,7 @@ export function useNightjar() {
     notice,
     securityNotices,
     identity,
+    accountIkSigPub,
     connected,
     registered,
     contacts,
@@ -1797,6 +1874,7 @@ export function useNightjar() {
       prepareMove,
       createMove: createMoveFile,
       eraseThisDevice,
+      rotateAccount,
       join,
       send,
       deleteMessage,

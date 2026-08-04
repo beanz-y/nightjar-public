@@ -9,6 +9,7 @@ import { describe, expect, it } from 'vitest'
 import { type Identity, accountIdOf, deviceIdOf, generateIdentity } from '../crypto/identity'
 import { hash256 } from '../crypto/primitives'
 import { type DeviceRoster, type RosterDevice, signRoster } from '../crypto/roster'
+import { type RotationStatement, signRotation } from '../crypto/rotation'
 import { AppLockStore } from '../storage/appLockStore'
 import { HistoryStore } from '../storage/historyStore'
 import { InMemoryLock } from '../storage/lock'
@@ -34,7 +35,7 @@ async function harness() {
   const appLock = new AppLockStore(keys, lock, stubKdf)
   await appLock.enroll([{ kind: 'pass', secret: 'x' }])
   const security: string[] = []
-  const changes: Array<{ accountId: string; added: string[]; removed: string[] }> = []
+  const changes: Array<{ accountId: string; added: string[]; removed: string[]; first: boolean }> = []
   const client = new NightjarClient(
     identity,
     store,
@@ -50,19 +51,30 @@ async function harness() {
   )
   /** What the relay will answer with, including the option of failing. */
   let served: DeviceRoster | null | Error = null
+  /** The forwarding pointer the relay serves alongside it, if any. */
+  let servedRotation: RotationStatement | null = null
   ;(client as unknown as { directory: unknown }).directory = {
+    fetchRosterWithRotation: async () => {
+      if (served instanceof Error) throw served
+      return { roster: served, rotation: servedRotation }
+    },
+    // Publishing paths read the roster alone; they have no use for a pointer.
     fetchRoster: async () => {
       if (served instanceof Error) throw served
       return served
     },
+    publishRoster: async (wire: { version: number }) => wire.version,
   }
   const serve = (r: DeviceRoster | null | Error) => {
     served = r
   }
+  const serveRotation = (r: RotationStatement | null) => {
+    servedRotation = r
+  }
   const know = async (peer: Identity) => {
     await contacts.recordFirstContact(accountIdOf(peer.ikSig.publicKey), peer.ikSig.publicKey, Date.now())
   }
-  return { identity, client, contacts, serve, security, changes, know }
+  return { identity, client, contacts, serve, serveRotation, security, changes, know }
 }
 
 describe('resolveDevices', () => {
@@ -89,8 +101,17 @@ describe('resolveDevices', () => {
       version: 1,
       devices: devices.map((d) => d.deviceId),
     })
-    // A first sighting is not a change: there is nothing it differs from.
-    expect(h.changes).toEqual([])
+    // A first sighting IS the event, and this expectation used to say the
+    // opposite. An account publishes no list until it links a second device, and
+    // the publisher always seeds the list with its own device, so this shape
+    // (version 1, two devices) is the only one a first roster ever has. Treating
+    // it as "nothing to compare against" silenced every first link there has ever
+    // been, including a first list on your OWN account, which is what a stolen
+    // account key produces. The baseline is the one device we were addressing
+    // them as, so what is reported is the laptop alone.
+    expect(h.changes).toEqual([
+      { accountId: peer.userId, added: [deviceIdOf(laptop.ikSig.publicKey)], removed: [], first: true },
+    ])
   })
 
   it('refuses a roster signed by anyone but the account, and says so', async () => {
@@ -148,6 +169,11 @@ describe('resolveDevices', () => {
     const peer = generateIdentity()
     const laptop = generateIdentity()
     await h.know(peer)
+    // NOTE the shape this seeds with: a version-1 SINGLE-device roster, which no
+    // client actually produces (see the first-sighting test above). It is kept
+    // because it exercises the second-and-later path cleanly, but it is not what
+    // a real first list looks like, and that gap is exactly why this test passed
+    // while every real first link went unannounced.
     h.serve(signRoster(peer.userId, 1, [deviceOf(peer)], peer.ikSig.privateKey))
     await h.client.resolveDevices(peer.userId)
 
@@ -155,7 +181,89 @@ describe('resolveDevices', () => {
     await h.client.resolveDevices(peer.userId)
 
     expect(h.changes).toEqual([
-      { accountId: peer.userId, added: [deviceIdOf(laptop.ikSig.publicKey)], removed: [] },
+      { accountId: peer.userId, added: [deviceIdOf(laptop.ikSig.publicKey)], removed: [], first: false },
+    ])
+  })
+
+  it('follows a rotation the relay reports, and resolves the successor instead', async () => {
+    // The repair path for somebody who was offline when a contact rotated: the
+    // announcement expired from the queue, so the forwarding pointer served
+    // alongside the device list is how they find out, at the moment they are
+    // about to send.
+    const h = await harness()
+    const peer = generateIdentity()
+    const after = generateIdentity()
+    const laptop = generateIdentity()
+    const oldId = accountIdOf(peer.ikSig.publicKey)
+    const newId = accountIdOf(after.ikSig.publicKey)
+    await h.know(peer)
+
+    h.serveRotation(signRotation(oldId, peer.ikSig.privateKey, after.ikSig, Date.now()))
+    h.serve(signRoster(newId, 1, [deviceOf(after), deviceOf(laptop)], after.ikSig.privateKey))
+
+    const devices = await h.client.resolveDevices(oldId)
+
+    // Resolved against the SUCCESSOR's list, and the contact moved with it.
+    expect(devices).toEqual([deviceIdOf(after.ikSig.publicKey), deviceIdOf(laptop.ikSig.publicKey)])
+    expect(await h.contacts.get(newId)).not.toBeNull()
+    expect(await h.contacts.get(oldId)).toBeNull()
+    expect(h.security.join(' ')).toMatch(/UNVERIFIED/)
+  })
+
+  it('ignores a rotation the relay reports that does not verify as theirs', async () => {
+    // The relay is untrusted here exactly as it is for a roster: a pointer is
+    // worth nothing until it verifies under the key this device already holds.
+    const h = await harness()
+    const peer = generateIdentity()
+    const impostor = generateIdentity()
+    const oldId = accountIdOf(peer.ikSig.publicKey)
+    await h.know(peer)
+
+    const forged = signRotation(
+      accountIdOf(impostor.ikSig.publicKey),
+      impostor.ikSig.privateKey,
+      generateIdentity().ikSig,
+      Date.now(),
+    )
+    h.serveRotation({ ...forged, oldAccountId: oldId })
+    h.serve(signRoster(oldId, 1, [deviceOf(peer)], peer.ikSig.privateKey))
+
+    expect(await h.client.resolveDevices(oldId)).toEqual([deviceIdOf(peer.ikSig.publicKey)])
+    expect(await h.contacts.get(oldId)).not.toBeNull()
+    expect(h.security.join(' ')).toMatch(/did not verify as theirs/)
+  })
+
+  it('announces a first device list on your OWN account, which nothing else would catch', async () => {
+    // The detection this exists for. Somebody holding a stolen account key
+    // publishes a list adding their device; it verifies under our own account
+    // key, so nothing upstream refuses it, and from the next send onward this
+    // device copies everything it sends and receives to them. Before the
+    // baseline fix this was the one case that was silent, because a device that
+    // has never linked anything has no cached list of its own either.
+    const h = await harness()
+    const attacker = generateIdentity()
+    const me = h.identity
+    h.serve(
+      signRoster(
+        h.client.account.accountId,
+        1,
+        [
+          { deviceId: h.client.deviceId, dkSigPub: me.ikSig.publicKey, addedAt: Date.now() },
+          deviceOf(attacker),
+        ],
+        me.ikSig.privateKey,
+      ),
+    )
+
+    const devices = await h.client.resolveDevices(h.client.account.accountId)
+    expect(devices).toContain(deviceIdOf(attacker.ikSig.publicKey))
+    expect(h.changes).toEqual([
+      {
+        accountId: h.client.account.accountId,
+        added: [deviceIdOf(attacker.ikSig.publicKey)],
+        removed: [],
+        first: true,
+      },
     ])
   })
 

@@ -22,6 +22,7 @@ export function App() {
     notice,
     securityNotices,
     identity,
+    accountIkSigPub,
     connected,
     registered,
     contacts,
@@ -162,7 +163,7 @@ export function App() {
 
             {isReady && identity && (
               <Messenger
-                identity={identity}
+                accountIkSigPub={accountIkSigPub ?? identity.ikSig.publicKey}
                 connected={connected}
                 removedPeer={removedPeer}
                 contacts={contacts}

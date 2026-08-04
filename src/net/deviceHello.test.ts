@@ -48,7 +48,9 @@ async function harness() {
     new HistoryStore(appLock),
   )
   let served: ReturnType<typeof signRoster> | null = null
-  ;(client as unknown as { directory: unknown }).directory = { fetchRoster: async () => served }
+  ;(client as unknown as { directory: unknown }).directory = {
+    fetchRosterWithRotation: async () => ({ roster: served, rotation: null }),
+  }
   return {
     client,
     contacts,

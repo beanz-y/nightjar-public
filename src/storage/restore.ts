@@ -36,6 +36,7 @@ import type { BackupPayload } from '../crypto/backup'
 import { serializeIdentity } from '../crypto/identity'
 import type { MovePayload } from '../crypto/move'
 import type { ContactStore } from '../trust/contactStore'
+import { clearAccountKey } from './accountKeyStore'
 import { HISTORY_LOCK_KEY } from './appLockStore'
 import type { HistoryMessage, HistoryStore } from './historyStore'
 import { IDENTITY_KEY } from './identityStore'
@@ -116,6 +117,7 @@ export async function stageRestore(deps: RestoreDeps, payload: BackupPayload): P
     // forgotten-secret user at an unopenable unlock screen). The old history rows
     // are wiped above and were unreadable without the old LDK regardless.
     await deps.keys.delete(HISTORY_LOCK_KEY)
+    await clearAccountKey(deps.keys) // see the note in stageRestoreEnrolled
     await deps.keys.put(RESTORE_PENDING_KEY, Uint8Array.from([1]))
     await deps.contacts.replaceAllFromBackup(payload.contacts)
     await deps.keys.put(IDENTITY_KEY, serializeIdentity(payload.identity))
@@ -132,6 +134,14 @@ export async function stageRestoreEnrolled(deps: RestoreDeps, payload: BackupPay
     await deps.keys.delete(IDENTITY_KEY) // the commit-point invariant (see header)
     await deps.sessions.wipeAll()
     await deps.keys.delete(PREKEYS_KEY)
+    // An account key from a PREVIOUS life of this device (it was linked to
+    // somebody's account, or a link ceremony was abandoned part-way) must not
+    // survive a restore. It is loaded on every boot and PREFERRED over this
+    // device's own identity, so a restored device that kept one would go on
+    // acting as that account: signing its rosters, announcing it to contacts,
+    // and copying everything sent and received to its devices. A restore
+    // REPLACES a device, so its account membership goes with the rest.
+    await clearAccountKey(deps.keys)
     await deps.keys.put(RESTORE_PENDING_KEY, Uint8Array.from([1]))
     await deps.contacts.replaceAllFromBackup(payload.contacts) // encrypted under the resident LDK
     await deps.keys.put(IDENTITY_KEY, serializeIdentity(payload.identity))
@@ -159,6 +169,7 @@ export async function stageMove(
     await deps.keys.delete(IDENTITY_KEY) // the commit-point invariant (see header)
     await deps.sessions.wipeAll()
     await deps.keys.delete(PREKEYS_KEY)
+    await clearAccountKey(deps.keys) // see the note in stageRestoreEnrolled
     await deps.keys.put(RESTORE_PENDING_KEY, Uint8Array.from([1]))
     await deps.contacts.replaceAllForMove(payload.contacts, payload.aliases, payload.dismissals)
     // The refresh-ping list: every imported contact EXCEPT dismissed peers (a

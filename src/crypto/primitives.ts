@@ -150,6 +150,34 @@ export function ed25519Verify(
   return ed25519.verify(signature, message, publicKey)
 }
 
+/**
+ * Whether an Ed25519 public key can stand for a private half somebody holds.
+ *
+ * There are eight points on this curve of small order, and the all-zero encoding
+ * is one of them. A signature of all zero bytes VERIFIES under it, measured
+ * against this library rather than assumed. So "it verified" under such a key
+ * proves nothing at all: anybody can produce that signature, and nobody holds a
+ * private half to go with the key.
+ *
+ * This matters wherever a signature is checked under a key the PRESENTER chose,
+ * rather than one we already hold for somebody: an account rotating to a new key,
+ * an identity registering itself, a device registering under an account. In each
+ * of those a degenerate key would turn a proof of possession into a formality
+ * that anyone can satisfy. It never matters for a key we already hold, because a
+ * real key is never small-order, but the check is cheap enough not to reason
+ * about which is which at every call site.
+ *
+ * Fails closed on anything that is not a point at all, and on the wrong width.
+ */
+export function ed25519KeyUsable(publicKey: Uint8Array): boolean {
+  if (publicKey.length !== 32) return false
+  try {
+    return !ed25519.Point.fromBytes(publicKey).isSmallOrder()
+  } catch {
+    return false // not a point on the curve, or a non-canonical encoding
+  }
+}
+
 // --- AEAD (XChaCha20-Poly1305) -------------------------------------------
 
 export const XCHACHA_KEY_BYTES = 32

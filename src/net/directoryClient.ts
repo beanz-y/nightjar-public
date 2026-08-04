@@ -4,13 +4,17 @@
 
 import type { FetchedBundle } from '../crypto/prekeys'
 import type { DeviceRoster } from '../crypto/roster'
+import type { RotationStatement } from '../crypto/rotation'
+
 import {
   type WireDeviceRoster,
   type WirePublishedBundle,
+  type WireRotationStatement,
   type WireSignedPrekey,
   type WireOneTimePrekey,
   decodeDeviceRoster,
   decodeFetchedBundle,
+  decodeRotationStatement,
 } from '../wire/codec'
 import type { Transport } from './transport'
 
@@ -85,12 +89,66 @@ export class DirectoryClient {
    *  degrades to null, which the caller reads as "one device", rather than
    *  throwing at a call site that only wanted an address. */
   async fetchRoster(accountId: string): Promise<DeviceRoster | null> {
+    return (await this.fetchRosterWithRotation(accountId)).roster
+  }
+
+  /** The device list AND, if that account rotated its key away, the statement
+   *  naming its successor. One round trip, because the caller asking where to
+   *  send is exactly who needs to know they moved. Both halves are structural
+   *  decodes only: a rotation is worth nothing until `verifyRotation` has checked
+   *  it under a key the caller already holds. */
+  async fetchRosterWithRotation(
+    accountId: string,
+  ): Promise<{ roster: DeviceRoster | null; rotation: RotationStatement | null }> {
     const id = reqId()
     const r = await this.transport.request(id, { t: 'fetchRoster', reqId: id, accountId })
     if (r.t !== 'roster') throw new Error(`fetchRoster: unexpected ${r.t}`)
-    if (!r.roster) return null
+    let roster: DeviceRoster | null = null
+    if (r.roster) {
+      try {
+        roster = decodeDeviceRoster(r.roster)
+      } catch {
+        roster = null
+      }
+    }
+    let rotation: RotationStatement | null = null
+    if (r.rotation) {
+      try {
+        rotation = decodeRotationStatement(r.rotation)
+      } catch {
+        rotation = null
+      }
+    }
+    return { roster, rotation }
+  }
+
+  /** Record which key replaces this account's (Sesame, account-key rotation).
+   *  The statement is its own authorization, so like a roster this works from any
+   *  device of the account. Returns the successor the Directory has on record,
+   *  which is what makes a retried rotation safe: republishing the same one
+   *  answers with the same id rather than failing. */
+  async publishRotation(statement: WireRotationStatement): Promise<string> {
+    const id = reqId()
+    const r = await this.transport.request(id, { t: 'publishRotation', reqId: id, statement })
+    if (r.t !== 'rotationPublished') throw new Error(`publishRotation: unexpected ${r.t}`)
+    return r.newAccountId
+  }
+
+  /** Whether an account rotated, and to what. ONE hop: a chain is followed by
+   *  asking again, because each hop must be verified under the key the previous
+   *  one introduced.
+   *
+   *  Same untrusted-relay discipline as `fetchRoster`. Decoding is STRUCTURAL
+   *  only, and a structurally broken answer degrades to null, which the caller
+   *  reads as "they did not rotate". Believing it needs `verifyRotation` under a
+   *  key the caller already holds. */
+  async fetchRotation(accountId: string): Promise<RotationStatement | null> {
+    const id = reqId()
+    const r = await this.transport.request(id, { t: 'fetchRotation', reqId: id, accountId })
+    if (r.t !== 'rotation') throw new Error(`fetchRotation: unexpected ${r.t}`)
+    if (!r.statement) return null
     try {
-      return decodeDeviceRoster(r.roster)
+      return decodeRotationStatement(r.statement)
     } catch {
       return null
     }

@@ -4,7 +4,6 @@
 // the main app reads as a messenger.
 
 import { useState } from 'react'
-import type { Identity } from '../crypto/identity'
 import type { CanaryResult } from '../verify/canary'
 import { About } from './About'
 import { BackupPanel } from './BackupPanel'
@@ -23,7 +22,12 @@ type Prepared =
   | { ok: false; blocked: 'outbox' | 'too-large'; count: number }
 
 interface Props {
-  identity: Identity
+  /** The ACCOUNT id, which is who other people add and what a conversation is
+   *  filed under. On a linked device this is NOT `identity.userId`: that is the
+   *  DEVICE id, and handing it out would give somebody a chat with one device of
+   *  an account rather than with the person, unverifiable against their safety
+   *  number and invisible to their other devices. */
+  accountId: string
   notify: NotifyState
   storagePersisted: boolean | null
   canary: CanaryResult | null
@@ -35,6 +39,7 @@ interface Props {
   onPrepareMove: () => Promise<Prepared | null>
   onCreateMove: (passphrase: string) => Promise<boolean>
   onEraseDevice: () => Promise<void>
+  onRotateAccount: () => Promise<string | null>
   onListDevices: () => Promise<DeviceRow[]>
   onRemoveDevice: (deviceId: string) => Promise<boolean>
   onAuthorizeDevice: (codeText: string) => Promise<{ deviceId: string; secret: Uint8Array } | null>
@@ -49,7 +54,7 @@ interface Props {
 }
 
 export function Settings({
-  identity,
+  accountId,
   notify,
   storagePersisted,
   canary,
@@ -61,6 +66,7 @@ export function Settings({
   onPrepareMove,
   onCreateMove,
   onEraseDevice,
+  onRotateAccount,
   onListDevices,
   onRemoveDevice,
   onAuthorizeDevice,
@@ -79,7 +85,7 @@ export function Settings({
 
   async function copyId() {
     try {
-      await navigator.clipboard.writeText(identity.userId)
+      await navigator.clipboard.writeText(accountId)
       setCopied(true)
       setTimeout(() => setCopied(false), 1500)
     } catch {
@@ -119,6 +125,7 @@ export function Settings({
           onSeal={onSealLink}
           onSendOverRelay={onSendLinkOverRelay}
           onErase={onEraseDevice}
+          onRotate={onRotateAccount}
           history={history}
           onClose={() => setMode('menu')}
         />
@@ -139,9 +146,9 @@ export function Settings({
           public user id, so it is safe to show.
         </p>
         <div className="qr-wrap">
-          <QrCode text={identity.userId} size={208} />
+          <QrCode text={accountId} size={208} />
         </div>
-        <p className="mono break small yourid">{identity.userId}</p>
+        <p className="mono break small yourid">{accountId}</p>
       </section>
     )
   }
@@ -156,7 +163,7 @@ export function Settings({
       </div>
 
       <div className="field-label small muted">your identity</div>
-      <p className="mono break small yourid">{identity.userId}</p>
+      <p className="mono break small yourid">{accountId}</p>
       <div className="row">
         <button className="ghost small" onClick={() => void copyId()}>
           {copied ? 'copied' : 'copy id'}

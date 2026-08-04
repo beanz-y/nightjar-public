@@ -9,6 +9,7 @@ import {
   concatBytes,
   domainSeparate,
   ed25519Generate,
+  ed25519KeyUsable,
   ed25519Sign,
   ed25519Verify,
   hash256,
@@ -164,5 +165,31 @@ describe('bytesEqual', () => {
     expect(bytesEqual(utf8('abc'), utf8('abc'))).toBe(true)
     expect(bytesEqual(utf8('abc'), utf8('abd'))).toBe(false)
     expect(bytesEqual(utf8('abc'), utf8('ab'))).toBe(false)
+  })
+})
+
+describe('ed25519KeyUsable', () => {
+  it('rejects the degenerate key that verifies a signature of zeros', () => {
+    // The measurement this check exists for, pinned here rather than asserted
+    // from memory: an all-zero key is a small-order point, and an all-zero
+    // signature verifies under it. Any "proof of possession" against such a key
+    // is a formality anybody can satisfy, so the places that check a signature
+    // under a key the PRESENTER chose have to refuse it.
+    const zeroKey = new Uint8Array(32)
+    const zeroSig = new Uint8Array(64)
+    expect(ed25519Verify(zeroSig, utf8('anything at all'), zeroKey)).toBe(true)
+    expect(ed25519KeyUsable(zeroKey)).toBe(false)
+  })
+
+  it('accepts a real key', () => {
+    expect(ed25519KeyUsable(ed25519Generate().publicKey)).toBe(true)
+  })
+
+  it('fails closed on anything that is not a point, or the wrong width', () => {
+    expect(ed25519KeyUsable(new Uint8Array(31))).toBe(false)
+    expect(ed25519KeyUsable(new Uint8Array(33))).toBe(false)
+    expect(ed25519KeyUsable(new Uint8Array(0))).toBe(false)
+    // 32 bytes that do not decode to a curve point at all.
+    expect(ed25519KeyUsable(new Uint8Array(32).fill(0xff))).toBe(false)
   })
 })

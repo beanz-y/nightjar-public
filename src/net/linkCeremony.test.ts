@@ -58,6 +58,7 @@ async function device(identity: Identity = generateIdentity()) {
   let roster: DeviceRoster | null = null
   ;(client as unknown as { directory: unknown }).directory = {
     fetchRoster: async () => roster,
+    fetchRosterWithRotation: async () => ({ roster, rotation: null }),
     publishRoster: async (wire: WireDeviceRoster) => {
       const next = decodeDeviceRoster(wire)
       roster = next

@@ -46,6 +46,22 @@ describe('prekey generation', () => {
   it('builds a bundle whose signed prekey verifies', () => {
     expect(() => verifyFetchedBundle(bundleFor(generateIdentity(), NOW), NOW)).not.toThrow()
   })
+  it('refuses a bundle whose identity key is one nobody can hold', () => {
+    // Every signature in a bundle is checked under the key the bundle carries,
+    // so a small-order identity key makes all of them free: an all-zero
+    // signature verifies under it. Both the binding and the signed prekey pass
+    // here, which is exactly why the key itself has to be refused.
+    const zeroKey = new Uint8Array(32)
+    const degenerate: FetchedBundle = {
+      version: OWN_BUNDLE_VERSION,
+      ikSigPub: zeroKey,
+      ikDhPub: x25519Generate().publicKey,
+      idkbindSig: new Uint8Array(64),
+      spk: { id: 1, createdAt: NOW, expiry: NOW + SPK_MAX_AGE_MS, pub: x25519Generate().publicKey, sig: new Uint8Array(64) },
+      opk: null,
+    }
+    expect(() => verifyFetchedBundle(degenerate, NOW)).toThrow(/not a key anybody can hold/)
+  })
   it('generates a one-time prekey batch with sequential ids and 32-byte keys', () => {
     const batch = generateOneTimePrekeys(5, 3)
     expect(batch.map((b) => b.opk.id)).toEqual([5, 6, 7])
