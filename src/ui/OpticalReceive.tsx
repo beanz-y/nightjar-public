@@ -13,6 +13,7 @@
 import { useEffect, useRef, useState } from 'react'
 import { FountainDecoder } from '../net/fountain'
 import { parseOpticalFrame } from '../net/opticalFrames'
+import { releaseQrDecoder } from '../platform/qrDecoder'
 import { decodeQrFrame } from './qrDecode'
 
 interface OpticalReceiveProps {
@@ -61,6 +62,9 @@ export function OpticalReceive({ onPayload, onCancel, title = 'Receiving' }: Opt
       if (raf) cancelAnimationFrame(raf)
       clearInterval(rateTimer)
       stream?.getTracks().forEach((t) => t.stop())
+      // A closed camera screen should not leave a thread and a decoder's working
+      // set alive behind it.
+      releaseQrDecoder()
     }
 
     void (async () => {

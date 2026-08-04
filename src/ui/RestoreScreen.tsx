@@ -61,6 +61,9 @@ export function RestoreScreen({ mode, busy, error, onRestore, onBack }: Props) {
         <input
           className="mono"
           type={reveal ? 'text' : 'password'}
+          id="nightjar-restore-passphrase"
+          name="password"
+          autoComplete="current-password"
           placeholder="the passphrase you saved with the file"
           value={passphrase}
           onChange={(e) => setPassphrase(e.target.value)}

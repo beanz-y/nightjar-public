@@ -111,9 +111,18 @@ function Enroll({ restoring, bioAvailable, onEnroll, makeBiometric }: Props) {
           : 'Convenient, but weaker: a short PIN can be brute-forced from a stolen or imaged device. Prefer a passphrase, or add biometric.'}
       </p>
 
+      {/* A password manager keys both saving and filling off `autocomplete` and a
+          stable field identity. Without them it often never offers to save this
+          at all, which quietly pushes people toward a secret they can hold in
+          their head: the opposite of what this screen is asking for, since the
+          only thing standing between an imaged device and everything on it is
+          how hard this is to guess. */}
       <input
         className="mono"
         type="password"
+        id="nightjar-applock-new"
+        name="new-password"
+        autoComplete="new-password"
         inputMode={kind === 'pin' ? 'numeric' : 'text'}
         placeholder={kind === 'pin' ? `PIN (${PIN_MIN_DIGITS}+ digits)` : 'passphrase'}
         value={secret}
@@ -122,6 +131,9 @@ function Enroll({ restoring, bioAvailable, onEnroll, makeBiometric }: Props) {
       <input
         className="mono"
         type="password"
+        id="nightjar-applock-confirm"
+        name="confirm-password"
+        autoComplete="new-password"
         inputMode={kind === 'pin' ? 'numeric' : 'text'}
         placeholder="confirm"
         value={confirm}
@@ -188,6 +200,9 @@ function Unlock({ bioAvailable, lockMethods, onUnlock, onUnlockBiometric, onRese
       <input
         className="mono"
         type="password"
+        id="nightjar-applock-unlock"
+        name="password"
+        autoComplete="current-password"
         inputMode={isPin ? 'numeric' : 'text'}
         placeholder={isPin ? 'PIN' : 'passphrase'}
         value={secret}

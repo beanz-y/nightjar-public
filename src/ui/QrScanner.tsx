@@ -4,6 +4,7 @@
 // a "paste instead" way out, never a dead end.
 
 import { useEffect, useRef, useState } from 'react'
+import { releaseQrDecoder } from '../platform/qrDecoder'
 import { decodeQrFrame } from './qrDecode'
 
 interface Props {
@@ -38,6 +39,7 @@ export function QrScanner({ onDecode, onCancel, hint, fallback }: Props) {
       stopped = true
       if (raf) cancelAnimationFrame(raf)
       stream?.getTracks().forEach((t) => t.stop())
+      releaseQrDecoder()
     }
 
     void (async () => {

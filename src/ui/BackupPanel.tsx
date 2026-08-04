@@ -81,6 +81,9 @@ export function BackupPanel({ onExport, storagePersisted, onClose }: Props) {
           <input
             className="mono"
             type={generated ? 'text' : 'password'}
+            id="nightjar-backup-passphrase"
+            name="new-password"
+            autoComplete="new-password"
             value={passphrase}
             onChange={(e) => {
               setPassphrase(e.target.value)
@@ -92,6 +95,9 @@ export function BackupPanel({ onExport, storagePersisted, onClose }: Props) {
           <input
             className="mono"
             type={generated ? 'text' : 'password'}
+            id="nightjar-backup-confirm"
+            name="confirm-password"
+            autoComplete="new-password"
             value={confirm}
             onChange={(e) => {
               setConfirm(e.target.value)

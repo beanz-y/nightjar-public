@@ -9,14 +9,15 @@
 // The payloads scanned here are never secret (an invite URL/code or a public
 // userId is meant to be shared), so decoding leaks nothing.
 //
-// jsQR is a STATIC import so it lands in the one SRI-pinned app bundle rather
-// than a separate runtime-loaded chunk: a dynamically imported chunk would carry
-// no integrity attribute and be blocked by the Integrity-Policy header (DESIGN
-// 10.2), and a security app is better served by one auditable, hash-pinned
-// bundle anyway. jsQR is pure JS with no dependencies; it is only EXECUTED on
-// browsers without a native BarcodeDetector (e.g. Firefox), never run otherwise.
+// The pure-JS decoder runs in a WORKER (src/platform/qrDecoder.ts), because on
+// the browsers that need it, which is every Firefox and Chrome on Windows, it is
+// the only decoder there is and it is O(pixels) of straight-line work. On the
+// main thread it starved the scan loop badly enough that an animated code could
+// not be read at all. It is still imported statically there, so the fallback for
+// a browser with no workers lands in the one hash-pinned bundle rather than a
+// chunk that Integrity-Policy would refuse (DESIGN 10.2).
 
-import jsQR from 'jsqr'
+import { decodeImage, decoderBusy } from '../platform/qrDecoder'
 
 type BarcodeDetectorLike = {
   detect(source: CanvasImageSource): Promise<Array<{ rawValue: string }>>
@@ -117,6 +118,10 @@ export async function decodeQrFrame(video: HTMLVideoElement, canvas: HTMLCanvasE
     }
   }
 
+  // Checked BEFORE the capture, not after: rasterizing a megapixel nobody is
+  // going to look at is the same waste in miniature.
+  if (decoderBusy()) return null
+
   const { sx, sy, side, edge } = cropRect(w, h)
   canvas.width = edge
   canvas.height = edge
@@ -129,6 +134,7 @@ export async function decodeQrFrame(video: HTMLVideoElement, canvas: HTMLCanvasE
   } catch {
     return null // tainted canvas etc.; give up on this frame
   }
-  const result = jsQR(image.data, image.width, image.height, { inversionAttempts: 'dontInvert' })
-  return result?.data ?? null
+  // The frame's buffer is handed over, not copied. Nothing reads `image` after
+  // this, and the next call captures a fresh one.
+  return decodeImage(image)
 }

@@ -9,6 +9,25 @@ or the commit page on the repository host). The format is loosely based on
 [Keep a Changelog](https://keepachangelog.com/); version headings correspond to the
 release tags cut by the deploy pipeline. Dates are the tag dates.
 
+## [1.13.1] - 2026-08-03
+
+### Fixed
+- **Reading a code no longer freezes the thread that is trying to read it.** On browsers
+  with no camera decoder of their own, which is every Firefox and Chrome on Windows, the
+  bundled decoder ran on the same thread as the app and the camera. It is a lot of
+  straight-line work per look, so the scanner managed only a handful of looks a second,
+  which is survivable for a printed code sitting still and hopeless for one that changes
+  several times a second. It now runs in a worker, and a look that is still in progress
+  makes the next frame skip rather than queue, so the loop keeps pace with the camera
+  instead of falling further behind it. The frame is handed over rather than copied, and
+  a browser without workers still scans the old way rather than not at all.
+- **Password managers can save and fill your app-lock again.** None of the secret fields
+  said what they were, so a vault often would not offer to save the passphrase at all,
+  which quietly pushes people toward something they can keep in their head. Since the
+  strength of that secret is the only thing between an imaged device and everything on
+  it, that was the wrong nudge. The app-lock, backup and restore fields now identify
+  themselves properly.
+
 ## [1.13.0] - 2026-08-03
 
 ### Added
