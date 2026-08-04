@@ -947,6 +947,15 @@ export class ContactStore {
     return out
   }
 
+  /** Forget the device list held for one account. Used when that id is retired
+   *  (an account-key rotation): a stale self entry would keep answering
+   *  "which account does this device belong to" with an id that no longer exists. */
+  async forgetKnownRoster(accountId: string): Promise<void> {
+    await this.lock.withLock(CONTACTS_LOCK, async () => {
+      await this.dropKeyed(ROSTERS_KEY, accountId)
+    })
+  }
+
   /** Move one entry of a sealed `Record<string, unknown>` blob to a new key. */
   private async moveKeyed(blobKey: string, oldId: string, newId: string): Promise<void> {
     try {

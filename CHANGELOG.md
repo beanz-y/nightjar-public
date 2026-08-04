@@ -9,6 +9,20 @@ or the commit page on the repository host). The format is loosely based on
 [Keep a Changelog](https://keepachangelog.com/); version headings correspond to the
 release tags cut by the deploy pipeline. Dates are the tag dates.
 
+## [1.14.1] - 2026-08-03
+
+### Fixed
+- **Replacing your account key could lose the account.** The new key was held in memory and
+  not written to disk until later, but the change is recorded the moment it is announced,
+  and recording it also freezes the old key's device list. So a reload in the wrong second
+  left the device holding the retired key with no way to publish under either identity: the
+  old one closed, the new one belonging to a key nothing had kept. The key is now saved
+  before anything is announced, which is the only order in which an interruption is
+  survivable. If you replaced your key on 1.14.0 and it still works, it was not affected;
+  if it stopped working, the account cannot be recovered, and we are sorry.
+- After replacing your key, your own other devices are no longer resolved against the
+  retired identity, which had quietly switched off the copies your devices send each other.
+
 ## [1.14.0] - 2026-08-03
 
 ### Added

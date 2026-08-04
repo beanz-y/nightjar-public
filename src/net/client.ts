@@ -2086,10 +2086,27 @@ export class NightjarClient {
    * again: publishRotation is idempotent for the same successor, and refuses a
    * DIFFERENT one, so a retry can never fork the account.
    */
-  async rotateAccount(onProgress?: (step: string) => void): Promise<{ accountId: string }> {
+  async rotateAccount(
+    persist: (privateKey: Uint8Array) => Promise<void>,
+    onProgress?: (step: string) => void,
+  ): Promise<{ accountId: string }> {
     const me = this.account
     const next = ed25519Generate()
     const statement = signRotation(me.accountId, me.accountKey.privateKey, next, Date.now())
+
+    // DURABLE FIRST, and this ordering is the whole safety of the operation.
+    // Recording the rotation is irreversible: the Directory keeps the first valid
+    // successor and refuses a different one, and it freezes the old account's
+    // device list at the same time. So if the new private key were only in memory
+    // when that happened, a reload before it was saved would leave this device
+    // holding the RETIRED key, unable to publish under either id: the old one is
+    // frozen and the new one belongs to a key nobody has. That is an account
+    // destroyed by a refresh, with no recovery path, so the key goes to disk
+    // before anybody is told it exists.
+    //
+    // The reverse order is merely wasteful: a key saved and then never announced
+    // is overwritten by the next attempt.
+    await persist(next.privateKey)
 
     onProgress?.('recording the change')
     await this.directory.publishRotation(encodeRotationStatement(statement))
@@ -2105,12 +2122,16 @@ export class NightjarClient {
     const roster = signRoster(statement.newAccountId, 1, devices, next.privateKey)
     await this.directory.publishRoster(encodeDeviceRoster(roster))
 
-    // Adopt it locally only after the relay has both halves, so a device that
-    // fails part-way through is still the old account and retries cleanly.
     this.accountKeyPair = next
     await this.contacts
       .putKnownRoster(statement.newAccountId, { version: 1, devices: devices.map((d) => d.deviceId) })
       .catch(() => {})
+    // Forget the list filed under the id we just retired. It names THIS account's
+    // own devices, and `accountForDevice` answers by scanning that map, so leaving
+    // it there makes every sibling device resolve to the dead account id: the
+    // self-only gate on synced copies then rejects our own devices' messages and
+    // cross-device sync silently stops working.
+    await this.contacts.forgetKnownRoster(me.accountId).catch(() => {})
 
     // Tell everyone. Contacts need it to keep talking to us; our OWN devices need
     // it because they hold the retired key and would otherwise go on signing and

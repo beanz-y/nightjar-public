@@ -1319,9 +1319,16 @@ export function useNightjar() {
    */
   const rotateAccount = useCallback(async (): Promise<string | null> => {
     const live = liveRef.current
-    if (!live) return null
+    const stores = storesRef.current
+    if (!live || !stores) return null
     try {
-      const { accountId } = await live.client.rotateAccount()
+      // The key is written to disk before the relay is told anything (see
+      // rotateAccount): recording a rotation is irreversible and freezes the old
+      // account, so a key that existed only in memory at that moment would be an
+      // account a page reload could destroy.
+      const { accountId } = await live.client.rotateAccount((priv) =>
+        saveAccountKey(stores.keys, stores.appLock, priv),
+      )
       if (!mountedRef.current) return accountId
       setAccountIkSigPub(live.client.account.accountKey.publicKey)
       await listContacts()
