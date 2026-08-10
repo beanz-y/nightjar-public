@@ -2,8 +2,13 @@
 // delivered envelope into plaintext, realising the receive-side discipline of
 // DESIGN 4.3 / 5.3 over a per-peer SESSION BOOK (docs/SESSION-GLARE.md):
 //
-//   - Everything runs under the per-peer lock (single writer) so a load ->
-//     decrypt -> persist critical section cannot interleave with a send.
+//   - Everything runs under the per-DEVICE session lock (single writer per ratchet)
+//     so a load -> decrypt -> persist critical section cannot interleave with a
+//     send on the same session. Read that name literally: it excludes writers of
+//     the same SESSION, not of the same conversation. A conversation is filed by
+//     account and can span several devices, so the operations scoped to one (the
+//     history sweep, a re-key) take no lock at all and get their exclusion from a
+//     single IndexedDB transaction instead. See `sweepHistory` in client.ts.
 //   - A message id already durably consumed (or poison-dropped) short-circuits to
 //     `duplicate`, so a redelivery is ack-and-dropped, never reprocessed.
 //   - An INITIAL (X3DH) message is checked against the persisted replay guard
@@ -180,7 +185,15 @@ async function dropAndAck(store: SessionStore, envId: string, from: string, reas
  *                persist and do not render;
  *   - `none`     nothing to persist (ephemeral / malformed / no history wired). */
 type HistoryPlan =
-  | { kind: 'put'; row: HistoryRecord }
+  /** `ifAbsent` marks a row that must not overwrite one already on disk. It is set
+   *  for the two SYNCED copies, which are a sibling device's account of a message
+   *  this device may already hold from the original sender. Both carry the ORIGINAL
+   *  timestamp, but the direct copy is stamped on arrival, so letting a forward
+   *  land on top of a direct copy (or the reverse) moves the message in the thread
+   *  on the next reload. Whoever got there first is the better answer, and this
+   *  matters more now that a sender never claims to have fanned out, so a forward
+   *  and a direct copy race on every multi-device conversation rather than rarely. */
+  | { kind: 'put'; row: HistoryRecord; ifAbsent?: boolean }
   | { kind: 'delete'; key: string }
   | { kind: 'suppress' }
   | { kind: 'none' }
@@ -234,6 +247,7 @@ async function planHistory(
     if (await deps.store.hasTombstone(key)) return { kind: 'suppress' }
     return {
       kind: 'put',
+      ifAbsent: true,
       row: deps.history.seal({
         id,
         peerId: decoded.accountId,
@@ -260,6 +274,7 @@ async function planHistory(
     if (await deps.store.hasTombstone(key)) return { kind: 'suppress' }
     return {
       kind: 'put',
+      ifAbsent: true,
       row: deps.history.seal({
         id,
         peerId: decoded.accountId,
@@ -356,6 +371,7 @@ async function handleInitial(env: Envelope, from: string, deps: InboundDeps): Pr
       initId,
       plan.kind === 'put' ? plan.row : undefined,
       plan.kind === 'delete' ? { key: plan.key } : undefined,
+      plan.kind === 'put' ? plan.ifAbsent : undefined,
     )
   } catch (e) {
     throw new HistoryPersistError(e instanceof Error ? e.message : String(e))
@@ -444,6 +460,7 @@ async function handleNormal(env: Envelope, from: string, deps: InboundDeps): Pro
       env.id,
       plan.kind === 'put' ? plan.row : undefined,
       plan.kind === 'delete' ? { key: plan.key } : undefined,
+      plan.kind === 'put' ? plan.ifAbsent : undefined,
     )
   } catch (e) {
     throw new HistoryPersistError(e instanceof Error ? e.message : String(e))

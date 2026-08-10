@@ -108,6 +108,22 @@ export class MoveBlockedError extends Error {
   }
 }
 
+/** The app-lock fired part-way through a history sweep, so the sweep's transaction
+ *  was ABORTED and no message was removed.
+ *
+ *  Thrown rather than worded here because what else survived depends entirely on
+ *  which operation was running: clearing a chat has touched nothing at all, while
+ *  deleting one has already removed the contact and its verification and will
+ *  finish the messages by itself on the next connect. One sentence cannot be true
+ *  of both, and the old one was written when the sweep ran first and so was true
+ *  of neither once the order changed. */
+export class HistorySweepLockedError extends Error {
+  constructor() {
+    super('the app locked part-way through removing saved messages')
+    this.name = 'HistorySweepLockedError'
+  }
+}
+
 // Reconnect backoff (P8): exponential with jitter, capped. A dropped socket
 // self-heals; the UI additionally kicks reconnectNow() on visibility/online.
 const RECONNECT_MIN_MS = 1000
@@ -240,6 +256,11 @@ export class NightjarClient {
    *  so a burst of messages from a peer we hold no record for causes ONE directory
    *  fetch rather than one per message. */
   private readonly recoveringContacts = new Set<string>()
+  /** Whether this connection has already asked the Directory for this account's OWN
+   *  device list. See `ownDevicesCached`: it is what turns "no stored list" from a
+   *  question worth a round trip into a settled answer, so passing a message to our
+   *  own devices costs one fetch per connection rather than one per message. */
+  private selfRosterRead = false
   /** Queued-send ids already reported as unreadable, so a stuck row is surfaced once
    *  rather than on every reconnect (mirrors `warnedSendCodes`). */
   private readonly warnedUnreadableOutbox = new Set<string>()
@@ -385,12 +406,26 @@ export class NightjarClient {
     if (this.authed?.registered) {
       void this.maybeRotateSpk().catch(() => {})
     }
+    // Tell the Directory which account this device belongs to, if it is a device
+    // of one. Idempotent and best-effort. It exists so the record heals for
+    // devices added BEFORE that record existed: nothing else would ever give them
+    // one, and without it taking such a device off a device list would silently
+    // stop retiring its prekeys.
+    if (this.authed?.registered && this.account.accountId !== this.deviceId) {
+      void this.directory.claimDevice(this.account.accountId).catch(() => {})
+    }
     // Learn our own devices before any of them can send us a copy. A freshly
     // linked device has no cached list of its own, and the self-only gate on
     // synced records is keyed on resolving a sibling to THIS account, so without
     // this the first copies from our own other devices arrive unattributable and
     // are dropped rather than saved. Cheap: one roster fetch per connect, and a
     // no-op for the single-device accounts that never publish a list.
+    //
+    // Cleared first so `ownDevicesCached` asks again on a fresh connection: a
+    // device could have been added or removed while this one was away, and the
+    // warm below is fire-and-forget, so the first inbound message may well beat
+    // it. Costs one extra resolve per connect at worst.
+    this.selfRosterRead = false
     void this.resolveDevices(this.account.accountId).catch(() => {})
     // Age out expired deleted-peer markers on disk, not just on read (8.9).
     void this.contacts.pruneDismissals().catch(() => {})
@@ -766,14 +801,34 @@ export class NightjarClient {
     // be delivered reliably, or a single lost frame would orphan the session and
     // break ALL future traffic (including non-ephemeral) to this peer.
     //
-    // `multi` doubles as the fanned-out flag, and the equivalence is exact: it is
-    // true precisely when this send addressed a device list that was actually read,
-    // so the recipient's device does not have to pass a copy to its siblings. When
-    // the list could NOT be read (offline, a relay hiccup, a build with no idea
-    // rosters exist) the flag stays clear and the recipient forwards, which is the
-    // conservative direction: a duplicate copy upserts one row, a missing one is
-    // gone.
-    const plaintext = encodeTextMessage(hexToBytes(contentIdHex), text, ephemeral, multi)
+    // THIS BUILD NEVER CLAIMS TO HAVE FANNED OUT, and the last argument being a
+    // literal `false` is the whole of that decision.
+    //
+    // The claim could only ever be an INTENT. One plaintext is sealed here, before
+    // any copy has committed, and the commit-before-release discipline forbids
+    // going back to amend it. So a failed copy still told the devices that did
+    // receive it not to pass it on, and the missed device never got that message,
+    // permanently and silently. Worse, the claim was computed from a device list
+    // that may be stale: when the relay simply withholds a roster, `resolveDevices`
+    // correctly falls back to the devices it already knew, and a device the sender
+    // has never heard of is one no sender-side retry can ever reach, because it was
+    // never attempted. That half is chosen by the untrusted party.
+    //
+    // The only honest claim is the empty one. Receivers forward, and the content id
+    // makes the duplicate free ON DISK: it upserts one row, so nobody sees a message
+    // twice.
+    //
+    // It is not free on the wire, and the real figure is worth writing down rather
+    // than rounding off. Every one of a recipient's K devices now passes the message
+    // to its K-1 siblings, so a send costs K + K(K-1) = K^2 envelopes instead of K:
+    // 4 instead of 2 at the realistic two-device case, and 64 instead of 8 at
+    // MAX_DEVICES_PER_ACCOUNT. Exactly ZERO extra for every account that never
+    // linked a device, which is almost everyone.
+    //
+    // `multi` keeps its other job below (transport ids, sent-refs, delivery
+    // marking, delete-cancellation), which is a separate concern that happens to
+    // have shared this variable.
+    const plaintext = encodeTextMessage(hexToBytes(contentIdHex), text, ephemeral, false)
     let first: OutboxEntry | null = null
     const queued: OutboxEntry[] = []
     let lastError: unknown = null
@@ -881,13 +936,50 @@ export class NightjarClient {
    */
   private async forwardToOwnDevices(fromAccount: string, contentIdHex: string, text: string, ts: number): Promise<void> {
     try {
-      const mine = (await this.resolveDevices(this.account.accountId)).filter((d) => d !== this.deviceId)
+      const mine = await this.ownDevicesCached()
       if (mine.length === 0) return
       const plaintext = encodeSyncRecvMessage(hexToBytes(contentIdHex), fromAccount, ts, text)
       for (const deviceId of mine) await this.queueControl(deviceId, plaintext).catch(() => {})
     } catch {
       /* one of my own devices missing a copy is not worth disturbing anything over */
     }
+  }
+
+  /**
+   * This account's OTHER devices, from the list already verified and stored, with
+   * no Directory call.
+   *
+   * `resolveDevices` always asks the Directory: the stored roster is its fallback
+   * for failure, not a cache. That was affordable while this path ran only for a
+   * sender who had not fanned out; now that no sender ever claims to have fanned
+   * out, it runs for EVERY message received, on every device, against the one
+   * Directory object every user shares. A round trip per received message is not
+   * a price this should pay to learn something it wrote down on connect.
+   *
+   * Reading the stored list is safe because of what it is: `putKnownRoster` only
+   * ever writes a list that verified under this account's own key and was newer
+   * than the last one, so this is a list we authenticated, not one the relay just
+   * offered. Staleness costs at most a missed forward to a device linked very
+   * recently, and this whole path is best-effort by contract. The list is
+   * refreshed on connect and on every send (`syncToOwnDevices`), so it does not
+   * drift far.
+   *
+   * An account that never linked a device has no stored roster at all, and that
+   * is indistinguishable from "linked, but this device has not read its own list
+   * yet", which is the state a freshly linked device boots into. Reading nothing
+   * and forwarding nothing would be wrong there, and it is precisely the device
+   * the forward exists to protect. So the FIRST call after a connect resolves for
+   * real; after that the answer is settled either way. One Directory round trip
+   * per connection, not one per message, which was the whole complaint.
+   */
+  private async ownDevicesCached(): Promise<string[]> {
+    const me = this.account.accountId
+    const known = await this.contacts.getKnownRoster(me).catch(() => null)
+    if (known) return known.devices.filter((d) => d !== this.deviceId)
+    if (this.selfRosterRead) return [] // asked once, no list: this account is one device
+    const devices = await this.resolveDevices(me)
+    this.selfRosterRead = true
+    return devices.filter((d) => d !== this.deviceId)
   }
 
   /** Pass an inbound delete-for-everyone on to this account's other devices, so a
@@ -899,7 +991,7 @@ export class NightjarClient {
    *  not already gone, so the duplicate is free. */
   private async forwardDeleteToOwnDevices(fromAccount: string, targetIdHex: string): Promise<void> {
     try {
-      const mine = (await this.resolveDevices(this.account.accountId)).filter((d) => d !== this.deviceId)
+      const mine = await this.ownDevicesCached()
       if (mine.length === 0) return
       const plaintext = encodeSyncRecvDeleteMessage(hexToBytes(targetIdHex), fromAccount)
       for (const deviceId of mine) await this.queueControl(deviceId, plaintext).catch(() => {})
@@ -1290,7 +1382,19 @@ export class NightjarClient {
    * must not claim to have deleted.
    */
   async clearMessages(peer: string): Promise<{ removed: number; unreadable: number }> {
-    return this.lock.withLock(sessionLock(peer), () => this.sweepHistory(peer))
+    // No lock. `peer` is an ACCOUNT and every session lock is named for a DEVICE,
+    // so taking one here borrowed a name that excluded nothing for anybody reading
+    // on more than one device. The sweep's own transaction is the exclusion now.
+    try {
+      return await this.sweepHistory(peer, Date.now())
+    } catch (e) {
+      // Nothing else in this operation touches anything, so "nothing was removed"
+      // is the whole truth here, and retrying is the whole remedy.
+      if (e instanceof HistorySweepLockedError) {
+        throw new Error('the app locked while clearing this chat; nothing was removed, try again')
+      }
+      throw e
+    }
   }
 
   /**
@@ -1315,11 +1419,21 @@ export class NightjarClient {
    * removing one row moved nothing from unreadable to readable. Keying it opaquely
    * (as history already is) is the real fix and is its own piece of work.
    *
-   * Ordering is chosen for crash recoverability, since inbound cannot interleave
-   * anyway (the whole thing runs under the per-peer lock that processInbound and
-   * sendText also take). Messages go FIRST and the contact goes LAST, so a failure
-   * part-way leaves the conversation still visible and the operation repeatable,
-   * rather than an orphaned thread the UI can no longer offer to delete.
+   * Ordering is chosen for crash recoverability. The contact record goes FIRST and
+   * the messages LAST, which is the reverse of what this used to do, and the reason
+   * is that the sweep is now ONE transaction and so cannot half-finish. The old
+   * order existed to protect against a sweep that could stop part-way; with that
+   * impossible, messages-first only bought a window in which a message arriving
+   * mid-sweep survived a delete whose contact record was about to be destroyed,
+   * leaving a nameless populated thread at the next launch. A marker written before
+   * the first step and cleared after the last makes an interruption resumable,
+   * which matters more now: once the contact is gone there is no other way to find
+   * that conversation's rows, because history keys are opaque.
+   *
+   * The residual is benign and worth naming: a message arriving between the contact
+   * removal and the sweep re-records the contact (DESIGN 8.9), so the user can be
+   * left with an EMPTY named thread they can delete again. That is a much better
+   * outcome than a populated nameless one.
    *
    * What this cannot do, and what the UI must therefore not claim: it does not
    * block them (Nightjar has no block, and their next message reopens the chat as a
@@ -1327,11 +1441,51 @@ export class NightjarClient {
    * anything already handed to the relay.
    */
   async deleteConversation(peer: string): Promise<{ removed: number; unreadable: number; cancelled: number }> {
-    return this.lock.withLock(sessionLock(peer), async () => {
-      // 1. Saved messages. The only enumerator is a full scan plus a decrypt per
-      //    row, because history keys are opaque by design.
-      const swept = await this.sweepHistory(peer)
-      // 2. Queued sends to this peer, so nothing further goes out to them. An
+    // No lock, for the reason in `clearMessages`: this is account-scoped work and
+    // every session lock names a device, so the one taken here excluded nothing
+    // for a contact with more than one device while reading as though it did. Each
+    // step below now carries its own exclusion: the sweep is one transaction, the
+    // contact writes take the contacts lock, and the outbox entries are removed by
+    // id.
+    {
+      // 1. Say that this delete is happening, before anything is destroyed. The
+      //    messages now go LAST (see the ordering note above), so an interruption
+      //    after the contact record is gone would otherwise leave rows nothing
+      //    will ever sweep: opaque keys mean there is no way to find a
+      //    conversation's messages once the name for it has been removed.
+      //
+      //    A failure here is NOT swallowed, and that is the whole point of the
+      //    marker: if it cannot be written then the recovery it exists to provide
+      //    does not exist, so this stops while everything is still intact rather
+      //    than proceeding to destroy the only name those rows have. The stamp is
+      //    what bounds the sweep and any later resume of it, so that neither can
+      //    remove a message the peer sends afterwards (DESIGN 8.9).
+      const startedAt = Date.now()
+      try {
+        await this.contacts.setPendingDelete(peer, startedAt)
+      } catch {
+        // Whatever went wrong (the idle lock landing between the click and this
+        // write is the likely one), nothing has been destroyed yet, so this is the
+        // one place in the operation where "nothing was removed" is unarguable.
+        throw new Error('could not start the delete, so nothing was removed. Try again.')
+      }
+      // 2. Mark the peer deleted, then remove the contact. Both go BEFORE the
+      //    sweep so the user can never be left looking at a populated thread
+      //    whose contact record has already been destroyed, which is what the old
+      //    order produced whenever a message landed mid-sweep: a nameless
+      //    conversation, back at the next launch, with the verification gone.
+      //
+      //    `hadSession` is captured HERE, while the book is still readable, because
+      //    it is the only honest basis for the stale-prekey judgement on a later
+      //    re-establishment: a peer deleted before any session existed never
+      //    consumed a one-time prekey (see the send path).
+      const hadSession = ((await this.store.loadBook(peer))?.sessions.length ?? 0) > 0
+      await this.contacts.markDismissed(peer, Date.now(), hadSession)
+      // The ratchet session book is INTENTIONALLY LEFT ALONE (see the doc above):
+      // it is what lets this peer keep reaching you, and its removal is what would
+      // silently destroy their messages while telling them they had arrived.
+      await this.contacts.remove(peer, Date.now())
+      // 3. Queued sends to this peer, so nothing further goes out to them. An
       //    envelope already handed to the socket is gone; we cannot recall it, and
       //    the caller's wording must not pretend otherwise. Counted because
       //    "what was still queued is gone" is something to be told, not inferred.
@@ -1353,55 +1507,106 @@ export class NightjarClient {
           cancelled++
         }
       }
-      // 3. Mark the peer deleted BEFORE the contact write, so an interruption still
-      //    leaves the marker that keeps the relay-driven paths from re-adding them.
-      //    Idempotent, and `remove` below preserves what this records.
-      //
-      //    `hadSession` is captured HERE, while the book is still readable, because
-      //    it is the only honest basis for the stale-prekey judgement on a later
-      //    re-establishment: a peer deleted before any session existed never
-      //    consumed a one-time prekey (see the send path).
-      const hadSession = ((await this.store.loadBook(peer))?.sessions.length ?? 0) > 0
-      await this.contacts.markDismissed(peer, Date.now(), hadSession)
-      // 4. The ratchet session book is INTENTIONALLY LEFT ALONE (see the doc above):
-      //    it is what lets this peer keep reaching you, and its removal is what would
-      //    silently destroy their messages while telling them they had arrived.
-      // 5. Contact, nickname, parked trust work.
-      await this.contacts.remove(peer, Date.now())
+      // 4. The messages, in one transaction (see sweepHistory). Last, and safe to
+      //    be last precisely because it is atomic: it cannot half-finish.
+      let swept
+      try {
+        swept = await this.sweepHistory(peer, startedAt)
+      } catch (e) {
+        // Everything above this line is already gone, so "nothing was removed" is
+        // false, and "try again" is not the remedy either: the marker survives and
+        // `resumePendingDeletes` finishes the messages on the next connect. Say
+        // both, because a person who is told a delete failed will otherwise go
+        // looking for a conversation that is on its way out.
+        if (e instanceof HistorySweepLockedError) {
+          throw new Error(
+            'the app locked part-way through. The contact, its verification and anything still queued are gone; ' +
+              'the saved messages will be removed the next time this device connects.',
+          )
+        }
+        throw e
+      }
+      // Clearing the marker is best-effort ON PURPOSE, and the asymmetry with
+      // step 1 is deliberate: failing to WRITE it loses the recovery, while
+      // failing to CLEAR it costs at most one repeat sweep, which is bounded by
+      // `startedAt` and therefore removes nothing a repeat should not remove.
+      await this.contacts.clearPendingDelete(peer).catch(() => {})
       return { ...swept, cancelled }
-    })
+    }
   }
 
-  /** Remove every history row belonging to `peer`. Caller holds the per-peer lock,
-   *  which is what makes the scan's snapshot authoritative: without it, a message
-   *  committing mid-scan would survive and re-hydrate the "deleted" conversation. */
-  private async sweepHistory(peer: string): Promise<{ removed: number; unreadable: number }> {
-    if (!this.history) return { removed: 0, unreadable: 0 }
-    const rows = await this.store.historyLoadAll()
-    let removed = 0
+  /** Finish any delete whose sweep did not run, e.g. the app was closed between
+   *  removing the contact and removing the messages. Called on connect, with the
+   *  rest of the catch-up work.
+   *
+   *  Cheap in the normal case: the marker list is empty, so this is one sealed
+   *  read and no scan at all.
+   *
+   *  Bounded by the stamp the delete was asked for, NOT by now. A marker can sit
+   *  through several connects if the sweep keeps failing, and in that time the peer
+   *  may well have written again, which DESIGN 8.9 says re-opens the conversation.
+   *  Sweeping to `now` would quietly destroy those messages on every connect until
+   *  it happened to succeed, so the resume removes exactly what the original delete
+   *  would have removed and nothing that arrived since. */
+  async resumePendingDeletes(): Promise<void> {
+    for (const { peer, startedAt } of await this.contacts.pendingDeletes()) {
+      try {
+        await this.sweepHistory(peer, startedAt)
+        await this.contacts.clearPendingDelete(peer)
+      } catch {
+        /* left marked on purpose: the next connect tries again */
+      }
+    }
+  }
+
+  /**
+   * Remove every history row belonging to `peer`, in ONE IndexedDB transaction.
+   *
+   * That transaction, not a lock, is what makes the scan authoritative, and the
+   * distinction matters because no lock could do it: this operation is scoped to
+   * an ACCOUNT while every writer is scoped to a DEVICE, so for anybody reading on
+   * more than one device the sweep and an inbound write were never mutually
+   * exclusive, and a message committing mid-scan survived a delete that reported
+   * it gone. Overlapping read-write transactions are serialized, so a write now
+   * lands either entirely before this (and is removed) or entirely after it (and
+   * is a message that arrived after the delete, which DESIGN 8.9 already covers by
+   * re-opening the conversation).
+   *
+   * The whole scan fits in one transaction only because opening a row is
+   * SYNCHRONOUS: it is noble XChaCha under a synchronous HMAC key, so the cursor
+   * never yields and the transaction cannot die under it. That is the property to
+   * check before anyone makes history crypto async.
+   *
+   * `before` bounds the sweep to messages that already existed when the user asked
+   * for it, and every caller passes one. It is what stops this being a standing
+   * order to delete: a sweep can be interrupted and resumed on a later connect (see
+   * `resumePendingDeletes`), and by then the peer may have written again, which
+   * DESIGN 8.9 says re-opens the conversation. Without the bound the resume would
+   * destroy that message instead, silently, while its sender was told delivered.
+   * It also removes the residual the reorder used to carry, since a message landing
+   * between the contact removal and the sweep is now kept rather than swept.
+   */
+  private async sweepHistory(peer: string, before: number): Promise<{ removed: number; unreadable: number }> {
+    const history = this.history
+    if (!history) return { removed: 0, unreadable: 0 }
     let unreadable = 0
-    for (const row of rows) {
+    const removed = await this.store.historySweep((row) => {
       let msg
       try {
-        msg = this.history.open(row)
-      } catch (e) {
+        msg = history.open(row)
+      } catch {
         // A row that cannot be opened is normally corruption, and is counted so the
         // caller never claims to have deleted it. But the SAME throw happens when
         // the idle app-lock fires mid-sweep and discards the key: every remaining
-        // row would then "fail to open", the sweep would report a tidy count, and
-        // the caller would go on to destroy the session and the outbox having
-        // deleted almost nothing. Fail the whole operation instead, so the user is
-        // told and can retry with the conversation still intact.
-        if (!this.history.isUnlocked) {
-          throw new Error('the app locked while deleting; nothing further was removed, try again')
-        }
+        // row would then "fail to open" and the sweep would report a tidy count for
+        // work it did not do. Throwing here ABORTS the transaction, so nothing is
+        // removed and the conversation is still whole when the user retries.
+        if (!history.isUnlocked) throw new HistorySweepLockedError()
         unreadable++
-        continue
+        return false
       }
-      if (msg.peerId !== peer) continue
-      await this.store.historyRemove(row.key)
-      removed++
-    }
+      return msg.peerId === peer && msg.ts <= before
+    })
     return { removed, unreadable }
   }
 
@@ -2399,28 +2604,25 @@ export class NightjarClient {
   private async renameHistory(oldId: string, newId: string, onProgress?: (done: number, total: number) => void): Promise<number> {
     const history = this.history
     if (!history) return 0
-    return this.lock.withLock(sessionLock(oldId), async () => {
-      const rows = await this.store.historyLoadAll()
-      const mine: Array<{ rec: HistoryRecord; msg: HistoryMessage }> = []
-      for (const rec of rows) {
-        try {
-          const msg = history.open(rec)
-          if (msg.peerId === oldId) mine.push({ rec, msg })
-        } catch {
-          /* an unopenable row names nobody, so it belongs to no rename */
-        }
+    // ONE transaction, and no lock, for the same reasons as sweepHistory: this is
+    // account-scoped work, every session lock names a device, and the previous
+    // shape held a lock on the SOURCE conversation while blind-putting into a
+    // DESTINATION it did not lock, with a yield to the event loop in between. Both
+    // sealing and opening a row are synchronous, so the whole re-key fits inside
+    // the transaction and a message can never end up lost or present under both
+    // names.
+    const moved = await this.store.historyRekey((rec) => {
+      let msg
+      try {
+        msg = history.open(rec)
+      } catch {
+        return null // an unopenable row names nobody, so it belongs to no rename
       }
-      let done = 0
-      for (let i = 0; i < mine.length; i += HISTORY_IMPORT_BATCH) {
-        const slice = mine.slice(i, i + HISTORY_IMPORT_BATCH)
-        await this.store.historyPutMany(slice.map(({ rec, msg }) => history.seal({ ...msg, peerId: newId }, rec.failed)))
-        for (const { rec } of slice) await this.store.historyRemove(rec.key).catch(() => {})
-        done += slice.length
-        onProgress?.(done, mine.length)
-        await new Promise((r) => setTimeout(r, 0))
-      }
-      return mine.length
+      if (msg.peerId !== oldId) return null
+      return history.seal({ ...msg, peerId: newId }, rec.failed)
     })
+    onProgress?.(moved, moved)
+    return moved
   }
 
   /**

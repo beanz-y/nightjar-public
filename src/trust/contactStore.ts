@@ -76,6 +76,17 @@ const RENAME_KEY = 'contacts.renames.v1'
  *  checked against the account's signed device list. Sealed with the rest: it is a
  *  map of who this device talks to and how many machines they read on. */
 const DEVICE_CLAIMS_KEY = 'contacts.deviceclaims.v1'
+/** Conversations whose delete started but has not finished sweeping. */
+const DELETE_PENDING_KEY = 'contacts.deletes.v1'
+
+/** One conversation whose delete began and whose messages have not all gone yet.
+ *  `startedAt` is when the user asked, and it bounds both the original sweep and
+ *  any later resume of it, so that neither removes a message the peer sent after
+ *  the request (which re-opens the conversation, DESIGN 8.9). */
+export interface PendingDelete {
+  peer: string
+  startedAt: number
+}
 /** Peers owed a session-refresh ping after a move (Phase D, 8.3), drained by the
  *  client once the post-move re-registration succeeds. Durable so a crash between
  *  the move and the first connect cannot lose the list.
@@ -376,9 +387,13 @@ export class ContactStore {
    */
   async remove(peerId: string, now: number): Promise<void> {
     // Three separate blobs, so three separate holds of the contacts lock rather
-    // than one nested hold (the lock is a plain mutex, not re-entrant). The caller
-    // holds the per-peer session lock across the whole delete, which is what makes
-    // the sequence atomic against sending and receiving.
+    // than one nested hold (the lock is a plain mutex, not re-entrant).
+    //
+    // Nothing here is atomic against sending or receiving, and an earlier version
+    // of this comment claimed it was. The caller holds no session lock: it could
+    // not usefully, because a delete is scoped to an ACCOUNT while every session
+    // lock is named for a DEVICE. A message arriving mid-delete re-records the
+    // contact, which is DESIGN 8.9's designed behavior rather than a race to close.
     await this.mutateWithDismissals((map, dismissals) => {
       delete map[peerId]
       // `markDismissed` normally ran first and already recorded whether a session
@@ -1009,6 +1024,67 @@ export class ContactStore {
     const out: Record<string, string> = {}
     for (const [k, v] of Object.entries(m)) if (typeof v === 'string') out[k] = v
     return out
+  }
+
+  // --- deletes that have started but not finished --------------------------
+  //
+  // Deleting a conversation is several durable steps, and the messages now go
+  // LAST so a person cannot end up with a populated thread whose contact record
+  // has already been destroyed. That ordering needs a marker: without one, an
+  // interruption after the contact is gone leaves rows nothing will ever sweep.
+  //
+  // Each entry carries WHEN the delete was asked for, and that stamp is not
+  // decoration. A marker can outlive several connects if the sweep keeps failing,
+  // and in that time the peer may write again, which re-opens the conversation
+  // (DESIGN 8.9). The stamp is what keeps this a record of one past request rather
+  // than a standing order to delete whatever that conversation holds next.
+
+  async setPendingDelete(peerId: string, startedAt: number): Promise<void> {
+    await this.lock.withLock(CONTACTS_LOCK, async () => {
+      // NOT `.catch(() => [])`. An unreadable list here would silently drop every
+      // other pending delete, and each of those is a conversation whose contact
+      // record is already gone, so nothing else could ever find its messages
+      // again. Failing is the safe direction: the caller has destroyed nothing
+      // yet, and it stops rather than proceeding without recovery.
+      const list = await this.loadPendingDeletes()
+      const next = [...list.filter((d) => d.peer !== peerId), { peer: peerId, startedAt }]
+      await this.putSealed(DELETE_PENDING_KEY, DELETE_PENDING_KEY, encoder.encode(JSON.stringify(next)))
+    })
+  }
+
+  async clearPendingDelete(peerId: string): Promise<void> {
+    await this.lock.withLock(CONTACTS_LOCK, async () => {
+      const list = await this.loadPendingDeletes()
+      if (!list.some((d) => d.peer === peerId)) return
+      const next = list.filter((d) => d.peer !== peerId)
+      if (next.length === 0) await this.store.delete(DELETE_PENDING_KEY)
+      else await this.putSealed(DELETE_PENDING_KEY, DELETE_PENDING_KEY, encoder.encode(JSON.stringify(next)))
+    })
+  }
+
+  /** Fail-CLOSED to "none": an unreadable marker must not make a caller sweep
+   *  conversations it was never asked to delete. */
+  async pendingDeletes(): Promise<PendingDelete[]> {
+    try {
+      return await this.loadPendingDeletes()
+    } catch {
+      return []
+    }
+  }
+
+  private async loadPendingDeletes(): Promise<PendingDelete[]> {
+    const bytes = await this.getSealed(DELETE_PENDING_KEY, DELETE_PENDING_KEY)
+    if (!bytes) return []
+    const list = JSON.parse(decoder.decode(bytes)) as unknown
+    if (!Array.isArray(list)) return []
+    // An entry with no usable stamp is DROPPED rather than swept unbounded. This
+    // blob has never shipped, so the only way to hold one is to have crashed
+    // mid-delete on an unreleased build; losing the resume there costs a
+    // conversation the user must delete again, which beats a sweep with no bound.
+    return list.filter(
+      (d): d is PendingDelete =>
+        !!d && typeof d === 'object' && typeof d.peer === 'string' && Number.isFinite(d.startedAt),
+    )
   }
 
   /** Forget the device list held for one account. Used when that id is retired

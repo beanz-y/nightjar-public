@@ -75,6 +75,14 @@ const FLAG_EPHEMERAL = 0x01
  * Read the ABSENCE, not the presence: a message with the bit clear is one nobody
  * promised to have fanned out, which is every message from every build that
  * predates multi-device. That is exactly the population this exists to cover.
+ *
+ * NO BUILD FROM v1.14.3 ONWARD SETS THIS BIT, and it is kept anyway. The claim
+ * could only ever be an intent (the plaintext is sealed before any copy commits),
+ * and a wrong intent loses a message permanently and silently, so the send path
+ * now always passes false. It stays defined, read and honored because senders
+ * running v1.12.0 through v1.14.2 will keep setting it for as long as they are out
+ * there, and a receiver must keep doing what those senders asked. Treat bit1 as
+ * spent: do not reuse it for something else.
  */
 const FLAG_FANNED = 0x02
 /** Defensive cap on a decoded body. The send path caps at 8000 chars and the

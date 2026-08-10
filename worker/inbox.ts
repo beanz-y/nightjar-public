@@ -34,6 +34,7 @@ import type {
   ClientMessage,
   DeliveredCheckMsg,
   FetchBundleMsg,
+  ClaimDeviceMsg,
   FetchRosterMsg,
   FetchRotationMsg,
   PresenceMsg,
@@ -258,6 +259,8 @@ export class Inbox {
         return this.doPublishRotation(ws, msg)
       case 'fetchRotation':
         return this.doFetchRotation(ws, msg)
+      case 'claimDevice':
+        return this.doClaimDevice(ws, userId, msg)
       case 'registerDevice':
         return this.doRegisterDevice(ws, userId, msg)
       case 'sendLink':
@@ -353,6 +356,23 @@ export class Inbox {
         statement: msg.statement,
       })
       this.sendTo(ws, { t: 'rotationPublished', reqId: msg.reqId, newAccountId: r.newAccountId })
+    } catch (e) {
+      this.replyError(ws, e, msg.reqId)
+    }
+  }
+
+  /** Re-assert this device's account (Sesame). Unlike the roster ops above this
+   *  one IS forwarded with the authenticated user id, because the whole point is
+   *  that the DEVICE is speaking for itself: the id must be the one this socket
+   *  proved, never a claim in the body. */
+  private async doClaimDevice(ws: WebSocket, userId: string, msg: ClaimDeviceMsg): Promise<void> {
+    try {
+      const r = await callDO<{ claimed: boolean }>(directoryStub(this.env), '/claimDevice', {
+        deviceId: userId,
+        accountId: msg.accountId,
+        now: Date.now(),
+      })
+      this.sendTo(ws, { t: 'deviceClaimed', reqId: msg.reqId, claimed: r.claimed })
     } catch (e) {
       this.replyError(ws, e, msg.reqId)
     }

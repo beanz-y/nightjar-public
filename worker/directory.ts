@@ -196,6 +196,8 @@ export class Directory {
           return json(this.fetchRoster((await req.json()) as { accountId: string }))
         case '/publishRotation':
           return json(this.publishRotation((await req.json()) as PublishRotationBody))
+        case '/claimDevice':
+          return json(this.claimDevice((await req.json()) as { deviceId: string; accountId: string; now: number }))
         case '/fetchRotation':
           return json(this.fetchRotation((await req.json()) as { accountId: string }))
         default:
@@ -467,6 +469,40 @@ export class Directory {
    *  saw it register", which every caller must read as a reason to do LESS, never
    *  as permission to act. Devices registered before this table existed have no
    *  row, so the rules below fail safe for them rather than newly refusing them. */
+  /**
+   * Re-assert what `/registerDevice` would have recorded: this device belongs to
+   * this account. Cheap, idempotent, and safe to call on every connect.
+   *
+   * It exists to make the claim record SELF-HEALING. Devices that were added
+   * before claims existed have no row, and nothing else would ever give them one:
+   * registration happens once, at link time, and the prekey republishing a device
+   * does afterwards says nothing about which account it belongs to. Without this
+   * they would be permanently unremovable in the sense that matters, because
+   * `dropUnlistedDevices` refuses to retire prekeys it never saw claimed, so
+   * taking such a device off the list would silently stop retiring its keys.
+   *
+   * The authorization is the same one registration uses and is no weaker: the
+   * device id is SERVER-VERIFIED from the authenticated socket, and the account it
+   * names must already list it in a roster signed by that account's key. Neither
+   * half can be supplied by the other party.
+   */
+  private claimDevice(body: { deviceId: string; accountId: string; now: number }): { claimed: boolean } {
+    const roster = this.sql.exec('SELECT blob FROM rosters WHERE account_id = ?', body.accountId).toArray()[0] as
+      | { blob: string }
+      | undefined
+    if (!roster) throw new DirectoryError('no_roster', 'that account has not listed any devices')
+    const listed = (JSON.parse(roster.blob) as WireDeviceRoster).devices.some((d) => d.deviceId === body.deviceId)
+    if (!listed) throw new DirectoryError('not_listed', 'that account has not listed this device')
+    this.sql.exec(
+      'INSERT INTO device_claims (device_id, account_id, claimed_at) VALUES (?, ?, ?) ' +
+        'ON CONFLICT(device_id) DO UPDATE SET account_id = excluded.account_id, claimed_at = excluded.claimed_at',
+      body.deviceId,
+      body.accountId,
+      body.now,
+    )
+    return { claimed: true }
+  }
+
   /** Whether `accountId` is what `deviceId` became, following the recorded
    *  rotations forward.
    *

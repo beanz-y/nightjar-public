@@ -122,6 +122,16 @@ export class DirectoryClient {
     return { roster, rotation }
   }
 
+  /** Re-assert that this device belongs to `accountId` (Sesame). Idempotent, and
+   *  best-effort by contract: the caller sends it on connect and ignores failure,
+   *  because a device that cannot say so is exactly as reachable as before. */
+  async claimDevice(accountId: string): Promise<boolean> {
+    const id = reqId()
+    const r = await this.transport.request(id, { t: 'claimDevice', reqId: id, accountId })
+    if (r.t !== 'deviceClaimed') throw new Error(`claimDevice: unexpected ${r.t}`)
+    return r.claimed
+  }
+
   /** Record which key replaces this account's (Sesame, account-key rotation).
    *  The statement is its own authorization, so like a roster this works from any
    *  device of the account. Returns the successor the Directory has on record,

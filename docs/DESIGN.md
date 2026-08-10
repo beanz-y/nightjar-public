@@ -1165,16 +1165,47 @@ marker that stops the app re-adding them on its own initiative. It deliberately
 does **not** remove the ratchet session; the bullets below say why, and what that
 costs.
 
-Both run under the per-peer lock that sending and receiving take, so nothing can
-interleave. Both require the app to be UNLOCKED, since every opaque-keyed trace
-needs the Local Data Key; if the idle lock fires mid-sweep the operation fails
-loudly and removes nothing further, rather than reporting a tidy count for work it
-did not do. Rows that cannot be opened at all are reported separately and never
+**What makes the sweep authoritative is a database transaction, not a lock.** An
+earlier version of this section said both actions ran under the per-peer lock, so
+nothing could interleave. That was true only for a contact who reads on ONE device.
+A delete is scoped to an ACCOUNT while every session lock is named for a DEVICE
+(3.1), so for anyone with a linked device the sweep and an arriving message were
+never mutually exclusive, and a message committing mid-scan survived a delete that
+had already counted it as gone. The scan is now a single IndexedDB read-write
+transaction, which is possible only because opening a history row is synchronous,
+so the cursor never yields. Overlapping transactions are serialized, so an arriving
+message lands either entirely before the sweep (and goes with the rest) or entirely
+after it (and is a message that arrived after the delete, which reopens the
+conversation, below). No lock is taken at all.
+
+Both require the app to be UNLOCKED, since every opaque-keyed trace needs the Local
+Data Key. If the idle lock fires mid-sweep the transaction is ABORTED, so no message
+is removed and the conversation is intact. What else survives depends on which
+action was running, and the app says so rather than printing one sentence for both:
+clearing a chat has touched nothing, so it can be retried; deleting one has already
+removed the contact and its verification, and finishes the messages by itself on the
+next connection. Rows that cannot be opened at all are reported separately and never
 counted as deleted, and that figure is database-wide, because an unopenable row
-cannot be attributed to any conversation. Messages are removed FIRST and the contact LAST: history rows are keyed
-by an opaque HMAC (8.5) with no per-peer index, so the only way to find them is to
-decrypt every row and match, and ordering it this way means an interruption leaves
-a conversation that is still visible and still deletable rather than an orphan.
+cannot be attributed to any conversation.
+
+**The contact record is removed FIRST and the messages LAST**, which is the reverse
+of the original order, because that order existed to guard against a sweep that
+could stop part-way and a single transaction cannot. Messages-first only bought a
+window in which a message landing mid-sweep survived a delete whose contact record
+was about to be destroyed: a nameless populated thread at the next launch, with the
+verification already gone. Contact-first needs a durable marker, because history
+rows are keyed by an opaque HMAC (8.5) with no per-peer index, so once the name is
+gone there is no way left to find that conversation's rows. The marker is written
+before anything is destroyed and cleared after the sweep; if it cannot be written
+the delete does not start. An interrupted delete finishes on the next connection.
+
+That marker records WHEN the delete was asked for, and both the sweep and any later
+resume of it are bounded by that stamp. Without the bound a marker that outlived
+several failed attempts would become a standing order: the peer writes again, which
+reopens the conversation by design, and the resume would then destroy that message
+on every connection until it happened to succeed, silently, while its sender was
+told delivered. With it, a message that arrives after the request is kept, which is
+the same behavior as one arriving after the delete finished.
 
 What it can honestly claim, and what it cannot:
 
@@ -1342,13 +1373,61 @@ whole path back to precisely the one-envelope send it has always been. That is t
 property that keeps this safe for every conversation that exists today, and it is
 the first thing the tests assert.
 
-**Being sent to by an older build.** A sender that has never heard of device lists
-addresses one device, and that is most contacts for a long time. So a message
-carries a bit saying whether it was fanned out, and a device receiving one WITHOUT
-that bit passes a copy to its own siblings. Read the absence, not the presence: no
-claim means nobody promised the others got it. Session-only messages (8.7) are
-never passed on, because a forward would sit in an outbox until delivered, which is
-a durable record of the one kind that promised not to leave one.
+**Passing a message on to your own devices.** A sender that has never heard of
+device lists addresses one device, and that is most contacts for a long time. So a
+message carries a bit saying whether it was fanned out, and a device receiving one
+WITHOUT that bit passes a copy to its own siblings. Read the absence, not the
+presence: no claim means nobody promised the others got it. Session-only messages
+(8.7) are never passed on, because a forward would sit in an outbox until
+delivered, which is a durable record of the one kind that promised not to leave one.
+
+**No sender sets that bit any more, and the bit is kept anyway.** It could only ever
+have been an INTENT. One plaintext is sealed before any copy has committed, and the
+commit-before-release discipline (5.3) forbids going back to amend it, so a copy
+that failed still told the copies that landed not to pass the message on, and the
+device that was missed never received it, permanently and silently. The claim was
+also computed from a list that may be stale: when the relay simply withholds a
+device list, the sender correctly falls back to the devices it already knew, and a
+device it has never heard of is one no sender-side retry can reach, because it was
+never attempted. That half is chosen by the untrusted party. So the only honest
+claim is the empty one, and every device now always passes a message to its
+siblings. Receivers still HONOR the bit, because senders running the builds that set
+it will be out there for a long time, and a receiver must keep doing what those
+senders asked. Treat the bit as spent: it must not be reused for anything else.
+
+**What that costs, in numbers rather than adjectives.** Each of a recipient's K
+devices passes the message to its K-1 siblings, so a send is K + K(K-1) = K²
+envelopes instead of K: four instead of two for the common two-device case, and
+sixty-four instead of eight at `MAX_DEVICES_PER_ACCOUNT` (14). Exactly zero extra
+for an account that never linked a device, which is almost every account. Nobody
+sees a message twice, because both copies carry the same content id and upsert one
+row, and the copy already on disk is the one kept: they arrive with different
+timestamps, so letting either overwrite the other would move the message in the
+thread on the next reload. What this still does NOT fix, and is disclosed rather
+than engineered around: a device offline past the envelope TTL still loses the
+message, so does one whose siblings are all offline for that whole window, and
+nothing tells either side that a device was missed.
+
+**Filing a message under a person needs BOTH of them to say so.** A conversation is
+filed by ACCOUNT while sessions run between DEVICES, so a receiver has to answer
+"whose device is this?" and a signed list alone cannot answer it. Signing a list
+only proves the account SAID it: a device is named by a public value, so anyone can
+list anyone's device in a list that verifies perfectly. Attribution therefore takes
+two independent halves. The account must list the device, and the device must
+itself have said which account it belongs to, over a session that runs on that
+device's own key. Neither party can supply the other's half. When two accounts name
+the same device, only one of them can be right, so NEITHER gets it and the person is
+told. A device that is its own account is exempt, because a first device's account
+key IS its device key and it never introduces itself.
+
+The Directory keeps its own record of which devices it watched register under which
+account, and that record is what it consults before retiring a device's prekeys, so
+that listing a stranger's device and then dropping it cannot delete the keys other
+people need to reach them. It is not an authority on ownership and is not offered as
+one: it is a rule about what the relay is willing to DELETE, and it is worth nothing
+against the operator. It self-heals, because a device re-asserts its account on
+every connection, which is the only way a device linked before that record existed
+could ever acquire one.
 
 **Linking.** The new device shows a QR carrying its device key and a fresh 32-byte
 secret; an existing device photographs it, adds that device to the account's signed
@@ -1998,16 +2077,17 @@ Native (Tauri) is **not** on the critical path; it is a demand-gated v2 (10.5).
 | Backup blob format | magic `"NJBK"`, format version `0x01`, then m/t/p/salt header, then AEAD body; download-only in v1 | 8.3 |
 | Move file format | magic `"NJMV"`, format version `0x01`, same m/t/p/salt header + AEAD body as the backup blob but key+nonce via HKDF info `"Nightjar_Move_v1"` (domain-separated from the backup); passphrase is generated-only (~100 bits) and canonicalized (NFC, lowercase, base32-alphabet only) before the KDF; payload cap 16 MiB (checked against file size before read, header before KDF, and before parse), <= 90000 messages, <= 1000 contacts, <= 200 deletion markers; refuse-over-cap, never truncate | 8.3 |
 | Portable history unit | `{ t: "njhist", hv: 1, messages: [...] }` embedded in the move payload; self-bounding (own row and total-text budgets, not the envelope's) and self-versioning so a future multi-device link reuses it without the passphrase envelope; per-row `kind` reserved | 8.3 |
-| Message payload format | magic `"NJM1"`, format version `0x01`, kind (`0x01` text / `0x02` delete / `0x03` session-refresh / `0x04` retry-request / `0x05` device hello / `0x06` sync-sent / `0x07` sync-delete / `0x08` sync-received / `0x09` sync-received-delete), 16-B content msgId, then (text) a flags byte (bit0 = ephemeral, **bit1 = fanned out to the recipient's whole device list**, other bits reserved) + utf8 body; the ratchet plaintext. Kinds `0x06`-`0x09` are accepted ONLY from a device of this same account, proven by that account's signed device list, because each of them writes into or deletes from local history; `0x08`/`0x09` additionally attribute an INBOUND message to a third party, so without that check anyone could put words in a contact's mouth. A payload with no magic is legacy plain text; a magic-but-invalid/unknown-version/unknown-kind payload is clean-ignored (never thrown or rendered), which is exactly how kind `0x03` renders on every build: nothing, while the fresh session it rides still promotes. Kind `0x04` is the one control the receiver acts on, and reads as that same clean-ignored nothing on any build older than it (8.10). A `0x04` record carries no target, because a device that could not decrypt never learned a content id | 8.5, 8.10 |
+| Message payload format | magic `"NJM1"`, format version `0x01`, kind (`0x01` text / `0x02` delete / `0x03` session-refresh / `0x04` retry-request / `0x05` device hello / `0x06` sync-sent / `0x07` sync-delete / `0x08` sync-received / `0x09` sync-received-delete), 16-B content msgId, then (text) a flags byte (bit0 = ephemeral, **bit1 = fanned out to the recipient's whole device list, SET BY NO CURRENT BUILD**, other bits reserved) + utf8 body; the ratchet plaintext. Bit1 could only ever state an intent (the plaintext is sealed before any copy commits, from a list that may be stale), and a wrong intent loses a message permanently and silently, so senders now always leave it clear and every device passes a message to its siblings (8.11). It stays defined and HONORED on receive because senders on older builds keep setting it; it is spent, and must not be reused. Kinds `0x06`-`0x09` are accepted ONLY from a device of this same account, proven by that account's signed device list, because each of them writes into or deletes from local history; `0x08`/`0x09` additionally attribute an INBOUND message to a third party, so without that check anyone could put words in a contact's mouth. A payload with no magic is legacy plain text; a magic-but-invalid/unknown-version/unknown-kind payload is clean-ignored (never thrown or rendered), which is exactly how kind `0x03` renders on every build: nothing, while the fresh session it rides still promotes. Kind `0x04` is the one control the receiver acts on, and reads as that same clean-ignored nothing on any build older than it (8.10). A `0x04` record carries no target, because a device that could not decrypt never learned a content id | 8.5, 8.10 |
 | Content vs transport id | the 16-B content msgId lives inside the ratchet plaintext (history key / delete target); the relay-visible transport envelope id is separate (dedup/ack/outbox). A first-send text may reuse its content id as the transport id (brand-new, safe); a delete gets its own fresh transport id | 8.5 |
 | Delete-for-everyone | `delete{targetContentId}` (kind `0x02`) sent on the current session with its OWN fresh transport id; receiver removes only the compound (this peer, dir=in, target id), records a **tombstone** (opaque history key, TTL = envelope TTL 30 d) so a target arriving after its delete is suppressed; removal + tombstone ride the same tx as the ratchet advance. A still-outboxed target is cancelled, not chased. Best-effort, honest-client-dependent; UI says "delete sent" | 8.6 |
 | Session-only (ephemeral) | NJM1 text with flags bit0 set; **never** sealed to history on either device (send-side seal skipped, receive-side persist gate fails closed). RAM-only, cleared on reload/lock. Delivered EXACTLY like any message (same outbox + ack + retransmit, so a session-establishing initial is reliable); it removes only the persistent history row and leaves no EXTRA at-rest trace (the unencrypted session state any message updates still keys on the peer + stamps the send time). Encrypted identically in transit; does not hide relay metadata or the push nudge; off-the-record courtesy, not a guarantee; delete-for-everyone hidden on ephemeral bubbles; rendered live in other open **unlocked** tabs via a same-origin render `BroadcastChannel` (render-only, never leaves the browser, closed while locked), so the remaining miss is only a tab closed/locked/reloaded at arrival | 8.7 |
-| Delete a conversation | two actions: clear the saved messages, or delete everything local for that peer (messages, contact, verification, nickname, queued sends, parked trust work). Runs under the per-peer session lock; messages removed FIRST, contact LAST, so an interruption leaves a still-deletable conversation. NOT a block (none exists). The ratchet session is deliberately KEPT so the peer can still reach you: destroying it would silently drop their messages while the relay reported **delivered** to them, lying to both sides at once. Their next message reopens the chat and re-records them as an `unverified` TOFU contact (key re-fetched, binding-checked), so a delete costs the **verification**, not the ability to reach you. Disclosed cost: the kept session names them at rest, in a store that already names every contact in cleartext (opaque session keys tracked separately). A deleted peer goes in an app-lock-sealed, 30-day, 200-entry list that ONLY the relay-driven paths (mutual-invite sync, pending-trust retry) consult, so the app never re-adds them on its own; a message from them or a user re-add lifts it. Dropped by the forgot-secret reset and by restore, and a backup predating the delete restores the contact. Tombstones, replay-guard entries and dedup ids deliberately survive (unattributable, and removing them would break 8.6/4.3/dedup). A delete never forces a re-establishment; if one happens anyway inside `OPK_VEND_TTL_MS` for a peer who HAD a session when deleted, the no-OPK path is used, since the directory would re-serve a prekey that peer already consumed | 8.9 |
+| Delete a conversation | two actions: clear the saved messages, or delete everything local for that peer (messages, contact, verification, nickname, queued sends, parked trust work). Takes NO lock: a delete is account-scoped while every session lock names a device, so the lock it used to take excluded nothing for a contact with a linked device. The message sweep is ONE IndexedDB transaction instead, which serializes against every writer and cannot half-finish (possible only because opening a row is synchronous). Contact FIRST, messages LAST, behind an app-lock-sealed marker written before anything is destroyed and cleared after the sweep; if the marker cannot be written the delete does not start, and an interrupted one resumes on the next connect. The marker carries the time the delete was asked for, and BOTH the sweep and any resume are bounded by it, so neither can remove a message the peer sent afterwards (which reopens the conversation, as it always has). If the app-lock fires mid-sweep the transaction aborts and no message is removed. NOT a block (none exists). The ratchet session is deliberately KEPT so the peer can still reach you: destroying it would silently drop their messages while the relay reported **delivered** to them, lying to both sides at once. Their next message reopens the chat and re-records them as an `unverified` TOFU contact (key re-fetched, binding-checked), so a delete costs the **verification**, not the ability to reach you. Disclosed cost: the kept session names them at rest, in a store that already names every contact in cleartext (opaque session keys tracked separately). A deleted peer goes in an app-lock-sealed, 30-day, 200-entry list that ONLY the relay-driven paths (mutual-invite sync, pending-trust retry) consult, so the app never re-adds them on its own; a message from them or a user re-add lifts it. Dropped by the forgot-secret reset and by restore, and a backup predating the delete restores the contact. Tombstones, replay-guard entries and dedup ids deliberately survive (unattributable, and removing them would break 8.6/4.3/dedup). A delete never forces a re-establishment; if one happens anyway inside `OPK_VEND_TTL_MS` for a peer who HAD a session when deleted, the no-OPK path is used, since the directory would re-serve a prekey that peer already consumed | 8.9 |
 | App-lock + at-rest data | random 32-B **LDK** wraps all local at-rest data; the LDK is never stored unwrapped, only wrapped per method: passphrase/PIN via `HKDF(Argon2id(secret, 64 MiB/t3/p1, 16-B salt), 16-B salt, "Nightjar_LockWrap_v1")`, biometric via `HKDF(prfSecret, 16-B salt, same info)`, each `XChaCha20-Poly1305(kek, LDK)` with the method kind bound in the AAD. Mandatory; >=1 knowledge factor; PIN min 6 digits (disclosed weak). Sub-keys `HKDF(LDK, "Nightjar_HistBody_v1" / "Nightjar_HistIndex_v1" / "Nightjar_Contacts_v1" / "Nightjar_SessBody_v1" / "Nightjar_SessIndex_v1" / "Nightjar_Prekeys_v1")`, derived once per unlock and overwritten (best-effort) on lock | 8.5 |
 | History at rest | per-message record in the sessions IndexedDB; the **whole message** (content id, peer, direction, ts, text) sealed with XChaCha20-Poly1305 under key+nonce = HKDF(history-body sub-key, **fresh 16-B per-record salt**, info `"Nightjar_History_v1"`); IndexedDB key = `hex(HMAC(history-index sub-key, peer‖dir‖id))` (opaque: the DB reveals no peer, direction, timestamp or content). What it DOES still reveal is the NUMBER of stored messages (one row each) and each message's approximate length (ciphertext is unpadded, 9), plus a plaintext `failed` flag marking a permanently failed send; AAD binds that storage key + a history-format version; written in the same tx as the ratchet advance + dedup marker. Contacts/pending/aliases sealed under the contacts sub-key with a fresh 16-B salt | 8.5 |
 | Sessions + send queue at rest | the ratchet **SessionBook** is sealed with XChaCha20-Poly1305 under key+nonce = HKDF(session-body sub-key, **fresh 16-B per-record salt**, info `"Nightjar_Session_v1"`), at IndexedDB key `hex(HMAC(session-index sub-key, peerId))` (opaque: the DB names no peer). The AAD binds that storage key + a session-format version and is rebuilt from the peer the CALLER asked for, never from a field in the value, so a row moved into another peer's slot cannot authenticate. A row that exists but will not open is a distinct outcome from "no session", routed away from the poison counter. Outbox rows seal `{to, env, silent}` and keep `id` + `createdAt` in cleartext (neither names anyone; both are AAD-bound) so the retry horizon and oldest-first flush survive an unopenable row, which is reported rather than skipped. Prekey privates sealed under the prekeys sub-key. Migration: ONE IndexedDB transaction, no await inside, marker `meta.sealVersion` written in that same transaction, so an abort leaves the store byte-identical and the next unlock retries | 8.5 |
 | Account vs device id | `accountId = base32(SHA-256(account_key_pub))` is the id people exchange and what a safety number covers; `deviceId = base32(SHA-256(device_key_pub))` is what the relay authenticates and what addresses an inbox. On an account's FIRST device the two keys are the same key, so the two ids are the same string, which is what leaves every existing user untouched. Contacts bind an account key to an accountId; sessions bind a device key to a deviceId; the two checks are separate named operations so no call site can conflate them | 3.1, 8.11 |
 | Device list (roster) | account-key-signed, monotonically versioned, held by the Directory and served to anyone; the Directory NEVER authors one and authorizes a publish by the SIGNATURE, not the caller (a linked device authenticates as itself). Signed bytes are canonical and length-framed, never JSON, under their own `TAG_ROSTER` domain separation (the account key also signs auth challenges and prekeys, so without its own tag one use would be an oracle for another), with the accountId inside the signature so a list cannot be transplanted between accounts. `MAX_DEVICES_PER_ACCOUNT` = 8. Server monotonicity is LIVENESS only: the binding defence is each client's per-account high-water mark, which refuses a version not strictly newer (equal is refused too). Every real change raises a sticky alert. Verified under a key the device already holds (its own, or the contact's recorded key); on ANY failure it keeps the last good list rather than failing closed, because failing closed here means failing to deliver | 8.11 |
+| Attributing a device to a person | filing a message needs BOTH halves: the account's signed list must name the device, AND that device must have claimed the account itself, over a session running on its own key. Signing a list only proves the account said it, since a device is named by a public value, so either half alone lets anyone capture a third party's device. Two accounts naming one device is a CONFLICT: neither gets it and a security notice names both. Exempt: a device whose id IS the account id (a first device's account key is its device key, and it never introduces itself). Claims are re-pointed on rotation in both directions, and messages filed under a bare device id are moved into the conversation when the introduction arrives. The claim record is app-lock-sealed with the rest. Separately and server-side, the Directory retires a device's prekeys only for devices it OBSERVED register under that account (or a rotation ancestor), re-asserted on every connect so it heals for devices linked earlier; that is a rule about what the relay will DELETE, not an authority on ownership, and it is worth nothing against the operator | 8.11 |
 | Device link code | `NJLC` ‖ version ‖ device signing key (32 B) ‖ fresh single-use secret (32 B), base64url, shown as a QR by the device being added. The device id is NOT carried, it is DERIVED from the key, so a tampered code cannot name one device while carrying another's key. The one QR in this app that is secret-bearing | 8.11 |
 | Device link transfer | `NJLK` ‖ version ‖ transfer id (16 B) ‖ index ‖ count ‖ per-chunk salt (16 B) ‖ AEAD, header as AAD, key+nonce = HKDF(scanned secret, salt, `"Nightjar_Link_v1"`). Each chunk sealed INDEPENDENTLY, so reorder/duplicate/drop can only fail to complete, and splicing two transfers is refused (the transfer id is in the AAD). Chunk size is a property of the TRANSPORT: the relay path cuts at 32 KiB to stay inside its envelope cap, the optical path seals ONE unit. Carries the account key, contacts and nicknames, and **no trust field at all** (6.2). Relay delivery is LIVE-ONLY and never queued (an account key must not sit in a 30-day mail queue); the sender must be registered, the recipient need not be | 8.11 |
 | Saved-messages transfer | code `NJHC` ‖ version ‖ device signing key (32 B) ‖ fresh secret (32 B), shown by the device that WANTS the messages; a DIFFERENT magic from the linking code so the two ceremonies cannot be crossed by a camera that cannot tell them apart. Envelope `NJHT` ‖ version ‖ salt (16 B) ‖ AEAD, header as AAD, key+nonce = HKDF(scanned secret, salt, `"Nightjar_HistoryXfer_v1"`), sealed as ONE piece (the fountain layer splits it). Payload is the Phase D portable history unit (8.3) plus the sending account's id. `HISTORY_XFER_MAX_BYTES` = 512 KiB, which is a TIME budget (~5 KB/s optically) wearing a size's clothes: over it the app offers a shorter span rather than truncating, since a truncated history arrives looking complete. **Optical only, no relay path at all.** Sender checks the destination is on its own device list; receiver checks the transfer names its own account, refuses to resurrect a message it holds a delete tombstone for, and drops rows whose peer it holds no contact for. Merges by (peer, dir, content id), so running it twice changes nothing | 8.12 |

@@ -314,10 +314,25 @@ describe('passing on a message the sender addressed to one device only', () => {
   })
 })
 
-describe('a send says whether it addressed every device', () => {
-  it('marks a fanned-out message, and leaves a single-device one unmarked', async () => {
-    // The two halves of the same claim, asserted on the wire the recipient reads:
-    // saying "fanned" when it was not would strand the copy that was missed.
+describe('a send never claims to have addressed every device', () => {
+  it('leaves the fanned-out claim empty, whether the recipient has one device or two', async () => {
+    // This assertion used to be the opposite way round for the two-device case,
+    // and the claim it pinned could not be true. It is sealed into ONE plaintext
+    // before any copy has committed, and the commit-before-release discipline
+    // forbids amending it afterwards, so it was always an INTENT. Two ways that
+    // intent was wrong, and both lose a message permanently and silently:
+    //
+    //   a copy that FAILS leaves the copies that landed telling the recipient's
+    //   other devices not to pass it on, so the missed device never gets it;
+    //
+    //   and the list itself may be STALE. When the relay withholds a roster,
+    //   resolveDevices correctly falls back to the devices already known, so a
+    //   device the sender has never heard of is one it cannot retry, because it
+    //   was never attempted. That half is chosen by the untrusted party.
+    //
+    // The only honest claim is the empty one: receivers forward, and the content
+    // id makes the duplicate free. The bit stays defined and honored on receive,
+    // because senders on older builds keep setting it.
     const alicePhone = generateIdentity()
     const aliceLaptop = generateIdentity()
     const bob = generateIdentity()
@@ -332,10 +347,9 @@ describe('a send says whether it addressed every device', () => {
     const laptopKit = h.kit(aliceLaptop)
     if (!laptopKit) throw new Error('no kit')
     const fanned = siblingReader(aliceLaptop, laptopKit)(toLaptop[0])
-    expect(fanned.kind === 'text' && fanned.fanned).toBe(true)
+    expect(fanned.kind === 'text' && fanned.fanned).toBe(false)
 
-    // Bob has published no device list, so nothing was fanned anywhere and his
-    // device must not be told otherwise.
+    // And the single-device case is unchanged, as it always was.
     await h.client.sendText(bob.userId, 'to a person with one')
     const toBob = await toSibling(h, bob)
     expect(toBob).toHaveLength(1)

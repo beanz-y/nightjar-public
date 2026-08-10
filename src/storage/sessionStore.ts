@@ -178,6 +178,13 @@ export interface SessionStore {
     msgId: string,
     history?: HistoryRecord,
     del?: HistoryDelete,
+    /** Write the history row ONLY if that key is not already present, decided
+     *  inside the same transaction as the write (the discipline `historyUpdate`
+     *  already follows). Set for a SYNCED copy from one of this account's own
+     *  devices, which may describe a message this device already holds from the
+     *  original sender: the two carry different timestamps, so letting either
+     *  overwrite the other moves the message in the thread on the next reload. */
+    historyIfAbsent?: boolean,
   ): Promise<void>
   /** Persist the book (with a freshly-promoted session), the consumed message id,
    *  AND the initial-message id, all atomically (the initial accept path), plus an
@@ -189,6 +196,8 @@ export interface SessionStore {
     initId: string,
     history?: HistoryRecord,
     del?: HistoryDelete,
+    /** See `saveBookWithSeen`. */
+    historyIfAbsent?: boolean,
   ): Promise<void>
   /** Persist the advanced book AND the outbox entry atomically, BEFORE the
    *  envelope is handed to the socket (commit before release), plus an optional
@@ -262,6 +271,50 @@ export interface SessionStore {
   historyUpdate(rec: HistoryRecord): Promise<void>
   /** Remove exactly one record by its opaque storage key (delete / ephemeral). */
   historyRemove(key: string): Promise<void>
+  /**
+   * Remove every record `decide` returns true for, in ONE transaction.
+   *
+   * The transaction IS the exclusion, and it replaces a lock that could not
+   * provide it. Deleting a conversation is account-scoped while every writer is
+   * device-scoped, so no single lock name covered both and a message committing
+   * mid-scan survived a delete that reported it gone. IndexedDB serializes
+   * overlapping read-write transactions, so a write now lands either entirely
+   * before this sweep (and is removed) or entirely after it (and is a message that
+   * arrived after the delete, which DESIGN 8.9 already covers).
+   *
+   * `decide` MUST be synchronous, and that is what makes this possible at all:
+   * opening a history row is synchronous noble crypto, so the cursor never yields
+   * and the transaction cannot die under it. If `decide` throws, the transaction
+   * is ABORTED and nothing is removed, which is the honest outcome when the
+   * app-lock fires mid-sweep: a rolled-back delete beats a half-finished one that
+   * reported a tidy count.
+   *
+   * That requirement is ENFORCED, not just documented, because the failure mode of
+   * breaking it is the worst one this store has: an async `decide` returns a
+   * promise, every promise is truthy, so every row in the database would be
+   * deleted and the caller handed a tidy count for it. Anything but a strict
+   * boolean aborts.
+   */
+  historySweep(decide: (rec: HistoryRecord) => boolean): Promise<number>
+  /**
+   * Re-key records in ONE transaction: `transform` returns the replacement for a
+   * record (at a DIFFERENT key), or null to leave it alone.
+   *
+   * Same reasoning as `historySweep`, and the same enforced synchronous
+   * requirement, with two additions that matter. The old row is deleted and the
+   * new one written inside the same transaction, so a re-key can never lose a
+   * message or leave it present under both names; the previous shape loaded
+   * everything, wrote the new rows, deleted the old ones and yielded to the event
+   * loop in between, holding a lock on the SOURCE conversation while writing into
+   * a DESTINATION it did not lock.
+   *
+   * And the destination is PUT-IF-ABSENT while the source always goes. A key
+   * collision means the same message is already filed under the new name, having
+   * arrived by another route, and that copy is the one delivery status was written
+   * against. Overwriting it walked the status and the timestamp backwards, which
+   * is exactly what put-if-absent exists to stop for synced copies.
+   */
+  historyRekey(transform: (rec: HistoryRecord) => HistoryRecord | null): Promise<number>
   /** Mark one record failed by its opaque storage key. No-op if the row is gone. */
   historyMarkFailed(key: string): Promise<void>
   /** Clear the saved-history row classes, meaning messages AND their delete
@@ -340,10 +393,13 @@ export class MemorySessionStore implements SessionStore {
     msgId: string,
     history?: HistoryRecord,
     del?: HistoryDelete,
+    historyIfAbsent?: boolean,
   ): Promise<void> {
     this.books.set(peerId, clone(book))
     this.seen.set(msgId, Date.now())
-    if (history) this.history.set(history.key, clone(history))
+    if (history && !(historyIfAbsent && this.history.has(history.key))) {
+      this.history.set(history.key, clone(history))
+    }
     if (del) this.applyDelete(del)
   }
 
@@ -354,11 +410,14 @@ export class MemorySessionStore implements SessionStore {
     initId: string,
     history?: HistoryRecord,
     del?: HistoryDelete,
+    historyIfAbsent?: boolean,
   ): Promise<void> {
     this.books.set(peerId, clone(book))
     this.seen.set(msgId, Date.now())
     this.replay.add(initId)
-    if (history) this.history.set(history.key, clone(history))
+    if (history && !(historyIfAbsent && this.history.has(history.key))) {
+      this.history.set(history.key, clone(history))
+    }
     if (del) this.applyDelete(del)
   }
 
@@ -476,6 +535,33 @@ export class MemorySessionStore implements SessionStore {
     this.history.delete(key)
   }
 
+  async historySweep(decide: (rec: HistoryRecord) => boolean): Promise<number> {
+    // A snapshot of the keys first, so `decide` throwing leaves this store exactly
+    // as it was, matching the IndexedDB implementation's abort.
+    const doomed: string[] = []
+    for (const rec of this.history.values()) if (sweepVerdict(decide(clone(rec)))) doomed.push(rec.key)
+    for (const key of doomed) this.history.delete(key)
+    return doomed.length
+  }
+
+  async historyRekey(transform: (rec: HistoryRecord) => HistoryRecord | null): Promise<number> {
+    const moves: Array<{ from: string; to: HistoryRecord }> = []
+    for (const rec of this.history.values()) {
+      const next = rekeyResult(transform(clone(rec)))
+      if (next) moves.push({ from: rec.key, to: next })
+    }
+    for (const m of moves) {
+      if (m.to.key === m.from) {
+        this.history.set(m.to.key, clone(m.to))
+        continue
+      }
+      // Source always goes; destination is put-if-absent. See the interface doc.
+      this.history.delete(m.from)
+      if (!this.history.has(m.to.key)) this.history.set(m.to.key, clone(m.to))
+    }
+    return moves.length
+  }
+
   async historyMarkFailed(key: string): Promise<void> {
     const r = this.history.get(key)
     if (r) r.failed = true
@@ -565,6 +651,44 @@ const DB_VERSION = 8
 function applyDeleteTx(t: IDBTransaction, del: HistoryDelete): void {
   t.objectStore(HISTORY).delete(del.key)
   t.objectStore(TOMBSTONES).put(Date.now(), del.key)
+}
+
+// Enforce, rather than document, the synchronous contract that `historySweep` and
+// `historyRekey` both depend on. Their callbacks run inside a live IndexedDB
+// transaction, and an async one would return a promise: every promise is truthy,
+// so an async `decide` would delete EVERY row in the database and hand the caller
+// a tidy count for it. That is the worst failure this store can have, and it is
+// two lines to make impossible, so it is not left to a comment and a reviewer.
+function sweepVerdict(v: unknown): boolean {
+  if (typeof v !== 'boolean') {
+    throw new TypeError('sessions: history sweep decide() must return a boolean synchronously')
+  }
+  return v
+}
+
+function rekeyResult(v: unknown): HistoryRecord | null {
+  if (v === null || v === undefined) return null
+  if (typeof v !== 'object' || typeof (v as HistoryRecord).key !== 'string') {
+    throw new TypeError('sessions: history re-key transform() must return a record or null, synchronously')
+  }
+  return v as HistoryRecord
+}
+
+// Write a history row inside a receive transaction. When `ifAbsent` is set, the
+// existence check happens INSIDE the same transaction as the write, so a row that
+// landed in between is not overwritten: the get is issued from this transaction
+// and the put from its own success callback, which keeps both in the same commit.
+// Same discipline as `historyUpdate`, and the reason is the same one written there.
+function putHistoryTx(t: IDBTransaction, rec: HistoryRecord, ifAbsent?: boolean): void {
+  const store = t.objectStore(HISTORY)
+  if (!ifAbsent) {
+    store.put(rec, rec.key)
+    return
+  }
+  const existing = store.get(rec.key)
+  existing.onsuccess = () => {
+    if (existing.result === undefined) store.put(rec, rec.key)
+  }
 }
 
 export class IdbSessionStore implements SessionStore {
@@ -779,6 +903,7 @@ export class IdbSessionStore implements SessionStore {
     msgId: string,
     history?: HistoryRecord,
     del?: HistoryDelete,
+    historyIfAbsent?: boolean,
   ): Promise<void> {
     // Seal BEFORE opening the transaction. Sealing is synchronous, but doing it
     // inside the callback would put a throw (app locked mid-operation) in the middle
@@ -789,7 +914,7 @@ export class IdbSessionStore implements SessionStore {
     await this.tx(stores, 'readwrite', (t) => {
       t.objectStore(SESSIONS).put(row, slot)
       t.objectStore(SEEN).put(Date.now(), msgId)
-      if (history) t.objectStore(HISTORY).put(history, history.key)
+      if (history) putHistoryTx(t, history, historyIfAbsent)
       if (del) applyDeleteTx(t, del)
       return null
     })
@@ -802,6 +927,7 @@ export class IdbSessionStore implements SessionStore {
     initId: string,
     history?: HistoryRecord,
     del?: HistoryDelete,
+    historyIfAbsent?: boolean,
   ): Promise<void> {
     const slot = this.sessionSlot(peerId)
     const row = this.sealedBook(peerId, book)
@@ -810,7 +936,7 @@ export class IdbSessionStore implements SessionStore {
       t.objectStore(SESSIONS).put(row, slot)
       t.objectStore(SEEN).put(Date.now(), msgId)
       t.objectStore(REPLAY).put(1, initId)
-      if (history) t.objectStore(HISTORY).put(history, history.key)
+      if (history) putHistoryTx(t, history, historyIfAbsent)
       if (del) applyDeleteTx(t, del)
       return null
     })
@@ -954,6 +1080,90 @@ export class IdbSessionStore implements SessionStore {
 
   async historyRemove(key: string): Promise<void> {
     await this.tx(HISTORY, 'readwrite', (t) => t.objectStore(HISTORY).delete(key))
+  }
+
+  async historySweep(decide: (rec: HistoryRecord) => boolean): Promise<number> {
+    const db = await this.open()
+    return new Promise<number>((resolve, reject) => {
+      const t = db.transaction(HISTORY, 'readwrite')
+      let removed = 0
+      // Held so the abort handler can reject with the REASON rather than with a
+      // bare "aborted", which would turn an app-lock into an unexplained failure.
+      let thrown: unknown = null
+      t.oncomplete = () => (thrown ? reject(thrown) : resolve(removed))
+      t.onabort = () => reject(thrown ?? t.error ?? new Error('sessions: history sweep aborted'))
+      t.onerror = () => reject(thrown ?? t.error ?? new Error('sessions: history sweep failed'))
+      const req = t.objectStore(HISTORY).openCursor()
+      req.onsuccess = () => {
+        const cur = req.result
+        if (!cur) return // walked the whole store; oncomplete resolves
+        try {
+          if (sweepVerdict(decide(cur.value as HistoryRecord))) {
+            cur.delete()
+            removed++
+          }
+        } catch (e) {
+          // Roll the whole sweep back. Nothing is removed, and the caller can say
+          // so truthfully. `decide` is synchronous, so this runs inside the
+          // transaction's own callback and the abort is honored.
+          thrown = e
+          t.abort()
+          return
+        }
+        cur.continue()
+      }
+    })
+  }
+
+  async historyRekey(transform: (rec: HistoryRecord) => HistoryRecord | null): Promise<number> {
+    const db = await this.open()
+    return new Promise<number>((resolve, reject) => {
+      const t = db.transaction(HISTORY, 'readwrite')
+      let moved = 0
+      let thrown: unknown = null
+      t.oncomplete = () => (thrown ? reject(thrown) : resolve(moved))
+      t.onabort = () => reject(thrown ?? t.error ?? new Error('sessions: history re-key aborted'))
+      t.onerror = () => reject(thrown ?? t.error ?? new Error('sessions: history re-key failed'))
+      const store = t.objectStore(HISTORY)
+      const req = store.openCursor()
+      req.onsuccess = () => {
+        const cur = req.result
+        if (!cur) return
+        try {
+          const next = rekeyResult(transform(cur.value as HistoryRecord))
+          if (next) {
+            // Write the new row and drop the old one in the SAME transaction, so a
+            // re-key can never lose a message or leave it under both names.
+            const from = (cur.value as HistoryRecord).key
+            if (next.key === from) {
+              store.put(next, next.key)
+            } else {
+              // The source always goes. The destination is PUT-IF-ABSENT, decided
+              // inside this same transaction: a row already filed under the new
+              // name is the same message arriving by another route, and it is the
+              // one delivery status was written against, because markDelivery keys
+              // by the account while the row being re-keyed was filed under a bare
+              // device id. Overwriting it walked status and the timestamp
+              // backwards, which is the defect this store just fixed for synced
+              // copies. Honest residual: if the source were the better-informed
+              // row, this keeps the weaker one, which is the conservative
+              // direction rather than a merge nobody can see.
+              cur.delete()
+              const existing = store.get(next.key)
+              existing.onsuccess = () => {
+                if (existing.result === undefined) store.put(next, next.key)
+              }
+            }
+            moved++
+          }
+        } catch (e) {
+          thrown = e
+          t.abort()
+          return
+        }
+        cur.continue()
+      }
+    })
   }
 
   async historyGet(key: string): Promise<HistoryRecord | null> {

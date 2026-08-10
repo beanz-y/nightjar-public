@@ -236,6 +236,96 @@ function historySuite(name: string, make: () => SessionStore) {
       expect(await s.load(PEER_A)).toEqual(snap)
     })
 
+    it('historySweep removes exactly what decide() picks, in one commit', async () => {
+      const s = make()
+      for (const k of ['keep1', 'drop1', 'keep2', 'drop2']) {
+        await s.saveBookWithSeen(PEER_A, singleSessionBook(snap), `e-${k}`, hrec(k))
+      }
+      const removed = await s.historySweep((r) => r.key.startsWith('drop'))
+      expect(removed).toBe(2)
+      expect((await s.historyLoadAll()).map((r) => r.key).sort()).toEqual(['keep1', 'keep2'])
+    })
+
+    it('historySweep rolls the WHOLE scan back when decide() throws', async () => {
+      // This is what the app-lock firing mid-delete looks like from here, and it is
+      // the property the delete path leans on to say truthfully that it removed
+      // nothing: an abort, not a half-finished conversation with a tidy count.
+      const s = make()
+      for (const k of ['r1', 'r2', 'r3']) {
+        await s.saveBookWithSeen(PEER_A, singleSessionBook(snap), `e-${k}`, hrec(k))
+      }
+      await expect(
+        s.historySweep((r) => {
+          if (r.key === 'r3') throw new Error('locked')
+          return true
+        }),
+      ).rejects.toThrow('locked')
+      expect((await s.historyLoadAll()).map((r) => r.key).sort()).toEqual(['r1', 'r2', 'r3'])
+    })
+
+    it('historySweep refuses a decide() that is not synchronously boolean, and removes nothing', async () => {
+      // An async decide() returns a promise, every promise is truthy, and the whole
+      // database would go. Enforced rather than documented, because that failure is
+      // silent, total, and reported as success.
+      const s = make()
+      await s.saveBookWithSeen(PEER_A, singleSessionBook(snap), 'e1', hrec('precious'))
+      await expect(s.historySweep((async () => true) as unknown as (r: HistoryRecord) => boolean)).rejects.toThrow(
+        /synchronously/,
+      )
+      expect((await s.historyLoadAll()).map((r) => r.key)).toEqual(['precious'])
+    })
+
+    it('historyRekey moves a row and drops the old key in the same commit', async () => {
+      const s = make()
+      await s.saveBookWithSeen(PEER_A, singleSessionBook(snap), 'e1', hrec('old'))
+      await s.saveBookWithSeen(PEER_A, singleSessionBook(snap), 'e2', hrec('other'))
+      const moved = await s.historyRekey((r) => (r.key === 'old' ? { ...r, key: 'new' } : null))
+      expect(moved).toBe(1)
+      expect((await s.historyLoadAll()).map((r) => r.key).sort()).toEqual(['new', 'other'])
+    })
+
+    it('historyRekey keeps the row already at the destination and still drops the source', async () => {
+      // The same message reached this device twice under two names: once direct from
+      // a device it could not yet attribute, once forwarded by a sibling that could.
+      // The copy already filed under the real name is the one delivery status was
+      // written against, so overwriting it walked that status backwards.
+      const s = make()
+      await s.saveBookWithSeen(PEER_A, singleSessionBook(snap), 'e1', hrec('src'))
+      await s.saveBookWithSeen(PEER_A, singleSessionBook(snap), 'e2', hrec('dst', true))
+      const moved = await s.historyRekey((r) => (r.key === 'src' ? { ...r, key: 'dst' } : null))
+      expect(moved).toBe(1)
+      const rows = await s.historyLoadAll()
+      expect(rows.map((r) => r.key)).toEqual(['dst']) // the source is gone either way
+      expect(rows[0].failed).toBe(true) // and the better-informed copy survived
+      expect(rows[0].ct).toEqual(hrec('dst', true).ct)
+    })
+
+    it('historyRekey does not re-visit the row it just wrote further along the walk', async () => {
+      // The cursor walks in key order and the new row is written into the same
+      // store mid-walk, so a destination that sorts AFTER the source is a key the
+      // cursor has not reached yet. Counting it twice, or re-keying it again,
+      // would be the quiet kind of wrong: the two live cases both sort backwards.
+      const s = make()
+      await s.saveBookWithSeen(PEER_A, singleSessionBook(snap), 'e1', hrec('aaa'))
+      let seen = 0
+      const moved = await s.historyRekey((r) => {
+        seen++
+        return r.key === 'aaa' ? { ...r, key: 'zzz' } : null
+      })
+      expect(moved).toBe(1)
+      expect(seen).toBeLessThanOrEqual(2) // the source, and at most the row it became
+      expect((await s.historyLoadAll()).map((r) => r.key)).toEqual(['zzz'])
+    })
+
+    it('historyRekey refuses a transform() that returns something other than a record or null', async () => {
+      const s = make()
+      await s.saveBookWithSeen(PEER_A, singleSessionBook(snap), 'e1', hrec('precious'))
+      await expect(
+        s.historyRekey((async () => null) as unknown as (r: HistoryRecord) => HistoryRecord | null),
+      ).rejects.toThrow(/synchronously/)
+      expect((await s.historyLoadAll()).map((r) => r.key)).toEqual(['precious'])
+    })
+
     it('pendingOutbox returns entries oldest-first, not in key order', async () => {
       const s = make()
       // Ids are random hex in production and the IndexedDB key IS the id, so raw

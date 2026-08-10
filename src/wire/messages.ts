@@ -129,6 +129,17 @@ export interface FetchRotationMsg {
   accountId: string
 }
 
+/** Re-assert that this device belongs to `accountId` (Sesame). The device id is
+ *  the server-verified one from this socket, never a body claim, and the account
+ *  must already list it in a signed roster. Idempotent, and sent on connect by a
+ *  linked device so the Directory's record of which devices are whose heals for
+ *  devices added before that record existed. */
+export interface ClaimDeviceMsg {
+  t: 'claimDevice'
+  reqId: string
+  accountId: string
+}
+
 export interface SendMsg {
   t: 'send'
   to: string
@@ -197,6 +208,7 @@ export type ClientMessage =
   | FetchRosterMsg
   | PublishRotationMsg
   | FetchRotationMsg
+  | ClaimDeviceMsg
   | RegisterDeviceMsg
   | SendLinkMsg
   | SendMsg
@@ -279,6 +291,12 @@ export interface RosterMsg {
    *  not send one. Never believed without verifying it under the key the caller
    *  already holds. */
   rotation?: WireRotationStatement | null
+}
+
+export interface DeviceClaimedMsg {
+  t: 'deviceClaimed'
+  reqId: string
+  claimed: boolean
 }
 
 export interface RotationPublishedMsg {
@@ -364,6 +382,7 @@ export type ServerMessage =
   | RosterMsg
   | RotationPublishedMsg
   | RotationMsg
+  | DeviceClaimedMsg
   | LinkChunkMsg
   | DeliverMsg
   | SentMsg

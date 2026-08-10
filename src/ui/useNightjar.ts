@@ -561,6 +561,10 @@ export function useNightjar() {
               // catch-up work a reconnecting device does, and it re-reads the
               // contact list afterwards so an open window stops showing both.
               .then(() => client.resumePendingRenames())
+              // And any delete whose sweep did not run, for the same reason: the
+              // contact record is gone first now, so nothing else could find those
+              // rows again.
+              .then(() => client.resumePendingDeletes())
               .then(() => listContacts())
               .catch(() => {})
             setRegistered(client.isRegistered)

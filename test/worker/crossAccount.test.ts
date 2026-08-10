@@ -144,6 +144,44 @@ describe('what one account can do to another', () => {
     expect(await reachable(account.userId, laptop.userId)).toBe(false)
   })
 
+  it('heals a device that was added before the record existed', async () => {
+    // The migration case, and the reason a claim can be re-asserted at all.
+    // Devices linked before this record existed have no row, and nothing else
+    // would ever give them one: registration happens once, and the prekeys a
+    // device republishes afterwards say nothing about whose it is. Without the
+    // heal, taking such a device off the list would silently stop retiring its
+    // keys, which is a REGRESSION against the previous behavior rather than a
+    // new caution.
+    const account = await registeredAccount()
+    const laptop = generateIdentity()
+    const laptopId = deviceIdOf(laptop.ikSig.publicKey)
+    await link(account, laptop, 1)
+    // Wipe the record to stand in for a device linked by an older build.
+    await callDO(dir(), '/claimDevice', { deviceId: laptopId, accountId: account.userId, now: Date.now() })
+
+    // Re-asserted on connect: the id is the server-verified one, and the account
+    // must already list it.
+    expect(await callDO<{ claimed: boolean }>(dir(), '/claimDevice', {
+      deviceId: laptopId,
+      accountId: account.userId,
+      now: Date.now(),
+    })).toEqual({ claimed: true })
+
+    // And a device the account does NOT list cannot claim its way in.
+    const stranger = generateIdentity()
+    await expect(
+      callDO(dir(), '/claimDevice', {
+        deviceId: deviceIdOf(stranger.ikSig.publicKey),
+        accountId: account.userId,
+        now: Date.now(),
+      }),
+    ).rejects.toThrow(/has not listed/)
+
+    // Removal retires its prekeys again, which is the behavior being restored.
+    await publishRoster(encodeDeviceRoster(signRoster(account.userId, 2, [deviceOf(account)], account.ikSig.privateKey)))
+    expect(await reachable(laptopId, account.userId)).toBe(false)
+  })
+
   it('does not let a device mint invites, so one invite cannot become many', async () => {
     // Adding a device costs no invite by design. If a device's row also counted
     // as a registered member, one invited account could add devices for keypairs

@@ -9,6 +9,54 @@ or the commit page on the repository host). The format is loosely based on
 [Keep a Changelog](https://keepachangelog.com/); version headings correspond to the
 release tags cut by the deploy pipeline. Dates are the tag dates.
 
+## [1.14.3] - 2026-08-10
+
+### Fixed
+- **Deleting a conversation now removes exactly what it says it removed.** For someone who
+  reads on more than one device, a message arriving while the delete was running could
+  survive it, and the count you were shown had already counted it as gone. You would see a
+  clean delete, and the conversation would come back at the next launch with the contact and
+  their verification already destroyed. The removal now happens in one go, so a message
+  either goes with the rest or arrives after the delete and re-opens the conversation, which
+  is what it has always said it does.
+- Deleting a conversation now removes the contact before the messages, and finishes the job
+  on the next start if it was interrupted. The old order could leave a conversation that came
+  back with your messages in it but no record of who it was with. If the note that lets it
+  finish cannot be written, the delete does not start at all, so nothing is destroyed that
+  could then never be found.
+- **A delete that was interrupted no longer removes messages that arrived after you asked
+  for it.** It now remembers when you asked, and removes only what was there at the time. An
+  unfinished delete used to be a standing order: if the other person wrote to you before it
+  got another chance to run, which re-opens the conversation, their message was quietly
+  destroyed, and it would keep happening on every start until the delete finally succeeded.
+- If the app locks itself part-way through a delete, it now tells you what actually
+  happened. No message is removed either way, but clearing a chat has touched nothing at
+  all and can simply be tried again, whereas deleting one has already removed the contact
+  and will finish the messages the next time the app connects. It used to say "nothing was
+  removed" for both, which was true of one of them.
+- A copy of a message passed between your own devices no longer replaces the one already
+  saved, so a message cannot change position in the conversation when you next open it.
+- Moving messages into the right conversation, after a device introduces itself or an
+  account key is replaced, no longer overwrites what was already filed there. The copy
+  already in place is the one that has been tracking whether it was delivered.
+- **A message is no longer sent claiming it reached every device you read on.** The claim was
+  made before any copy had been sent, and from a list that could be out of date, so a copy
+  that failed, or a device the sender had never been told about, left your other devices
+  believing they had nothing to pass on. That message then reached one device and stopped
+  there, permanently, with nothing shown to either of you. Your devices now always pass a
+  message on to each other. You never see the message twice, because both copies are the
+  same message and land in the same place. What it does cost is traffic: a message sent to
+  someone reading on two devices now travels as four copies instead of two, and at the
+  eight-device maximum as sixty-four instead of eight. Nothing extra travels for anyone who
+  has not added a second device.
+- **A device you added before the last release now tells the relay which account it belongs
+  to.** The last release stopped the relay retiring the keys of devices it never watched
+  join, which closed a way to make somebody unreachable, but it had no record for devices
+  added before that. Removing one of those would have quietly stopped retiring its keys.
+  Each device now says so on every connection, so the record fills itself in.
+- Passing a message to your own devices no longer asks the relay who they are every single
+  time. It asks once per connection instead, which it had already done anyway.
+
 ## [1.14.2] - 2026-08-03
 
 ### Fixed
