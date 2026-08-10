@@ -1455,6 +1455,17 @@ Honest limits, none of them incidental:
   could sign a list re-adding itself. Removing is the routine case (others stop
   sending to it; it keeps what it had). For a device that is LOST, the honest answer
   is account-key rotation, and every contact re-verifies.
+- **Removal is not instant on your other devices either.** When a device passes an
+  arriving message to its siblings, it reads the device list it has already checked
+  and stored rather than asking the Directory again, because every message received
+  would otherwise cost a round trip to the single directory everyone shares. So for
+  a short while after you remove a device, your remaining devices can still pass it
+  copies of messages that arrive, until each of them next sends something or
+  reconnects, which is when they read the list again. This is disclosed rather than
+  engineered away because it adds little: that device already holds the account key
+  and everything it had when it left, and it could sign a list putting itself back.
+  If the device is out of your hands, removing it was never the remedy; rotating the
+  account key is, and it is what closes this along with everything else.
 - **The rollback defence is the client's memory, not the server's.** The Directory
   refuses an older version, but an operator owns the Directory. What binds is that
   each device keeps a high-water mark per account and refuses anything not newer,
