@@ -9,6 +9,40 @@ or the commit page on the repository host). The format is loosely based on
 [Keep a Changelog](https://keepachangelog.com/); version headings correspond to the
 release tags cut by the deploy pipeline. Dates are the tag dates.
 
+## [1.14.4] - 2026-08-11
+
+### Security
+- **The key-exchange library was updated for a timing weakness found in an independent
+  audit.** `@noble/curves` 2.3.0 carries a Trail of Bits review and a fix for a remote
+  timing attack on X25519, the key agreement every conversation here is built on. The
+  weakness leaked on the order of four bits of a long-term private key to somebody who
+  could measure the timing of many key exchanges. Said plainly, because it would be easy
+  to overstate in either direction: that is enough to help tell one key apart from
+  another, not to recover one, and mounting it against this app would mean timing a
+  browser through a relay, which is a poor place to measure anything. It is a real
+  weakness in the primitive that protects your conversations, it was not urgent, and
+  taking it promptly is the whole reason this project borrows audited cryptography
+  rather than writing its own. The same release also makes constant-time execution a
+  measured property rather than a best effort, and blinds secret scalars.
+- Worth saying because it explains why nothing warned anyone: **no CVE or advisory
+  number was assigned**, so vulnerability scanners report this as a routine update, and
+  a security scan of this app came back clean both before and after.
+
+### Changed
+- **The other three cryptography libraries moved to 2.3.0 alongside it.** `@noble/hashes`,
+  `@noble/ciphers` and `@scure/base` bring stricter input validation, a hardening change
+  that stops a decryption failure revealing which part failed, and large speed gains. All
+  three carry removals or renames in this release; none of them touch anything this app
+  uses, which was checked against every import rather than assumed. The proof that
+  nothing moved on the wire is the same as last time: every pinned known-answer test
+  passes unchanged (user ids, safety numbers, X3DH secrets, ratchet message bytes, sealed
+  history and backups), and those tests exist so a primitive drifting by one byte fails
+  loudly instead of silently stranding every existing session.
+- One upstream change is a deliberate trade the other way: key generation and signing may
+  be slightly slower, because the fix for the timing weakness narrows a table that had
+  been sized for speed. Nothing here measures it, and correctness of that kind is worth
+  more than the difference.
+
 ## [1.14.3] - 2026-08-10
 
 ### Fixed
