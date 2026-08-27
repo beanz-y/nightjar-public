@@ -127,7 +127,14 @@ export function ratchetEncrypt(
   const { ck, mk } = kdfCk(state.cks)
   const header: MessageHeader = { version: VERSION, dhPub: state.dhs.publicKey, pn: state.pn, n: state.ns }
   const { key, nonce } = expandMk(mk)
-  const ciphertext = aeadSeal(key, nonce, plaintext, concatBytes(state.ad, encodeHeader(header)))
+  let ciphertext: Uint8Array
+  try {
+    ciphertext = aeadSeal(key, nonce, plaintext, concatBytes(state.ad, encodeHeader(header)))
+  } finally {
+    key.fill(0)
+    nonce.fill(0)
+    mk.fill(0)
+  }
   // Return the advanced state; the caller MUST persist it before releasing the
   // envelope, and MUST NOT re-encrypt on retry (DESIGN 5.3 send discipline).
   const newState: RatchetState = { ...cloneState(state), cks: ck, ns: state.ns + 1 }
@@ -152,9 +159,13 @@ export function ratchetDecrypt(
   // 3. A stored skipped key handles an out-of-order arrival directly.
   const stored = s.skipped.get(skKey(header.dhPub, header.n))
   if (stored) {
-    const plaintext = openMessage(stored.mk, header, ciphertext, s.ad)
-    s.skipped.delete(skKey(header.dhPub, header.n))
-    return { state: s, plaintext }
+    try {
+      const plaintext = openMessage(stored.mk, header, ciphertext, s.ad)
+      return { state: s, plaintext }
+    } finally {
+      stored.mk.fill(0)
+      s.skipped.delete(skKey(header.dhPub, header.n))
+    }
   }
 
   // 4. A new remote ratchet key means a DH ratchet step.
@@ -172,7 +183,12 @@ export function ratchetDecrypt(
     throw new Error('ratchet: no receiving chain for this header')
   }
   const { ck, mk } = kdfCk(s.ckr)
-  const plaintext = openMessage(mk, header, ciphertext, s.ad) // throws -> old state kept
+  let plaintext: Uint8Array
+  try {
+    plaintext = openMessage(mk, header, ciphertext, s.ad) // throws -> old state kept
+  } finally {
+    mk.fill(0)
+  }
   s.ckr = ck
   s.nr += 1
   return { state: s, plaintext }
@@ -182,7 +198,12 @@ export function ratchetDecrypt(
 
 function openMessage(mk: Uint8Array, header: MessageHeader, ciphertext: Uint8Array, ad: Uint8Array): Uint8Array {
   const { key, nonce } = expandMk(mk)
-  return aeadOpen(key, nonce, ciphertext, concatBytes(ad, encodeHeader(header)))
+  try {
+    return aeadOpen(key, nonce, ciphertext, concatBytes(ad, encodeHeader(header)))
+  } finally {
+    key.fill(0)
+    nonce.fill(0)
+  }
 }
 
 function assertWithinSkipBound(state: RatchetState, header: MessageHeader): void {

@@ -153,7 +153,12 @@ export function sealLink(
       salt,
     )
     const { key, nonce } = keyNonce(secret, salt)
-    out.push(concatBytes(header, aeadSeal(key, nonce, slice, header)))
+    try {
+      out.push(concatBytes(header, aeadSeal(key, nonce, slice, header)))
+    } finally {
+      key.fill(0)
+      nonce.fill(0)
+    }
   }
   return out
 }
@@ -195,6 +200,9 @@ function openChunk(chunk: Uint8Array, secret: Uint8Array): Uint8Array {
     return aeadOpen(key, nonce, chunk.slice(HEADER_LEN), header)
   } catch {
     throw new LinkAuthError()
+  } finally {
+    key.fill(0)
+    nonce.fill(0)
   }
 }
 

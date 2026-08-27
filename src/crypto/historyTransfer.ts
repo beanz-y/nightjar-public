@@ -108,7 +108,15 @@ export function sealHistoryTransfer(payload: HistoryTransferPayload, secret: Uin
   const salt = randomBytes(HISTORY_XFER_SALT_BYTES)
   const header = concatBytes(utf8(HISTORY_XFER_MAGIC), Uint8Array.from([HISTORY_XFER_VERSION]), salt)
   const { key, nonce } = keyNonce(secret, salt)
-  return concatBytes(header, aeadSeal(key, nonce, body, header))
+  let ciphertext: Uint8Array
+  try {
+    ciphertext = aeadSeal(key, nonce, body, header)
+  } finally {
+    key.fill(0)
+    nonce.fill(0)
+    body.fill(0)
+  }
+  return concatBytes(header, ciphertext)
 }
 
 /**
@@ -132,26 +140,33 @@ export function openHistoryTransfer(blob: Uint8Array, secret: Uint8Array, now: n
     body = aeadOpen(key, nonce, blob.slice(HEADER_LEN), header)
   } catch {
     throw new HistoryTransferAuthError()
+  } finally {
+    key.fill(0)
+    nonce.fill(0)
   }
 
-  let raw: unknown
   try {
-    raw = JSON.parse(decoder.decode(body))
-  } catch {
-    throw new HistoryTransferError('transfer is not readable')
+    let raw: unknown
+    try {
+      raw = JSON.parse(decoder.decode(body))
+    } catch {
+      throw new HistoryTransferError('transfer is not readable')
+    }
+    const o = raw as Record<string, unknown>
+    // Discriminator first: the link payload and the move payload are also `v: 1`
+    // JSON, and identifying a blob by which fields it happens to have is how
+    // cross-format bugs start.
+    if (!o || o.t !== 'njhx' || o.v !== 1) throw new HistoryTransferError('not a saved-messages payload')
+    const accountId = String(o.accountId ?? '')
+    if (!ACCOUNT_ID_RE.test(accountId)) throw new HistoryTransferError('transfer names no account')
+    const createdAt = typeof o.createdAt === 'number' && Number.isSafeInteger(o.createdAt) ? o.createdAt : 0
+    // decodeHistoryUnit does the row-level validation and bounding, including the
+    // timestamp ceiling that stops a wild ts pinning the conversation list forever.
+    const { messages } = decodeHistoryUnit(o.unit, now)
+    return { accountId, messages, createdAt }
+  } finally {
+    body.fill(0)
   }
-  const o = raw as Record<string, unknown>
-  // Discriminator first: the link payload and the move payload are also `v: 1`
-  // JSON, and identifying a blob by which fields it happens to have is how
-  // cross-format bugs start.
-  if (!o || o.t !== 'njhx' || o.v !== 1) throw new HistoryTransferError('not a saved-messages payload')
-  const accountId = String(o.accountId ?? '')
-  if (!ACCOUNT_ID_RE.test(accountId)) throw new HistoryTransferError('transfer names no account')
-  const createdAt = typeof o.createdAt === 'number' && Number.isSafeInteger(o.createdAt) ? o.createdAt : 0
-  // decodeHistoryUnit does the row-level validation and bounding, including the
-  // timestamp ceiling that stops a wild ts pinning the conversation list forever.
-  const { messages } = decodeHistoryUnit(o.unit, now)
-  return { accountId, messages, createdAt }
 }
 
 /** The fixed header width, exported so a test can pin it. */

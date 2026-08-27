@@ -96,7 +96,14 @@ export class HistoryStore {
     const body: Record<string, unknown> = { i: msg.id, p: msg.peerId, d: msg.dir, t: msg.ts, x: msg.text }
     if (msg.status) body.s = msg.status
     const plain = utf8(JSON.stringify(body))
-    const ct = aeadSeal(k, nonce, plain, this.aad(key))
+    let ct: Uint8Array
+    try {
+      ct = aeadSeal(k, nonce, plain, this.aad(key))
+    } finally {
+      k.fill(0)
+      nonce.fill(0)
+      plain.fill(0)
+    }
     return failed ? { key, salt, ct, failed: true } : { key, salt, ct }
   }
 
@@ -104,20 +111,30 @@ export class HistoryStore {
    *  corruption, or a relabelled key). */
   open(rec: HistoryRecord): HistoryMessage {
     const { key: k, nonce } = this.bodyKeyNonce(rec.salt)
-    const plain = aeadOpen(k, nonce, rec.ct, this.aad(rec.key))
-    const o = JSON.parse(decoder.decode(plain)) as {
-      i: string
-      p: string
-      d: 'in' | 'out'
-      t: number
-      x: string
-      s?: string
+    let plain: Uint8Array
+    try {
+      plain = aeadOpen(k, nonce, rec.ct, this.aad(rec.key))
+    } finally {
+      k.fill(0)
+      nonce.fill(0)
     }
-    const msg: HistoryMessage = { id: o.i, peerId: o.p, dir: o.d, ts: o.t, text: o.x }
-    // Only the two known values are honoured. A row written by a future version
-    // carrying some other status reads as "unknown" rather than being surfaced as
-    // a delivery claim this build cannot vouch for.
-    if (o.s === 'sent' || o.s === 'delivered') msg.status = o.s
-    return msg
+    try {
+      const o = JSON.parse(decoder.decode(plain)) as {
+        i: string
+        p: string
+        d: 'in' | 'out'
+        t: number
+        x: string
+        s?: string
+      }
+      const msg: HistoryMessage = { id: o.i, peerId: o.p, dir: o.d, ts: o.t, text: o.x }
+      // Only the two known values are honoured. A row written by a future version
+      // carrying some other status reads as "unknown" rather than being surfaced as
+      // a delivery claim this build cannot vouch for.
+      if (o.s === 'sent' || o.s === 'delivered') msg.status = o.s
+      return msg
+    } finally {
+      plain.fill(0)
+    }
   }
 }

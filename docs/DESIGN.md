@@ -683,6 +683,14 @@ acked, deduping by id at both ends; retry lifetime is bounded shorter than the
 receiver's skipped-key expiry, and a message that still fails is re-sent at a
 fresh chain position, never a stale `n`.
 
+**The Invariant Timing Hierarchy:**
+The delivery and deduplication lifecycle enforces strict monotonic bounds:
+$$\text{Outbox Retry Horizon (7d)} < \text{Relay Seen-ID TTL (8d)} < \text{DR Skipped-Key Expiry (14d)} < \text{Inbox Envelope TTL (30d)}$$
+- **Outbox Retry Horizon (`OUTBOX_RETRY_HORIZON_MS` = 7d):** Unacknowledged sends are retried upon reconnect for up to 7 days, after which they are permanently marked as failed in history.
+- **Relay Seen-ID TTL (`SEEN_ID_TTL_MS` = 8d):** The relay retains consumed envelope IDs for 8 days to ack-and-drop late redeliveries. Because $\text{7d} < \text{8d}$, retries never slip past relay deduplication.
+- **Skipped-Key Expiry (`SKIPPED_KEY_EXPIRY_MS` = 14d):** Retained out-of-order ratchet keys outlive the retry window to prevent decrypt failures on delayed packets.
+- **Oldest-First Monotonic Flush:** `pendingOutbox()` sorts entries by `createdAt ASC` before retransmitting, ensuring controls (like deletes) never overtake the messages they target.
+
 ### 7.3 Authentication (no passwords, no signing oracle)
 
 On connect the Worker issues a **structured** challenge
@@ -758,12 +766,6 @@ account's first device these are the same key, deliberately, and that single fac
 is what makes multi-device arrive without disturbing anybody: an existing user's
 account id, device id and user id are one id, so their inbox, their published
 prekeys, their sessions and above all their **safety numbers** are untouched, and
-nobody has to verify anybody again. The cost, stated where it will be looked for:
-a first device cannot be removed from its own account, because its device key is
-the account key; retiring it means moving to a new device (8.3) or rotating the
-account key, which is a re-verify event for every contact.
-
-Resolving where an account's devices are follows the same rule as everything else
 the relay says: believe nothing it cannot prove. A roster is used only if it
 verifies under an account key this device already holds, and only if its version
 is **higher than the highest already accepted for that account**. That second
@@ -796,16 +798,31 @@ not exist.
 
 ## 8. Client-side key storage
 
-### 8.1 Where keys live, and what non-extractability really buys
+### 8.1 Where keys live, memory hygiene, and what non-extractability really buys
 
 Identity private keys live in IndexedDB, generated as **extractable** raw bytes
 (via `@noble`) because backup (8.3) must wrap them and a non-extractable
 WebCrypto key cannot be exported. We therefore do **not** claim non-extractability
-for the identity key. Ratchet state lives in IndexedDB as raw bytes (the noble
-ratchet needs them in memory anyway; forward secrecy bounds the blast radius).
-Honest scope: in-page script (XSS) can read every ratchet and message key and
-*use* the identity key to sign the auth challenge, so the **primary** endpoint
-defense is the strict CSP and DOM hygiene (8.4 and 10.2), not a storage flag.
+for the identity key. Ratchet state lives in IndexedDB as raw bytes sealed under
+the Local Data Key (8.5).
+
+**In-RAM memory hygiene & scrubbing discipline:**
+- Sensitive buffers (`Uint8Array`) containing intermediate cryptographic secrets
+  (Argon2 KDF outputs, ephemeral Diffie-Hellman outputs, expanded message keys and nonces,
+  and unsealed plaintext buffers) are explicitly zeroed out in `finally` blocks
+  (`buf.fill(0)`) immediately after use.
+- Derived subkeys from the LDK are cached during an unlocked session to prevent
+  emitting thousands of throwaway 32-byte key allocations onto the garbage-collected heap,
+  and are explicitly zeroed (`subKey.fill(0)`) on idle timeout or explicit lock.
+- **Honest runtime disclosure:** In modern JavaScript engines (V8, SpiderMonkey,
+  JavaScriptCore), generational garbage collection (moving live memory chunks without
+  wiping abandoned chunks) and JIT register allocation make deterministic zero-trace
+  memory erasure impossible. In-place TypedArray zeroization minimizes the temporal
+  exposure window; the ultimate protection against memory extraction on a locked
+  device is the prompt idle timeout (5 minutes) and host OS Full Disk Encryption (FDE).
+- Honest scope: in-page script (XSS) can read every ratchet and message key and
+  *use* the identity key to sign the auth challenge, so the **primary** endpoint
+  defense is the strict CSP and DOM hygiene (8.4 and 10.2), not a storage flag.
 
 ### 8.2 Persistence and eviction (the PWA trap)
 

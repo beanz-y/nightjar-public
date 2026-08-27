@@ -115,9 +115,19 @@ async function kekFromSecret(
   params: Argon2Params,
   kdf: Argon2Kdf,
 ): Promise<{ key: Uint8Array; nonce: Uint8Array }> {
-  const raw = await kdf(utf8(normalizeSecret(secret)), argonSalt, params)
+  const normBytes = utf8(normalizeSecret(secret))
+  let raw: Uint8Array
+  try {
+    raw = await kdf(normBytes, argonSalt, params)
+  } finally {
+    normBytes.fill(0)
+  }
   if (raw.length !== 32) throw new Error('app-lock: kdf returned an unexpected length')
-  return kekFromRaw(raw, hkdfSalt)
+  try {
+    return kekFromRaw(raw, hkdfSalt)
+  } finally {
+    raw.fill(0)
+  }
 }
 
 function wrapAad(kind: LockMethodKind): Uint8Array {
@@ -151,7 +161,13 @@ export async function wrapKnowledge(
   const argonSalt = randomBytes(LOCK_SALT_BYTES)
   const hkdfSalt = randomBytes(LOCK_SALT_BYTES)
   const { key, nonce } = await kekFromSecret(secret, argonSalt, hkdfSalt, params, opts.kdf ?? argon2idKdf)
-  return { kind, argonSalt, hkdfSalt, m: params.m, t: params.t, p: params.p, wrap: sealLdk(ldk, key, nonce, kind) }
+  try {
+    const wrap = sealLdk(ldk, key, nonce, kind)
+    return { kind, argonSalt, hkdfSalt, m: params.m, t: params.t, p: params.p, wrap }
+  } finally {
+    key.fill(0)
+    nonce.fill(0)
+  }
 }
 
 export async function unwrapKnowledge(
@@ -160,7 +176,12 @@ export async function unwrapKnowledge(
   kdf: Argon2Kdf = argon2idKdf,
 ): Promise<Uint8Array> {
   const { key, nonce } = await kekFromSecret(secret, rec.argonSalt, rec.hkdfSalt, { m: rec.m, t: rec.t, p: rec.p }, kdf)
-  return openLdk(rec.wrap, key, nonce, rec.kind)
+  try {
+    return openLdk(rec.wrap, key, nonce, rec.kind)
+  } finally {
+    key.fill(0)
+    nonce.fill(0)
+  }
 }
 
 // --- biometric (WebAuthn PRF) -----------------------------------------------
@@ -170,12 +191,22 @@ export async function unwrapKnowledge(
 export function wrapBiometric(ldk: Uint8Array, credentialId: Uint8Array, prfSecret: Uint8Array): BioWrap {
   const hkdfSalt = randomBytes(LOCK_SALT_BYTES)
   const { key, nonce } = kekFromRaw(prfSecret, hkdfSalt)
-  return { kind: 'bio', credentialId, hkdfSalt, wrap: sealLdk(ldk, key, nonce, 'bio') }
+  try {
+    return { kind: 'bio', credentialId, hkdfSalt, wrap: sealLdk(ldk, key, nonce, 'bio') }
+  } finally {
+    key.fill(0)
+    nonce.fill(0)
+  }
 }
 
 export function unwrapBiometric(rec: BioWrap, prfSecret: Uint8Array): Uint8Array {
   const { key, nonce } = kekFromRaw(prfSecret, rec.hkdfSalt)
-  return openLdk(rec.wrap, key, nonce, 'bio')
+  try {
+    return openLdk(rec.wrap, key, nonce, 'bio')
+  } finally {
+    key.fill(0)
+    nonce.fill(0)
+  }
 }
 
 // --- sub-keys off the LDK ---------------------------------------------------
@@ -199,8 +230,12 @@ const BLOB_SALT_BYTES = 16
 export function sealBlob(subkey: Uint8Array, label: string, plain: Uint8Array): Uint8Array {
   const salt = randomBytes(BLOB_SALT_BYTES)
   const out = hkdfSha256(subkey, salt, utf8(BLOB_INFO), XCHACHA_KEY_BYTES + XCHACHA_NONCE_BYTES)
-  const ct = aeadSeal(out.slice(0, XCHACHA_KEY_BYTES), out.slice(XCHACHA_KEY_BYTES), plain, domainSeparate(BLOB_AAD_TAG, utf8(label)))
-  return concatBytes(salt, ct)
+  try {
+    const ct = aeadSeal(out.slice(0, XCHACHA_KEY_BYTES), out.slice(XCHACHA_KEY_BYTES), plain, domainSeparate(BLOB_AAD_TAG, utf8(label)))
+    return concatBytes(salt, ct)
+  } finally {
+    out.fill(0)
+  }
 }
 
 export function openBlob(subkey: Uint8Array, label: string, blob: Uint8Array): Uint8Array {
@@ -211,6 +246,8 @@ export function openBlob(subkey: Uint8Array, label: string, blob: Uint8Array): U
     return aeadOpen(out.slice(0, XCHACHA_KEY_BYTES), out.slice(XCHACHA_KEY_BYTES), blob.slice(BLOB_SALT_BYTES), domainSeparate(BLOB_AAD_TAG, utf8(label)))
   } catch {
     throw new AppLockAuthError()
+  } finally {
+    out.fill(0)
   }
 }
 

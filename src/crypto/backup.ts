@@ -158,10 +158,20 @@ export async function deriveKeyNonce(
   params: BackupParams,
   kdf: BackupKdf = argon2idKdf,
 ): Promise<{ key: Uint8Array; nonce: Uint8Array }> {
-  const raw = await kdf(utf8(normalizePassphrase(passphrase)), salt, params)
+  const normBytes = utf8(normalizePassphrase(passphrase))
+  let raw: Uint8Array
+  try {
+    raw = await kdf(normBytes, salt, params)
+  } finally {
+    normBytes.fill(0)
+  }
   if (raw.length !== 32) throw new BackupFormatError('kdf returned an unexpected length')
-  const out = hkdfSha256(raw, new Uint8Array(32), utf8(INFO_BACKUP), XCHACHA_KEY_BYTES + XCHACHA_NONCE_BYTES)
-  return { key: out.slice(0, XCHACHA_KEY_BYTES), nonce: out.slice(XCHACHA_KEY_BYTES) }
+  try {
+    const out = hkdfSha256(raw, new Uint8Array(32), utf8(INFO_BACKUP), XCHACHA_KEY_BYTES + XCHACHA_NONCE_BYTES)
+    return { key: out.slice(0, XCHACHA_KEY_BYTES), nonce: out.slice(XCHACHA_KEY_BYTES) }
+  } finally {
+    raw.fill(0)
+  }
 }
 
 // --- payload codec ----------------------------------------------------------
@@ -253,7 +263,14 @@ export async function sealBackup(
   const header = encodeHeader(params, salt)
   const { key, nonce } = await deriveKeyNonce(passphrase, salt, params, opts.kdf ?? argon2idKdf)
   const payload = encodeBackupPayload(identity, contacts, opts.createdAt ?? Date.now())
-  const ciphertext = aeadSeal(key, nonce, payload, header)
+  let ciphertext: Uint8Array
+  try {
+    ciphertext = aeadSeal(key, nonce, payload, header)
+  } finally {
+    key.fill(0)
+    nonce.fill(0)
+    payload.fill(0)
+  }
   return concatBytes(header, ciphertext)
 }
 
@@ -303,6 +320,13 @@ export async function openBackup(
     payload = aeadOpen(key, nonce, ciphertext, header)
   } catch {
     throw new BackupAuthError()
+  } finally {
+    key.fill(0)
+    nonce.fill(0)
   }
-  return decodeBackupPayload(payload)
+  try {
+    return decodeBackupPayload(payload)
+  } finally {
+    payload.fill(0)
+  }
 }

@@ -99,7 +99,13 @@ export class SessionSealer {
   sealSession(peerId: string, book: SessionBook): SealedSessionRecord {
     const salt = randomBytes(SESSION_SALT_BYTES)
     const { key, nonce } = this.keyNonce(salt)
-    const ct = aeadSeal(key, nonce, utf8(JSON.stringify(book)), this.sessionAad(this.sessionKey(peerId)))
+    let ct: Uint8Array
+    try {
+      ct = aeadSeal(key, nonce, utf8(JSON.stringify(book)), this.sessionAad(this.sessionKey(peerId)))
+    } finally {
+      key.fill(0)
+      nonce.fill(0)
+    }
     return { salt, ct }
   }
 
@@ -107,12 +113,16 @@ export class SessionSealer {
    *  rebuilt from it, so a row sitting in the wrong slot cannot authenticate. */
   openSession(peerId: string, rec: SealedSessionRecord): SessionBook {
     const { key, nonce } = this.keyNonce(rec.salt)
+    let plain: Uint8Array
     try {
-      const plain = aeadOpen(key, nonce, rec.ct, this.sessionAad(this.sessionKey(peerId)))
-      return JSON.parse(decoder.decode(plain)) as SessionBook
+      plain = aeadOpen(key, nonce, rec.ct, this.sessionAad(this.sessionKey(peerId)))
     } catch {
       throw new SessionSealError('this conversation')
+    } finally {
+      key.fill(0)
+      nonce.fill(0)
     }
+    return JSON.parse(decoder.decode(plain)) as SessionBook
   }
 
   sealOutbox(entry: OutboxEntry): SealedOutboxRecord {
@@ -132,19 +142,28 @@ export class SessionSealer {
     // peer, which is exactly what this seal exists to hide (see the header).
     if (entry.contentId) body.contentId = entry.contentId
     if (entry.account) body.account = entry.account
-    const ct = aeadSeal(key, nonce, utf8(JSON.stringify(body)), this.outboxAad(entry.id, entry.createdAt))
+    let ct: Uint8Array
+    try {
+      ct = aeadSeal(key, nonce, utf8(JSON.stringify(body)), this.outboxAad(entry.id, entry.createdAt))
+    } finally {
+      key.fill(0)
+      nonce.fill(0)
+    }
     return { id: entry.id, createdAt: entry.createdAt, salt, ct }
   }
 
   openOutbox(rec: SealedOutboxRecord): OutboxEntry {
     const { key, nonce } = this.keyNonce(rec.salt)
-    let body: { to: string; env: unknown; silent?: boolean; contentId?: string; account?: string }
+    let plain: Uint8Array
     try {
-      const plain = aeadOpen(key, nonce, rec.ct, this.outboxAad(rec.id, rec.createdAt))
-      body = JSON.parse(decoder.decode(plain)) as typeof body
+      plain = aeadOpen(key, nonce, rec.ct, this.outboxAad(rec.id, rec.createdAt))
     } catch {
       throw new SessionSealError('a queued message')
+    } finally {
+      key.fill(0)
+      nonce.fill(0)
     }
+    const body = JSON.parse(decoder.decode(plain)) as { to: string; env: unknown; silent?: boolean; contentId?: string; account?: string }
     const e: OutboxEntry = { id: rec.id, to: body.to, env: body.env as OutboxEntry['env'], createdAt: rec.createdAt }
     if (body.silent) e.silent = true
     // Absent on rows sealed before this fix, which is why every reader falls back

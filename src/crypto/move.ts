@@ -102,10 +102,20 @@ export async function deriveMoveKeyNonce(
 ): Promise<{ key: Uint8Array; nonce: Uint8Array }> {
   const canon = canonicalizeMovePassphrase(passphrase)
   if (canon.length === 0) throw new MoveFormatError('passphrase is empty after normalization')
-  const raw = await kdf(utf8(canon), salt, params)
+  const canonBytes = utf8(canon)
+  let raw: Uint8Array
+  try {
+    raw = await kdf(canonBytes, salt, params)
+  } finally {
+    canonBytes.fill(0)
+  }
   if (raw.length !== 32) throw new MoveFormatError('kdf returned an unexpected length')
-  const out = hkdfSha256(raw, new Uint8Array(32), utf8(INFO_MOVE), XCHACHA_KEY_BYTES + XCHACHA_NONCE_BYTES)
-  return { key: out.slice(0, XCHACHA_KEY_BYTES), nonce: out.slice(XCHACHA_KEY_BYTES) }
+  try {
+    const out = hkdfSha256(raw, new Uint8Array(32), utf8(INFO_MOVE), XCHACHA_KEY_BYTES + XCHACHA_NONCE_BYTES)
+    return { key: out.slice(0, XCHACHA_KEY_BYTES), nonce: out.slice(XCHACHA_KEY_BYTES) }
+  } finally {
+    raw.fill(0)
+  }
 }
 
 function encodeHeader(params: BackupParams, salt: Uint8Array): Uint8Array {
@@ -382,7 +392,14 @@ export async function sealMove(
     payload.messages,
     opts.createdAt ?? Date.now(),
   )
-  const ciphertext = aeadSeal(key, nonce, bytes, header)
+  let ciphertext: Uint8Array
+  try {
+    ciphertext = aeadSeal(key, nonce, bytes, header)
+  } finally {
+    key.fill(0)
+    nonce.fill(0)
+    bytes.fill(0)
+  }
   return concatBytes(header, ciphertext)
 }
 
@@ -400,6 +417,13 @@ export async function openMove(
     payload = aeadOpen(key, nonce, ciphertext, header)
   } catch {
     throw new MoveAuthError()
+  } finally {
+    key.fill(0)
+    nonce.fill(0)
   }
-  return decodeMovePayload(payload, opts.now ?? Date.now())
+  try {
+    return decodeMovePayload(payload, opts.now ?? Date.now())
+  } finally {
+    payload.fill(0)
+  }
 }

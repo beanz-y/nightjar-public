@@ -51,8 +51,13 @@ const X3DH_F = new Uint8Array(32).fill(0xff)
 
 function deriveSK(dhs: readonly Uint8Array[], version: number): Uint8Array {
   const ikm = concatBytes(X3DH_F, ...dhs)
-  const info = concatBytes(utf8(INFO_X3DH), Uint8Array.from([version]))
-  return hkdfSha256(ikm, new Uint8Array(32), info, 32)
+  try {
+    const info = concatBytes(utf8(INFO_X3DH), Uint8Array.from([version]))
+    return hkdfSha256(ikm, new Uint8Array(32), info, 32)
+  } finally {
+    ikm.fill(0)
+    for (const dh of dhs) dh.fill(0)
+  }
 }
 
 // AD = version || IK_sig_a || IK_dh_a || IK_sig_b || IK_dh_b, initiator first,
